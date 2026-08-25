@@ -260,6 +260,73 @@ func TestDifferentialRealVsColumnar(t *testing.T) {
 	}
 }
 
+// TestDifferentialTimeRangeFiltering runs the same workload/comparison as
+// TestDifferentialRealVsColumnar but with a BOUNDED query range instead of
+// [MinInt64, MaxInt64] - confirms real tsdb.Head and columnarhead.Head agree on
+// which samples fall inside a real, non-trivial window, not just that an unbounded
+// scan matches (the case every other test here already covers).
+func TestDifferentialTimeRangeFiltering(t *testing.T) {
+	workload := diffWorkload()
+
+	realHead := newRealHead(t)
+	appendToReal(t, realHead, workload)
+	colHead := NewHead(len(workload), 1, 16)
+	appendToColumnar(t, colHead, workload)
+
+	// Chosen to land strictly inside most series' timestamp spans (base+15000 to
+	// base+90000ish), excluding each series' first and/or last sample - a window that
+	// only matched everything or nothing wouldn't actually exercise filtering.
+	base := int64(1700000000000)
+	mint, maxt := base+15000, base+75000
+
+	realQuerier, err := tsdb.NewBlockQuerier(realHead, mint, maxt)
+	if err != nil {
+		t.Fatalf("real head querier: %v", err)
+	}
+	defer realQuerier.Close()
+	colQuerier, err := colHead.Querier(mint, maxt)
+	if err != nil {
+		t.Fatalf("columnar head querier: %v", err)
+	}
+	defer colQuerier.Close()
+
+	matchAll := labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, ".+")
+	realSeries := collectSeries(t, realQuerier.Select(context.Background(), true, nil, matchAll))
+	colSeries := collectSeries(t, colQuerier.Select(context.Background(), true, nil, matchAll))
+
+	totalReal, totalCol := 0, 0
+	for _, s := range realSeries {
+		totalReal += len(s)
+	}
+	for _, s := range colSeries {
+		totalCol += len(s)
+	}
+	t.Logf("bounded range [%d, %d]: real=%d samples, columnar=%d samples", mint, maxt, totalReal, totalCol)
+	if totalReal == 0 {
+		t.Fatal("sanity check failed: bounded range matched zero real samples - window doesn't actually exercise filtering")
+	}
+	// Also confirm the bound genuinely excluded something, relative to the unbounded
+	// case (33 total samples - see TestDifferentialSanityCheck) - otherwise this
+	// window isn't actually testing the filtering boundary at all.
+	if totalReal >= 33 {
+		t.Fatalf("bounded range matched %d samples, expected fewer than the unbounded total (33) - window doesn't exclude anything", totalReal)
+	}
+
+	for key, real := range realSeries {
+		col, ok := colSeries[key]
+		if !ok {
+			t.Errorf("series %s present in real head, missing from columnar", key)
+			continue
+		}
+		assertSamplesBitIdentical(t, key, real, col)
+		for _, sm := range real {
+			if sm.ts < mint || sm.ts > maxt {
+				t.Errorf("series %s: real head returned sample at ts=%d, outside requested [%d, %d]", key, sm.ts, mint, maxt)
+			}
+		}
+	}
+}
+
 func TestDifferentialSanityCheck(t *testing.T) {
 	workload := diffWorkload()
 	realHead := newRealHead(t)

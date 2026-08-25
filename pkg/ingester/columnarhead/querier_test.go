@@ -2,10 +2,12 @@ package columnarhead
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 )
 
@@ -43,7 +45,7 @@ func buildQueryHead(t *testing.T) *Head {
 
 func TestQuerierSelectByName(t *testing.T) {
 	h := buildQueryHead(t)
-	q, err := h.Querier(0, 0)
+	q, err := h.Querier(math.MinInt64, math.MaxInt64)
 	if err != nil {
 		t.Fatalf("Querier: %v", err)
 	}
@@ -71,7 +73,7 @@ func TestQuerierSelectByName(t *testing.T) {
 
 func TestQuerierSelectByExtraLabel(t *testing.T) {
 	h := buildQueryHead(t)
-	q, err := h.Querier(0, 0)
+	q, err := h.Querier(math.MinInt64, math.MaxInt64)
 	if err != nil {
 		t.Fatalf("Querier: %v", err)
 	}
@@ -94,7 +96,7 @@ func TestQuerierSelectByExtraLabel(t *testing.T) {
 
 func TestQuerierSelectReadsRealSamples(t *testing.T) {
 	h := buildQueryHead(t)
-	q, err := h.Querier(0, 0)
+	q, err := h.Querier(math.MinInt64, math.MaxInt64)
 	if err != nil {
 		t.Fatalf("Querier: %v", err)
 	}
@@ -122,9 +124,62 @@ func TestQuerierSelectReadsRealSamples(t *testing.T) {
 	}
 }
 
+func TestQuerierTimeRangeFiltering(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	app := h.Appender(context.Background())
+	l := labels.FromStrings(
+		labels.MetricName, "up",
+		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+	)
+	ts := []int64{1700000000000, 1700000015000, 1700000030000, 1700000045000, 1700000060000}
+	var ref storage.SeriesRef
+	for _, t0 := range ts {
+		var err error
+		ref, err = app.Append(ref, l, t0, 1)
+		if err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+
+	cases := []struct {
+		name           string
+		mint, maxt     int64
+		wantTimestamps []int64
+	}{
+		{"full range", math.MinInt64, math.MaxInt64, ts},
+		{"exact single point", 1700000030000, 1700000030000, []int64{1700000030000}},
+		{"middle window", 1700000015000, 1700000045000, ts[1:4]},
+		{"before all samples", 1600000000000, 1600000001000, nil},
+		{"after all samples", 1800000000000, 1800000001000, nil},
+		{"inclusive lower bound", 1700000015000, math.MaxInt64, ts[1:]},
+		{"inclusive upper bound", math.MinInt64, 1700000045000, ts[:4]},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			q, err := h.Querier(c.mint, c.maxt)
+			if err != nil {
+				t.Fatalf("Querier: %v", err)
+			}
+			defer q.Close()
+			ss := q.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "up"))
+			var got []int64
+			if ss.Next() {
+				it := ss.At().Iterator(nil)
+				for it.Next() == chunkenc.ValFloat {
+					gotTS, _ := it.At()
+					got = append(got, gotTS)
+				}
+			}
+			if !int64SliceEqual(got, c.wantTimestamps) {
+				t.Fatalf("mint=%d maxt=%d: got timestamps %v, want %v", c.mint, c.maxt, got, c.wantTimestamps)
+			}
+		})
+	}
+}
+
 func TestQuerierLabelValuesAndNames(t *testing.T) {
 	h := buildQueryHead(t)
-	q, err := h.Querier(0, 0)
+	q, err := h.Querier(math.MinInt64, math.MaxInt64)
 	if err != nil {
 		t.Fatalf("Querier: %v", err)
 	}
@@ -176,7 +231,7 @@ func TestQuerierSelectHistogramSeries(t *testing.T) {
 		t.Fatalf("AppendHistogram: %v", err)
 	}
 
-	q, err := h.Querier(0, 0)
+	q, err := h.Querier(math.MinInt64, math.MaxInt64)
 	if err != nil {
 		t.Fatalf("Querier: %v", err)
 	}
@@ -224,7 +279,7 @@ func TestFloatIteratorPanicsOnAtHistogram(t *testing.T) {
 	if _, err := app.Append(0, l, 1700000000000, 1); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
-	q, err := h.Querier(0, 0)
+	q, err := h.Querier(math.MinInt64, math.MaxInt64)
 	if err != nil {
 		t.Fatalf("Querier: %v", err)
 	}

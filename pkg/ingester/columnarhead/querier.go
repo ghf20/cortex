@@ -13,18 +13,18 @@ import (
 
 // Querier returns a storage.Querier over h's current state - a live, unlocked
 // snapshot of whatever series exist at call time (Head has no locking anywhere yet;
-// a real concurrent-safe implementation is separate, later work). mint/maxt are
-// accepted for interface conformance but NOT used to filter samples yet - every
-// matching series returns its full sample history regardless of the requested time
-// range. This is a real, stated limitation, not silently dropped: a correct
-// implementation needs Select's iterators to respect [mint, maxt], which isn't built
-// yet - see CHECKLIST.md.
-func (h *Head) Querier(_, _ int64) (storage.Querier, error) {
-	return &headQuerier{h: h}, nil
+// a real concurrent-safe implementation is separate, later work). mint/maxt bound
+// every returned series' iterator to that inclusive range - a series with matcher
+// hits but zero samples inside [mint, maxt] is still returned (matching real
+// Prometheus's own lazy behavior: the caller's iterator just yields nothing), only
+// the samples themselves are filtered, not series membership.
+func (h *Head) Querier(mint, maxt int64) (storage.Querier, error) {
+	return &headQuerier{h: h, mint: mint, maxt: maxt}, nil
 }
 
 type headQuerier struct {
-	h *Head
+	h          *Head
+	mint, maxt int64
 }
 
 var _ storage.Querier = (*headQuerier)(nil)
@@ -35,9 +35,12 @@ func (q *headQuerier) Close() error { return nil }
 // reconstructed labels. Design doc §3.4's target architecture (postings for
 // __name__ only, then linear-scan the rest) is NOT implemented here - this is the
 // honest, correct, unoptimized full scan that architecture is meant to build on top
-// of, not the target design itself; see CHECKLIST.md. sortSeries and hints.Start/End
-// are accepted but not applied - results come out in ascending ref order, a stable
-// but arbitrary order, not a label-sorted guarantee.
+// of, not the target design itself; see CHECKLIST.md. sortSeries and hints.Func/
+// Grouping/etc. are accepted but not applied - results come out in ascending ref
+// order, a stable but arbitrary order, not a label-sorted guarantee. hints.Start/End
+// are ignored in favor of the querier's own mint/maxt (from Head.Querier) - real
+// Prometheus treats hints as optional acceleration input, not a replacement for the
+// querier's actual bounds.
 func (q *headQuerier) Select(_ context.Context, _ bool, _ *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
 	var refs []uint32
 	n := uint32(q.h.NumSeries())
@@ -46,7 +49,7 @@ func (q *headQuerier) Select(_ context.Context, _ bool, _ *storage.SelectHints, 
 			refs = append(refs, ref)
 		}
 	}
-	return &headSeriesSet{h: q.h, refs: refs}
+	return &headSeriesSet{h: q.h, refs: refs, mint: q.mint, maxt: q.maxt}
 }
 
 func matchesAll(lbls labels.Labels, matchers []*labels.Matcher) bool {
@@ -98,10 +101,11 @@ func sortedKeys(m map[string]struct{}) []string {
 // headSeriesSet iterates a fixed slice of series refs selected by Select - a snapshot
 // at Select time, not a live view.
 type headSeriesSet struct {
-	h    *Head
-	refs []uint32
-	i    int
-	cur  uint32
+	h          *Head
+	refs       []uint32
+	mint, maxt int64
+	i          int
+	cur        uint32
 }
 
 var _ storage.SeriesSet = (*headSeriesSet)(nil)
@@ -115,13 +119,16 @@ func (s *headSeriesSet) Next() bool {
 	return true
 }
 
-func (s *headSeriesSet) At() storage.Series                { return &headSeries{h: s.h, ref: s.cur} }
+func (s *headSeriesSet) At() storage.Series {
+	return &headSeries{h: s.h, ref: s.cur, mint: s.mint, maxt: s.maxt}
+}
 func (s *headSeriesSet) Err() error                        { return nil }
 func (s *headSeriesSet) Warnings() annotations.Annotations { return nil }
 
 type headSeries struct {
-	h   *Head
-	ref uint32
+	h          *Head
+	ref        uint32
+	mint, maxt int64
 }
 
 var _ storage.Series = (*headSeries)(nil)
@@ -130,40 +137,51 @@ func (s *headSeries) Labels() labels.Labels {
 	return s.h.SeriesLabels(s.ref)
 }
 
-// Iterator returns a chunkenc.Iterator over s's samples: a histogram-backed one if
-// this series ever received a histogram sample, a float-backed one otherwise. A
-// series is one or the other, never both (matches real Prometheus semantics that a
-// series' sample type doesn't change mid-stream - see HistogramStore's doc comment).
-// The passed-in iterator (for reuse) is ignored; this always allocates fresh, unlike
-// real chunk iterators that support in-place reuse - a real optimization opportunity,
-// not attempted here.
+// Iterator returns a chunkenc.Iterator over s's samples, bounded to [s.mint, s.maxt]:
+// a histogram-backed one if this series ever received a histogram sample, a
+// float-backed one otherwise. A series is one or the other, never both (matches real
+// Prometheus semantics that a series' sample type doesn't change mid-stream - see
+// HistogramStore's doc comment). The passed-in iterator (for reuse) is ignored; this
+// always allocates fresh, unlike real chunk iterators that support in-place reuse - a
+// real optimization opportunity, not attempted here.
 func (s *headSeries) Iterator(_ chunkenc.Iterator) chunkenc.Iterator {
 	if s.h.histograms.Has(s.ref) {
-		return &histogramSampleIterator{it: s.h.HistogramIterator(s.ref)}
+		return &histogramSampleIterator{it: s.h.HistogramIterator(s.ref), mint: s.mint, maxt: s.maxt}
 	}
-	return &floatSampleIterator{it: s.h.Iterator(s.ref)}
+	return &floatSampleIterator{it: s.h.Iterator(s.ref), mint: s.mint, maxt: s.maxt}
 }
 
 // floatSampleIterator adapts *Iterator (this package's float sample iterator) to
-// chunkenc.Iterator.
+// chunkenc.Iterator, bounded to [mint, maxt] inclusive.
 type floatSampleIterator struct {
-	it      *Iterator
-	started bool
-	done    bool
-	curTS   int64
-	curVal  float64
+	it         *Iterator
+	mint, maxt int64
+	started    bool
+	done       bool
+	curTS      int64
+	curVal     float64
 }
 
 var _ chunkenc.Iterator = (*floatSampleIterator)(nil)
 
 func (fi *floatSampleIterator) Next() chunkenc.ValueType {
-	if fi.done || !fi.it.Next() {
-		fi.done = true
-		return chunkenc.ValNone
+	for {
+		if fi.done || !fi.it.Next() {
+			fi.done = true
+			return chunkenc.ValNone
+		}
+		ts, v := fi.it.At()
+		if ts < fi.mint {
+			continue // before the requested range - keep scanning, don't surface it
+		}
+		if ts > fi.maxt {
+			fi.done = true          // past the requested range - the underlying stream is
+			return chunkenc.ValNone // time-ordered, so nothing later can be in range either
+		}
+		fi.started = true
+		fi.curTS, fi.curVal = ts, v
+		return chunkenc.ValFloat
 	}
-	fi.started = true
-	fi.curTS, fi.curVal = fi.it.At()
-	return chunkenc.ValFloat
 }
 
 func (fi *floatSampleIterator) Seek(t int64) chunkenc.ValueType {
@@ -202,25 +220,37 @@ func (fi *floatSampleIterator) AtFloatHistogram(*histogram.FloatHistogram) (int6
 
 func (fi *floatSampleIterator) Err() error { return nil }
 
-// histogramSampleIterator adapts *HistogramIterator to chunkenc.Iterator.
+// histogramSampleIterator adapts *HistogramIterator to chunkenc.Iterator, bounded to
+// [mint, maxt] inclusive.
 type histogramSampleIterator struct {
-	it      *HistogramIterator
-	started bool
-	done    bool
-	curTS   int64
-	curH    *histogram.Histogram
+	it         *HistogramIterator
+	mint, maxt int64
+	started    bool
+	done       bool
+	curTS      int64
+	curH       *histogram.Histogram
 }
 
 var _ chunkenc.Iterator = (*histogramSampleIterator)(nil)
 
 func (hi *histogramSampleIterator) Next() chunkenc.ValueType {
-	if hi.done || !hi.it.Next() {
-		hi.done = true
-		return chunkenc.ValNone
+	for {
+		if hi.done || !hi.it.Next() {
+			hi.done = true
+			return chunkenc.ValNone
+		}
+		ts, h := hi.it.At()
+		if ts < hi.mint {
+			continue
+		}
+		if ts > hi.maxt {
+			hi.done = true
+			return chunkenc.ValNone
+		}
+		hi.started = true
+		hi.curTS, hi.curH = ts, h
+		return chunkenc.ValHistogram
 	}
-	hi.started = true
-	hi.curTS, hi.curH = hi.it.At()
-	return chunkenc.ValHistogram
 }
 
 func (hi *histogramSampleIterator) Seek(t int64) chunkenc.ValueType {
