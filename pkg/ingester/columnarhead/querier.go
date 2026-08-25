@@ -31,25 +31,70 @@ var _ storage.Querier = (*headQuerier)(nil)
 
 func (q *headQuerier) Close() error { return nil }
 
-// Select scans every series in h and checks every matcher against each one's
-// reconstructed labels. Design doc §3.4's target architecture (postings for
-// __name__ only, then linear-scan the rest) is NOT implemented here - this is the
-// honest, correct, unoptimized full scan that architecture is meant to build on top
-// of, not the target design itself; see CHECKLIST.md. sortSeries and hints.Func/
-// Grouping/etc. are accepted but not applied - results come out in ascending ref
-// order, a stable but arbitrary order, not a label-sorted guarantee. hints.Start/End
-// are ignored in favor of the querier's own mint/maxt (from Head.Querier) - real
-// Prometheus treats hints as optional acceleration input, not a replacement for the
-// querier's actual bounds.
+// Select implements design doc §3.4's architecture: if matchers include an exact
+// (MatchEqual) selector on __name__, look up its postings (Head.SeriesRefsForName)
+// and linear-scan the REMAINING matchers only within that candidate set, instead of
+// every series in h - "the leading selector in essentially every real query," per
+// the design doc, and now measured, not assumed (see CHECKLIST.md for real numbers:
+// TestPostingsSpeedup). Falls back to a full scan when there's no exact __name__
+// matcher (regex/negation on __name__, or none at all) - matching the design doc's
+// own stated scope: this accelerates the common case, not every possible query
+// shape. sortSeries and hints.Func/Grouping/etc. are accepted but not applied -
+// results come out in whatever order the candidate set is in (postings creation
+// order, or ascending ref order for the full-scan fallback), a stable but arbitrary
+// order, not a label-sorted guarantee. hints.Start/End are ignored in favor of the
+// querier's own mint/maxt (from Head.Querier).
 func (q *headQuerier) Select(_ context.Context, _ bool, _ *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
+	candidates, rest := q.candidateRefs(matchers)
 	var refs []uint32
-	n := uint32(q.h.NumSeries())
-	for ref := uint32(0); ref < n; ref++ {
-		if matchesAll(q.h.SeriesLabels(ref), matchers) {
+	for _, ref := range candidates {
+		if refMatchesAll(q.h, ref, rest) {
 			refs = append(refs, ref)
 		}
 	}
 	return &headSeriesSet{h: q.h, refs: refs, mint: q.mint, maxt: q.maxt}
+}
+
+// refMatchesAll checks matchers against ref's labels one at a time via
+// Head.SeriesLabelValue, not by reconstructing the full label set first
+// (SeriesLabels' ScratchBuilder+Sort) - measured to dominate a full scan's cost (see
+// CHECKLIST.md), and wasted work for every candidate that fails an early matcher.
+// LabelValues/LabelNames still use SeriesLabels directly (they need the whole set
+// regardless), only Select's per-candidate filtering goes through this cheaper path.
+func refMatchesAll(h *Head, ref uint32, matchers []*labels.Matcher) bool {
+	for _, m := range matchers {
+		if !m.Matches(h.SeriesLabelValue(ref, m.Name)) {
+			return false
+		}
+	}
+	return true
+}
+
+// candidateRefs returns the series refs to scan and the matchers still left to check
+// against each one. If matchers includes an exact __name__ matcher, the candidate set
+// is that name's postings list and __name__ is dropped from the remaining matchers
+// (already satisfied by construction - every ref in the list has that name). Otherwise
+// the candidate set is every series in h and all matchers still need checking.
+func (q *headQuerier) candidateRefs(matchers []*labels.Matcher) (candidates []uint32, rest []*labels.Matcher) {
+	for i, m := range matchers {
+		if m.Type != labels.MatchEqual || m.Name != labels.MetricName {
+			continue
+		}
+		refs, ok := q.h.SeriesRefsForName(m.Value)
+		if !ok {
+			return nil, nil // metric name doesn't exist at all - no series can match
+		}
+		rest = make([]*labels.Matcher, 0, len(matchers)-1)
+		rest = append(rest, matchers[:i]...)
+		rest = append(rest, matchers[i+1:]...)
+		return refs, rest
+	}
+	// No exact __name__ matcher - full scan fallback.
+	all := make([]uint32, q.h.NumSeries())
+	for i := range all {
+		all[i] = uint32(i)
+	}
+	return all, matchers
 }
 
 func matchesAll(lbls labels.Labels, matchers []*labels.Matcher) bool {

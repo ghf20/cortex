@@ -46,6 +46,16 @@ type Head struct {
 	targetIndex map[[targetFields]uint32]uint32
 	seriesIndex map[seriesKey]uint32
 
+	// namePostings is design doc §3.4's "postings for __name__ only": nameID -> every
+	// series ref with that __name__, in creation order. Maintained incrementally in
+	// GetOrCreateSeries (append-only, one entry added per new series, never on the
+	// dedup-hit path) rather than built as a separate indexing pass - this is the
+	// live-head counterpart to the static, MPHF-adjacent postings the design doc
+	// describes for the post-compaction case; still a plain Go map like the rest of
+	// this package's live indexes (targetIndex, seriesIndex), not yet the compact
+	// structure a rebuild-at-compaction path would produce.
+	namePostings map[uint16][]uint32
+
 	metadata   *seriesMetadata
 	lastST     map[uint32]int64 // series ref -> most recent start-timestamp recorded via SetSTZeroSample
 	exemplars  *exemplarStorage
@@ -71,15 +81,16 @@ type seriesKey struct {
 // NewHead returns an empty Head with capacity preallocated for the expected scale.
 func NewHead(expectedSeries, expectedTargets, expectedSymbols int) *Head {
 	return &Head{
-		symbols:     newLiveInterner(expectedSymbols),
-		targets:     NewTargetStore(expectedTargets),
-		series:      NewSeriesStore(expectedSeries),
-		targetIndex: make(map[[targetFields]uint32]uint32, expectedTargets),
-		seriesIndex: make(map[seriesKey]uint32, expectedSeries),
-		metadata:    newSeriesMetadata(),
-		lastST:      make(map[uint32]int64),
-		exemplars:   newExemplarStorage(defaultExemplarCapacity),
-		histograms:  NewHistogramStore(),
+		symbols:      newLiveInterner(expectedSymbols),
+		targets:      NewTargetStore(expectedTargets),
+		series:       NewSeriesStore(expectedSeries),
+		targetIndex:  make(map[[targetFields]uint32]uint32, expectedTargets),
+		seriesIndex:  make(map[seriesKey]uint32, expectedSeries),
+		namePostings: make(map[uint16][]uint32),
+		metadata:     newSeriesMetadata(),
+		lastST:       make(map[uint32]int64),
+		exemplars:    newExemplarStorage(defaultExemplarCapacity),
+		histograms:   NewHistogramStore(),
 	}
 }
 
@@ -134,6 +145,7 @@ func (h *Head) GetOrCreateSeries(target TargetLabels, metricName, localName, loc
 	}
 	ref := h.series.Create(targetID, nameID, localNameID, localRef, hasLocal)
 	h.seriesIndex[key] = ref
+	h.namePostings[nameID] = append(h.namePostings[nameID], ref)
 	return ref, nil
 }
 
@@ -206,6 +218,51 @@ func (h *Head) SeriesLabels(ref uint32) labels.Labels {
 	}
 	b.Sort()
 	return b.Labels()
+}
+
+// SeriesLabelValue returns just ref's value for label name, without reconstructing
+// the full label set SeriesLabels does (no ScratchBuilder, no Sort) - "" if ref has
+// no such label. Exists specifically so Select's matcher-filtering step (querier.go's
+// matchesAll) can check a candidate series against a handful of matchers without
+// paying full-reconstruction cost for every candidate, most of which won't even pass
+// - profiling showed SeriesLabels' builder+sort dominating a full scan's cost
+// (measured: >50% of CPU time - see CHECKLIST.md), which this directly targets.
+func (h *Head) SeriesLabelValue(ref uint32, name string) string {
+	switch name {
+	case labels.MetricName:
+		return h.symbols.String(uint32(h.series.NameID(ref)))
+	case labelCluster, labelNamespace, labelPod, labelContainer, labelNode, labelJob:
+		tRefs := h.targets.Get(h.series.TargetID(ref))
+		return h.symbols.String(tRefs[targetLabelIndex(name)])
+	default:
+		if h.series.HasLocal(ref) && h.symbols.String(uint32(h.series.LocalName(ref))) == name {
+			return h.symbols.String(uint32(h.series.LocalRef(ref)))
+		}
+		return ""
+	}
+}
+
+// targetLabelIndex maps one of the six fixed target label names to its position in
+// TargetStore's [targetFields]uint32 tuple (§3.1's fixed cluster/namespace/pod/
+// container/node/job order). Panics on an unrecognized name - callers (only
+// SeriesLabelValue) already gate on the same name set in their switch, so reaching
+// here with anything else is a programming error, not a real-world input to guard.
+func targetLabelIndex(name string) int {
+	switch name {
+	case labelCluster:
+		return 0
+	case labelNamespace:
+		return 1
+	case labelPod:
+		return 2
+	case labelContainer:
+		return 3
+	case labelNode:
+		return 4
+	case labelJob:
+		return 5
+	}
+	panic("columnarhead: targetLabelIndex called with an unrecognized label name: " + name)
 }
 
 // ErrSeriesNotFound is returned by SetMetadata when ref doesn't correspond to a series
@@ -286,6 +343,20 @@ func (h *Head) HistogramIterator(ref uint32) *HistogramIterator {
 // Iterator returns an iterator over ref's encoded samples.
 func (h *Head) Iterator(ref uint32) *Iterator {
 	return h.series.Iterator(ref)
+}
+
+// SeriesRefsForName returns every series ref with __name__ == metricName, and
+// whether metricName is known at all - the read path for design doc §3.4's
+// __name__-postings shortcut (see Querier.Select). A read-only lookup: unlike
+// GetOrCreateSeries, an unknown metricName is never interned as a side effect of
+// asking whether it exists (same reasoning as lookupTarget/lookupSeries).
+func (h *Head) SeriesRefsForName(metricName string) ([]uint32, bool) {
+	nameID32, ok := h.symbols.Lookup(metricName)
+	if !ok || nameID32 > math.MaxUint16 {
+		return nil, false
+	}
+	refs, ok := h.namePostings[uint16(nameID32)]
+	return refs, ok
 }
 
 // NumSeries, NumTargets, NumSymbols report the head's current cardinality.
