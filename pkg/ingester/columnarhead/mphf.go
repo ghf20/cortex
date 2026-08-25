@@ -368,7 +368,19 @@ func (m *MPHF) Lookup(key string) uint32 {
 	b := reduceRange(h, m.numBuckets)
 	d := unpackFixedWidth(m.disp, b, m.dispWidth)
 	raw := mixSlot(h, d, m.numSlots)
-	return m.rank(raw)
+	id := m.rank(raw)
+	if id >= m.numKeys {
+		// Only possible for a key outside the built set (see the type's doc comment):
+		// raw landed in the "slack" region (slotSlack's extra capacity) past the
+		// position of the last real key, so rank correctly counts all m.numKeys real
+		// bits as "before" it, returning exactly m.numKeys - one past the [0, numKeys)
+		// range this method promises. A real bug (found via a rare, seed-dependent
+		// test panic, not by inspection): clamp so the documented contract holds even
+		// for a key the table was never built over, instead of handing callers an
+		// out-of-bounds id that panics several layers away in whatever indexes it.
+		id = 0
+	}
+	return id
 }
 
 // SizeBytes returns the MPHF's own memory footprint: the packed displacement array,

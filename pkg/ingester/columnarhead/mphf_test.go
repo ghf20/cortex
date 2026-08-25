@@ -66,6 +66,42 @@ func TestMPHFLookupIsStable(t *testing.T) {
 	}
 }
 
+// TestMPHFLookupNeverOutOfRange verifies Lookup's documented contract - result always
+// in [0, NumKeys()) - holds for keys OUTSIDE the built set, not just inside it. Found
+// via a rare, seed-dependent panic (not by inspection): an unknown key's raw slot can
+// land in the "slack" region past the last real key's bitmap position, where rank()
+// legitimately returns exactly NumKeys() (one past the valid range) rather than
+// something < NumKeys() - which then panics wherever a caller (SymbolTable.String)
+// indexes an array with it. Sweeps many small builds and many probes per build,
+// rather than one lucky/unlucky seed, since the bug is inherently probabilistic
+// (depends on where an unknown key's hash happens to land relative to the slack
+// region, which varies by seed and key set).
+func TestMPHFLookupNeverOutOfRange(t *testing.T) {
+	for n := 1; n <= 20; n++ {
+		for seed := int64(0); seed < 20; seed++ {
+			keys := genKeys(n, seed)
+			m, err := BuildMPHF(keys)
+			if err != nil {
+				t.Fatalf("BuildMPHF(n=%d, seed=%d): %v", n, seed, err)
+			}
+			built := make(map[string]bool, n)
+			for _, k := range keys {
+				built[k] = true
+			}
+			for i := 0; i < 200; i++ {
+				probe := fmt.Sprintf("probe_%d_%d_%d", n, seed, i)
+				if built[probe] {
+					continue
+				}
+				if id := m.Lookup(probe); id >= m.NumKeys() {
+					t.Fatalf("n=%d, seed=%d, probe=%q: Lookup returned %d, want < NumKeys()=%d",
+						n, seed, probe, id, m.NumKeys())
+				}
+			}
+		}
+	}
+}
+
 func TestMPHFEmpty(t *testing.T) {
 	m, err := BuildMPHF(nil)
 	if err != nil {
