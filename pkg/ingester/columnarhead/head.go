@@ -6,6 +6,7 @@ import (
 
 	"github.com/prometheus/prometheus/model/exemplar"
 	"github.com/prometheus/prometheus/model/histogram"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/metadata"
 )
 
@@ -57,9 +58,14 @@ type TargetLabels struct {
 }
 
 type seriesKey struct {
-	targetID uint32
-	nameID   uint16
-	localRef uint16
+	targetID  uint32
+	nameID    uint16
+	localName uint16
+	localRef  uint16
+	// hasLocal disambiguates "no local label" from "local label whose name and value
+	// both happen to intern to id 0" - both would otherwise present as
+	// localName=localRef=0 and collide in seriesIndex despite being different series.
+	hasLocal bool
 }
 
 // NewHead returns an empty Head with capacity preallocated for the expected scale.
@@ -77,13 +83,19 @@ func NewHead(expectedSeries, expectedTargets, expectedSymbols int) *Head {
 	}
 }
 
-// GetOrCreateSeries resolves target+metricName+localLabel to a series ref, creating
-// the target, symbols, and series record as needed - repeated calls with identical
-// arguments return the same ref rather than creating duplicates. localLabel is the
-// series-specific label besides __name__ (e.g. a histogram's "le" bucket value); pass
-// "" if the series has none - matches SeriesStore's existing single-localRef-field
-// model (bench/04's original simplification, carried through unchanged here).
-func (h *Head) GetOrCreateSeries(target TargetLabels, metricName, localLabel string) (uint32, error) {
+// GetOrCreateSeries resolves target+metricName+(localName,localLabel) to a series
+// ref, creating the target, symbols, and series record as needed - repeated calls
+// with identical arguments return the same ref rather than creating duplicates.
+// localName/localLabel are the name and value of the series-specific label besides
+// __name__ (e.g. "le" and "0.1" for a histogram bucket); pass "" for both if the
+// series has none - matches SeriesStore's existing single-extra-label model (bench/04's
+// original simplification, carried through unchanged here). Both must store the NAME,
+// not just the value: two series with the same value under different label names
+// (e.g. le="0.1" vs quantile="0.1") are different series, and the read path needs the
+// name to reconstruct a faithful label set (see Head.SeriesLabels) - a real gap found
+// and fixed while building the Querier, since nothing needed to reconstruct full
+// labels before then.
+func (h *Head) GetOrCreateSeries(target TargetLabels, metricName, localName, localLabel string) (uint32, error) {
 	tRefs := [targetFields]uint32{
 		h.symbols.Intern(target.Cluster),
 		h.symbols.Intern(target.Namespace),
@@ -104,20 +116,23 @@ func (h *Head) GetOrCreateSeries(target TargetLabels, metricName, localLabel str
 	}
 	nameID := uint16(nameID32)
 
-	var localRef uint16
-	if localLabel != "" {
+	hasLocal := localLabel != ""
+	var localNameID, localRef uint16
+	if hasLocal {
+		localNameID32 := h.symbols.Intern(localName)
 		localRef32 := h.symbols.Intern(localLabel)
-		if localRef32 > math.MaxUint16 {
+		if localNameID32 > math.MaxUint16 || localRef32 > math.MaxUint16 {
 			return 0, ErrTooManySymbols
 		}
+		localNameID = uint16(localNameID32)
 		localRef = uint16(localRef32)
 	}
 
-	key := seriesKey{targetID, nameID, localRef}
+	key := seriesKey{targetID, nameID, localNameID, localRef, hasLocal}
 	if ref, ok := h.seriesIndex[key]; ok {
 		return ref, nil
 	}
-	ref := h.series.Create(targetID, nameID, localRef)
+	ref := h.series.Create(targetID, nameID, localNameID, localRef, hasLocal)
 	h.seriesIndex[key] = ref
 	return ref, nil
 }
@@ -142,9 +157,9 @@ func (h *Head) lookupTarget(target TargetLabels) ([targetFields]uint32, bool) {
 	return tRefs, true
 }
 
-// lookupSeries returns the series ref for (tRefs, metricName, localLabel) and whether
-// it's already known, without creating anything.
-func (h *Head) lookupSeries(tRefs [targetFields]uint32, metricName, localLabel string) (uint32, bool) {
+// lookupSeries returns the series ref for (tRefs, metricName, localName, localLabel)
+// and whether it's already known, without creating anything.
+func (h *Head) lookupSeries(tRefs [targetFields]uint32, metricName, localName, localLabel string) (uint32, bool) {
 	targetID, ok := h.targetIndex[tRefs]
 	if !ok {
 		return 0, false
@@ -153,21 +168,44 @@ func (h *Head) lookupSeries(tRefs [targetFields]uint32, metricName, localLabel s
 	if !ok || nameID32 > math.MaxUint16 {
 		return 0, false
 	}
-	var localRef uint16
-	if localLabel != "" {
-		localRef32, ok := h.symbols.Lookup(localLabel)
-		if !ok || localRef32 > math.MaxUint16 {
+	hasLocal := localLabel != ""
+	var localNameID, localRef uint16
+	if hasLocal {
+		localNameID32, nameOK := h.symbols.Lookup(localName)
+		localRef32, refOK := h.symbols.Lookup(localLabel)
+		if !nameOK || !refOK || localNameID32 > math.MaxUint16 || localRef32 > math.MaxUint16 {
 			return 0, false
 		}
+		localNameID = uint16(localNameID32)
 		localRef = uint16(localRef32)
 	}
-	ref, ok := h.seriesIndex[seriesKey{targetID, uint16(nameID32), localRef}]
+	ref, ok := h.seriesIndex[seriesKey{targetID, uint16(nameID32), localNameID, localRef, hasLocal}]
 	return ref, ok
 }
 
 // Append encodes one sample for the series at ref.
 func (h *Head) Append(ref uint32, ts int64, v float64) error {
 	return h.series.Append(ref, ts, v)
+}
+
+// SeriesLabels reconstructs ref's full label set: the six target labels, __name__,
+// and the one optional extra label, in the shape splitLabels originally accepted -
+// the read-side inverse of GetOrCreateSeries's write-side resolution.
+func (h *Head) SeriesLabels(ref uint32) labels.Labels {
+	tRefs := h.targets.Get(h.series.TargetID(ref))
+	b := labels.NewScratchBuilder(8)
+	b.Add(labels.MetricName, h.symbols.String(uint32(h.series.NameID(ref))))
+	b.Add(labelCluster, h.symbols.String(tRefs[0]))
+	b.Add(labelNamespace, h.symbols.String(tRefs[1]))
+	b.Add(labelPod, h.symbols.String(tRefs[2]))
+	b.Add(labelContainer, h.symbols.String(tRefs[3]))
+	b.Add(labelNode, h.symbols.String(tRefs[4]))
+	b.Add(labelJob, h.symbols.String(tRefs[5]))
+	if h.series.HasLocal(ref) {
+		b.Add(h.symbols.String(uint32(h.series.LocalName(ref))), h.symbols.String(uint32(h.series.LocalRef(ref))))
+	}
+	b.Sort()
+	return b.Labels()
 }
 
 // ErrSeriesNotFound is returned by SetMetadata when ref doesn't correspond to a series

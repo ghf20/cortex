@@ -76,7 +76,7 @@ func TestSeriesStoreRoundTrip_Patterns(t *testing.T) {
 	for name, want := range cases {
 		t.Run(name, func(t *testing.T) {
 			s := NewSeriesStore(1)
-			ref := s.Create(0, 0, 0)
+			ref := s.Create(0, 0, 0, 0, false)
 			for _, sm := range want {
 				if err := s.Append(ref, sm.ts, sm.v); err != nil {
 					t.Fatalf("Append: %v", err)
@@ -90,7 +90,7 @@ func TestSeriesStoreRoundTrip_Patterns(t *testing.T) {
 func TestSeriesStoreRoundTrip_Random(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 	s := NewSeriesStore(1)
-	ref := s.Create(0, 0, 0)
+	ref := s.Create(0, 0, 0, 0, false)
 
 	var want []sample
 	ts := int64(1700000000000)
@@ -115,9 +115,9 @@ func TestSeriesStoreRoundTrip_Random(t *testing.T) {
 
 func TestSeriesStoreIsolatesSeries(t *testing.T) {
 	s := NewSeriesStore(3)
-	refA := s.Create(0, 0, 0)
-	refB := s.Create(1, 1, 1)
-	refC := s.Create(2, 2, 2)
+	refA := s.Create(0, 0, 0, 0, false)
+	refB := s.Create(1, 1, 0, 1, false)
+	refC := s.Create(2, 2, 0, 2, false)
 
 	wantA := []sample{{1700000000000, 1}, {1700000015000, 2}}
 	wantB := []sample{{1700000000000, 100}, {1700000015000, 100}, {1700000030000, 100}}
@@ -150,8 +150,8 @@ func TestSeriesStoreIsolatesSeries(t *testing.T) {
 // growth event corrupting a neighboring series' still-live slot.
 func TestSeriesStoreGrowsAcrossManySamples(t *testing.T) {
 	s := NewSeriesStore(2)
-	ref := s.Create(0, 0, 0)
-	other := s.Create(1, 1, 1) // must survive ref's many grow events untouched
+	ref := s.Create(0, 0, 0, 0, false)
+	other := s.Create(1, 1, 0, 1, false) // must survive ref's many grow events untouched
 
 	var want, wantOther []sample
 	ts := int64(1700000000000)
@@ -194,7 +194,7 @@ func TestSeriesStoreFreeListReuseIsZeroed(t *testing.T) {
 	// 16B initial slot back to the free list.
 	var refs []uint32
 	for i := 0; i < 4; i++ {
-		ref := s.Create(0, 0, 0)
+		ref := s.Create(0, 0, 0, 0, false)
 		refs = append(refs, ref)
 		vals := []float64{math.MaxFloat64, -math.MaxFloat64, math.SmallestNonzeroFloat64}
 		ts := int64(1700000000000)
@@ -210,7 +210,7 @@ func TestSeriesStoreFreeListReuseIsZeroed(t *testing.T) {
 	}
 
 	// A fresh series should now be handed one of those freed, dirty regions.
-	newRef := s.Create(9, 9, 9)
+	newRef := s.Create(9, 9, 0, 9, false)
 	want := []sample{{1700000000000, 0}} // value 0 => raw bits all zero; any leftover 1-bit corrupts this
 	if err := s.Append(newRef, want[0].ts, want[0].v); err != nil {
 		t.Fatal(err)
@@ -236,8 +236,8 @@ func TestSeriesStoreNumSeries(t *testing.T) {
 	if s.NumSeries() != 0 {
 		t.Fatalf("NumSeries() = %d, want 0", s.NumSeries())
 	}
-	s.Create(0, 0, 0)
-	s.Create(0, 0, 0)
+	s.Create(0, 0, 0, 0, false)
+	s.Create(0, 0, 0, 0, false)
 	if s.NumSeries() != 2 {
 		t.Fatalf("NumSeries() = %d, want 2", s.NumSeries())
 	}

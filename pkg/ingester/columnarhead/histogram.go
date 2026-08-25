@@ -79,6 +79,14 @@ func (hst *HistogramStore) NumSeries() int {
 	return len(hst.series)
 }
 
+// Has reports whether ref has any histogram samples - the read path's way of telling
+// a histogram-typed series from a float-typed one, since both share the same ref
+// space (see the type's doc comment).
+func (hst *HistogramStore) Has(ref uint32) bool {
+	_, ok := hst.series[ref]
+	return ok
+}
+
 // Append encodes one histogram sample for the series at ref, creating its histogram
 // stream on first use.
 func (hst *HistogramStore) Append(ref uint32, ts int64, h *histogram.Histogram) error {

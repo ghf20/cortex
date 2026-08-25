@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"runtime"
 	"testing"
+
+	"github.com/prometheus/prometheus/model/labels"
 )
 
 func TestHeadDedupesTargetsAndSeries(t *testing.T) {
@@ -13,11 +15,11 @@ func TestHeadDedupesTargetsAndSeries(t *testing.T) {
 		Container: "app", Node: "ip-10-1-2-3", Job: "cadvisor",
 	}
 
-	ref1, err := h.GetOrCreateSeries(tgt, "cpu_seconds_total", "")
+	ref1, err := h.GetOrCreateSeries(tgt, "cpu_seconds_total", "", "")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
-	ref2, err := h.GetOrCreateSeries(tgt, "cpu_seconds_total", "")
+	ref2, err := h.GetOrCreateSeries(tgt, "cpu_seconds_total", "", "")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
@@ -32,7 +34,7 @@ func TestHeadDedupesTargetsAndSeries(t *testing.T) {
 	}
 
 	// A different metric on the SAME target must share the target but get a new series.
-	ref3, err := h.GetOrCreateSeries(tgt, "memory_bytes", "")
+	ref3, err := h.GetOrCreateSeries(tgt, "memory_bytes", "", "")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
@@ -48,11 +50,11 @@ func TestHeadDedupesTargetsAndSeries(t *testing.T) {
 
 	// A histogram bucket (different localLabel) is a distinct series from the same
 	// metric name with no local label.
-	ref4, err := h.GetOrCreateSeries(tgt, "request_duration_bucket", "0.1")
+	ref4, err := h.GetOrCreateSeries(tgt, "request_duration_bucket", "le", "0.1")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
-	ref5, err := h.GetOrCreateSeries(tgt, "request_duration_bucket", "0.5")
+	ref5, err := h.GetOrCreateSeries(tgt, "request_duration_bucket", "le", "0.5")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
@@ -64,7 +66,7 @@ func TestHeadDedupesTargetsAndSeries(t *testing.T) {
 	// otherwise-identical metric/local-label.
 	tgt2 := tgt
 	tgt2.Pod = "payments-api-def456"
-	ref6, err := h.GetOrCreateSeries(tgt2, "cpu_seconds_total", "")
+	ref6, err := h.GetOrCreateSeries(tgt2, "cpu_seconds_total", "", "")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
@@ -76,10 +78,63 @@ func TestHeadDedupesTargetsAndSeries(t *testing.T) {
 	}
 }
 
+// TestHeadSeriesLabels proves Head.SeriesLabels correctly reconstructs a series' full
+// label set, including the exact bug this file's GetOrCreateSeries signature change
+// fixed: two series with the same local-label VALUE but different NAMES (e.g. a
+// histogram's le="0.1" vs a summary's quantile="0.1") must be distinct series with
+// correctly distinguishable reconstructed labels - not merged via a shared value-only
+// key, and not read back with the wrong label name.
+func TestHeadSeriesLabels(t *testing.T) {
+	h := NewHead(3, 1, 1)
+	tgt := TargetLabels{
+		Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j",
+	}
+
+	noLocalRef, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	if err != nil {
+		t.Fatalf("GetOrCreateSeries: %v", err)
+	}
+	leRef, err := h.GetOrCreateSeries(tgt, "request_duration_bucket", "le", "0.1")
+	if err != nil {
+		t.Fatalf("GetOrCreateSeries: %v", err)
+	}
+	quantileRef, err := h.GetOrCreateSeries(tgt, "request_duration", "quantile", "0.1")
+	if err != nil {
+		t.Fatalf("GetOrCreateSeries: %v", err)
+	}
+	if leRef == quantileRef {
+		t.Fatal("le=\"0.1\" and quantile=\"0.1\" got the same series ref - the exact bug this test guards against")
+	}
+
+	want := labels.FromStrings(
+		labels.MetricName, "up",
+		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+	)
+	if got := h.SeriesLabels(noLocalRef); !labels.Equal(got, want) {
+		t.Fatalf("SeriesLabels(noLocalRef) = %v, want %v", got, want)
+	}
+
+	wantLE := labels.FromStrings(
+		labels.MetricName, "request_duration_bucket", "le", "0.1",
+		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+	)
+	if got := h.SeriesLabels(leRef); !labels.Equal(got, wantLE) {
+		t.Fatalf("SeriesLabels(leRef) = %v, want %v", got, wantLE)
+	}
+
+	wantQuantile := labels.FromStrings(
+		labels.MetricName, "request_duration", "quantile", "0.1",
+		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+	)
+	if got := h.SeriesLabels(quantileRef); !labels.Equal(got, wantQuantile) {
+		t.Fatalf("SeriesLabels(quantileRef) = %v, want %v", got, wantQuantile)
+	}
+}
+
 func TestHeadAppendAndIterate(t *testing.T) {
 	h := NewHead(1, 1, 1)
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
-	ref, err := h.GetOrCreateSeries(tgt, "up", "")
+	ref, err := h.GetOrCreateSeries(tgt, "up", "", "")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
@@ -137,11 +192,11 @@ func TestHeadAtScale(t *testing.T) {
 			Job:       "cadvisor",
 		}
 		metric := fmt.Sprintf("container_metric_name_number_%03d_total", i%numMetrics)
-		local := ""
+		var localName, local string
 		if i%20 < 6 { // roughly matches the histogram-bucket share used elsewhere
-			local = les[i%len(les)]
+			localName, local = "le", les[i%len(les)]
 		}
-		ref, err := h.GetOrCreateSeries(tgt, metric, local)
+		ref, err := h.GetOrCreateSeries(tgt, metric, localName, local)
 		if err != nil {
 			t.Fatalf("series %d: %v", i, err)
 		}

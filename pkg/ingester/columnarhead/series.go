@@ -52,7 +52,21 @@ type SeriesStore struct {
 	// theoretical edge case. See CHECKLIST.md for the measured cost of this choice.
 	targetID []uint32
 	nameID   []uint16
-	localRef []uint16
+	// localName/localRef are the name and value symbol refs of a series' one
+	// supported non-target, non-__name__ label (see appender.go's
+	// ErrUnsupportedLabelShape). Both are needed to reconstruct a series' full label
+	// set on the read path - storing only the value (localRef alone, the original
+	// shape of this struct) was enough for write-side dedup but made it impossible to
+	// tell "le" from "quantile" from anything else when querying. Found and fixed
+	// while building the Querier, not before - this store had no read path to expose
+	// the gap until then.
+	localName []uint16
+	localRef  []uint16
+	// hasLocal records, independent of localName/localRef's values, whether a series
+	// actually has the extra label at all. 0 is a legitimate real id from liveInterner
+	// (whichever string happens to be interned first) - localName/localRef == 0 does
+	// NOT mean "absent," so absence needs its own explicit signal, not an inferred one.
+	hasLocal []bool
 	bitOff   []uint16
 	nSamples []uint16
 
@@ -77,17 +91,19 @@ type SeriesStore struct {
 // NewSeriesStore returns an empty store with capacity preallocated for expectedSeries.
 func NewSeriesStore(expectedSeries int) *SeriesStore {
 	return &SeriesStore{
-		targetID: make([]uint32, 0, expectedSeries),
-		nameID:   make([]uint16, 0, expectedSeries),
-		localRef: make([]uint16, 0, expectedSeries),
-		bitOff:   make([]uint16, 0, expectedSeries),
-		nSamples: make([]uint16, 0, expectedSeries),
-		slotOff:  make([]uint32, 0, expectedSeries),
-		slotCap:  make([]uint32, 0, expectedSeries),
-		val:      make([]valueState, 0, expectedSeries),
-		ts:       make([]tsState, 0, expectedSeries),
-		arena:    make([]byte, 0, expectedSeries*initialSlotBytes),
-		freeList: make(map[uint32][]uint32),
+		targetID:  make([]uint32, 0, expectedSeries),
+		nameID:    make([]uint16, 0, expectedSeries),
+		localName: make([]uint16, 0, expectedSeries),
+		localRef:  make([]uint16, 0, expectedSeries),
+		hasLocal:  make([]bool, 0, expectedSeries),
+		bitOff:    make([]uint16, 0, expectedSeries),
+		nSamples:  make([]uint16, 0, expectedSeries),
+		slotOff:   make([]uint32, 0, expectedSeries),
+		slotCap:   make([]uint32, 0, expectedSeries),
+		val:       make([]valueState, 0, expectedSeries),
+		ts:        make([]tsState, 0, expectedSeries),
+		arena:     make([]byte, 0, expectedSeries*initialSlotBytes),
+		freeList:  make(map[uint32][]uint32),
 	}
 }
 
@@ -115,12 +131,16 @@ func (s *SeriesStore) free(off, size uint32) {
 	s.freeList[size] = append(s.freeList[size], off)
 }
 
-// Create allocates a new series and returns its ref.
-func (s *SeriesStore) Create(targetID uint32, nameID, localRef uint16) uint32 {
+// Create allocates a new series and returns its ref. hasLocal is false for a series
+// with no extra label - localName/localRef are meaningless (and typically both 0) in
+// that case, matching how appender.go treats an empty localLabel.
+func (s *SeriesStore) Create(targetID uint32, nameID, localName, localRef uint16, hasLocal bool) uint32 {
 	ref := uint32(len(s.targetID))
 	s.targetID = append(s.targetID, targetID)
 	s.nameID = append(s.nameID, nameID)
+	s.localName = append(s.localName, localName)
 	s.localRef = append(s.localRef, localRef)
+	s.hasLocal = append(s.hasLocal, hasLocal)
 	s.bitOff = append(s.bitOff, 0)
 	s.nSamples = append(s.nSamples, 0)
 	s.val = append(s.val, newValueState())
@@ -136,6 +156,14 @@ func (s *SeriesStore) Create(targetID uint32, nameID, localRef uint16) uint32 {
 func (s *SeriesStore) NumSeries() int {
 	return len(s.targetID)
 }
+
+// TargetID, NameID, LocalName, LocalRef, HasLocal expose a series' record fields for
+// the read path (reconstructing its full label set) - see Head.SeriesLabels.
+func (s *SeriesStore) TargetID(ref uint32) uint32  { return s.targetID[ref] }
+func (s *SeriesStore) NameID(ref uint32) uint16    { return s.nameID[ref] }
+func (s *SeriesStore) LocalName(ref uint32) uint16 { return s.localName[ref] }
+func (s *SeriesStore) LocalRef(ref uint32) uint16  { return s.localRef[ref] }
+func (s *SeriesStore) HasLocal(ref uint32) bool    { return s.hasLocal[ref] }
 
 // Append encodes one (timestamp, value) sample for the series at ref. Timestamps are
 // not required to be monotonic here - that validation belongs to the Appender layer
