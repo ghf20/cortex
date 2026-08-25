@@ -44,7 +44,13 @@ const maxSampleBits = 145
 // if something else later requests exactly that size class: no splitting, no merging
 // across classes. Full compaction (bench/05's approach) would do better; not built here.
 type SeriesStore struct {
-	targetID []uint16
+	// targetID is uint32, not uint16 like the other id fields: nameID/localRef come
+	// from bounded vocabularies (metric names, "le"-style local label values) that
+	// don't grow with fleet churn, but every new pod/target IS a new targetID, and a
+	// live head accumulates those indefinitely over uptime - 65,536 target creations
+	// is a realistic thing to hit in a high-churn cluster within weeks, not a
+	// theoretical edge case. See CHECKLIST.md for the measured cost of this choice.
+	targetID []uint32
 	nameID   []uint16
 	localRef []uint16
 	bitOff   []uint16
@@ -71,7 +77,7 @@ type SeriesStore struct {
 // NewSeriesStore returns an empty store with capacity preallocated for expectedSeries.
 func NewSeriesStore(expectedSeries int) *SeriesStore {
 	return &SeriesStore{
-		targetID: make([]uint16, 0, expectedSeries),
+		targetID: make([]uint32, 0, expectedSeries),
 		nameID:   make([]uint16, 0, expectedSeries),
 		localRef: make([]uint16, 0, expectedSeries),
 		bitOff:   make([]uint16, 0, expectedSeries),
@@ -110,7 +116,7 @@ func (s *SeriesStore) free(off, size uint32) {
 }
 
 // Create allocates a new series and returns its ref.
-func (s *SeriesStore) Create(targetID, nameID, localRef uint16) uint32 {
+func (s *SeriesStore) Create(targetID uint32, nameID, localRef uint16) uint32 {
 	ref := uint32(len(s.targetID))
 	s.targetID = append(s.targetID, targetID)
 	s.nameID = append(s.nameID, nameID)

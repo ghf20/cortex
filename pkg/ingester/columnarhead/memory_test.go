@@ -26,7 +26,7 @@ func TestMemoryPerSeries(t *testing.T) {
 	s := NewSeriesStore(n)
 	refs := make([]uint32, n)
 	for i := 0; i < n; i++ {
-		refs[i] = s.Create(uint16(i/seriesPerTgt), uint16(i%400), uint16(i%12))
+		refs[i] = s.Create(uint32(i/seriesPerTgt), uint16(i%400), uint16(i%12))
 	}
 
 	ts := int64(1700000000000)
@@ -112,7 +112,7 @@ func TestMemoryPerSeries_Staggered(t *testing.T) {
 	for wave := 0; wave < waves; wave++ {
 		for w := 0; w < perWave; w++ {
 			i := wave*perWave + w
-			ref := s.Create(uint16(i/seriesPerTgt), uint16(i%400), uint16(i%12))
+			ref := s.Create(uint32(i/seriesPerTgt), uint16(i%400), uint16(i%12))
 			refs = append(refs, ref)
 		}
 		// Every series alive so far gets appended to this wave, same as real ingestion
