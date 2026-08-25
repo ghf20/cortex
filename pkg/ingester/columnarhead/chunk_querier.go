@@ -49,9 +49,9 @@ func (q *headChunkQuerier) LabelNames(ctx context.Context, hints *storage.LabelH
 }
 
 // Select shares headQuerier's exact candidate-selection logic (the postings
-// shortcut and per-value matcher filtering) - only the series set returned wraps
-// chunks instead of decoded samples.
-func (q *headChunkQuerier) Select(_ context.Context, _ bool, _ *storage.SelectHints, matchers ...*labels.Matcher) storage.ChunkSeriesSet {
+// shortcut, per-value matcher filtering, and sortSeries ordering) - only the series
+// set returned wraps chunks instead of decoded samples.
+func (q *headChunkQuerier) Select(_ context.Context, sortSeries bool, _ *storage.SelectHints, matchers ...*labels.Matcher) storage.ChunkSeriesSet {
 	sq := &headQuerier{h: q.h, mint: q.mint, maxt: q.maxt}
 	candidates, rest := sq.candidateRefs(matchers)
 	var refs []uint32
@@ -59,6 +59,9 @@ func (q *headChunkQuerier) Select(_ context.Context, _ bool, _ *storage.SelectHi
 		if refMatchesAll(q.h, ref, rest) {
 			refs = append(refs, ref)
 		}
+	}
+	if sortSeries {
+		sortRefsByLabels(q.h, refs)
 	}
 	return &headChunkSeriesSet{h: q.h, refs: refs, mint: q.mint, maxt: q.maxt}
 }

@@ -3,12 +3,14 @@ package columnarhead
 import (
 	"context"
 	"math"
+	"path/filepath"
 	"testing"
 
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/prometheus/prometheus/tsdb/index"
 )
 
 func buildQueryHead(t *testing.T) *Head {
@@ -67,6 +69,92 @@ func TestQuerierSelectByName(t *testing.T) {
 	for _, l := range gotLabels {
 		if l.Get(labels.MetricName) != "up" {
 			t.Fatalf("selected series has __name__=%q, want \"up\"", l.Get(labels.MetricName))
+		}
+	}
+}
+
+// TestQuerierSelectSortSeries builds series with __name__ in descending alphabetical
+// order (so creation order and label-sorted order disagree), then checks
+// sortSeries=false preserves creation order while sortSeries=true produces strictly
+// increasing labels.Compare order.
+func TestQuerierSelectSortSeries(t *testing.T) {
+	h := NewHead(4, 2, 8)
+	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
+	for _, name := range []string{"charlie", "bravo", "alpha"} {
+		if _, err := h.GetOrCreateSeries(tgt, name, "", ""); err != nil {
+			t.Fatalf("GetOrCreateSeries(%q): %v", name, err)
+		}
+	}
+
+	q, err := h.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("Querier: %v", err)
+	}
+	defer q.Close()
+
+	unsorted := collectLabels(t, q.Select(context.Background(), false, nil))
+	if got := unsorted[0].Get(labels.MetricName); got != "charlie" {
+		t.Fatalf("sortSeries=false __name__[0] = %q, want \"charlie\" (creation order)", got)
+	}
+
+	sorted := collectLabels(t, q.Select(context.Background(), true, nil))
+	want := []string{"alpha", "bravo", "charlie"}
+	for i, l := range sorted {
+		if got := l.Get(labels.MetricName); got != want[i] {
+			t.Fatalf("sortSeries=true __name__[%d] = %q, want %q", i, got, want[i])
+		}
+	}
+	for i := 1; i < len(sorted); i++ {
+		if labels.Compare(sorted[i-1], sorted[i]) >= 0 {
+			t.Fatalf("sortSeries=true output not strictly increasing at %d: %v then %v", i, sorted[i-1], sorted[i])
+		}
+	}
+
+	assertSortedSeriesWriteToRealIndex(t, sorted)
+}
+
+func collectLabels(t *testing.T, ss storage.SeriesSet) []labels.Labels {
+	t.Helper()
+	var out []labels.Labels
+	for ss.Next() {
+		out = append(out, ss.At().Labels())
+	}
+	if err := ss.Err(); err != nil {
+		t.Fatalf("SeriesSet.Err(): %v", err)
+	}
+	return out
+}
+
+// assertSortedSeriesWriteToRealIndex is the decisive check: feed lset directly into
+// Prometheus's own index.Writer.AddSeries, which errors on any pair not in strict
+// labels.Compare order (see index.go's "out-of-order series added" check) - proving
+// sortRefsByLabels produces an order real Prometheus code actually accepts, not just
+// an order that happens to look right from the inside.
+func assertSortedSeriesWriteToRealIndex(t *testing.T, series []labels.Labels) {
+	t.Helper()
+	seen := make(map[string]struct{})
+	for _, l := range series {
+		l.Range(func(lb labels.Label) {
+			seen[lb.Name] = struct{}{}
+			seen[lb.Value] = struct{}{}
+		})
+	}
+	symbols := sortedKeys(seen)
+
+	w, err := index.NewWriter(context.Background(), filepath.Join(t.TempDir(), "index"))
+	if err != nil {
+		t.Fatalf("index.NewWriter: %v", err)
+	}
+	defer w.Close()
+
+	for _, sym := range symbols {
+		if err := w.AddSymbol(sym); err != nil {
+			t.Fatalf("AddSymbol(%q): %v", sym, err)
+		}
+	}
+	for i, l := range series {
+		if err := w.AddSeries(storage.SeriesRef(i), l); err != nil {
+			t.Fatalf("AddSeries(%v): %v", l, err)
 		}
 	}
 }

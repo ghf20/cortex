@@ -39,12 +39,13 @@ func (q *headQuerier) Close() error { return nil }
 // TestPostingsSpeedup). Falls back to a full scan when there's no exact __name__
 // matcher (regex/negation on __name__, or none at all) - matching the design doc's
 // own stated scope: this accelerates the common case, not every possible query
-// shape. sortSeries and hints.Func/Grouping/etc. are accepted but not applied -
-// results come out in whatever order the candidate set is in (postings creation
-// order, or ascending ref order for the full-scan fallback), a stable but arbitrary
-// order, not a label-sorted guarantee. hints.Start/End are ignored in favor of the
-// querier's own mint/maxt (from Head.Querier).
-func (q *headQuerier) Select(_ context.Context, _ bool, _ *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
+// shape. hints.Func/Grouping/etc. are accepted but not applied. hints.Start/End are
+// ignored in favor of the querier's own mint/maxt (from Head.Querier). sortSeries, when
+// true, sorts the result by labels.Compare - required by callers like
+// tsdb.CreateBlock/index.Writer.AddSeries that need strictly increasing label order;
+// when false, results come out in whatever order the candidate set is in (postings
+// creation order, or ascending ref order for the full-scan fallback).
+func (q *headQuerier) Select(_ context.Context, sortSeries bool, _ *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
 	candidates, rest := q.candidateRefs(matchers)
 	var refs []uint32
 	for _, ref := range candidates {
@@ -52,7 +53,19 @@ func (q *headQuerier) Select(_ context.Context, _ bool, _ *storage.SelectHints, 
 			refs = append(refs, ref)
 		}
 	}
+	if sortSeries {
+		sortRefsByLabels(q.h, refs)
+	}
 	return &headSeriesSet{h: q.h, refs: refs, mint: q.mint, maxt: q.maxt}
+}
+
+// sortRefsByLabels sorts refs in place by their reconstructed labels, using the same
+// labels.Compare ordering index.Writer.AddSeries requires from its caller (strictly
+// increasing, series-by-series).
+func sortRefsByLabels(h *Head, refs []uint32) {
+	sort.Slice(refs, func(i, j int) bool {
+		return labels.Compare(h.SeriesLabels(refs[i]), h.SeriesLabels(refs[j])) < 0
+	})
 }
 
 // refMatchesAll checks matchers against ref's labels one at a time via
