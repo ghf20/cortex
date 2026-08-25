@@ -103,6 +103,49 @@ func (h *Head) GetOrCreateSeries(target TargetLabels, metricName, localLabel str
 	return ref, nil
 }
 
+// lookupTarget returns target's symbol-ref tuple and whether it's already known,
+// without creating anything - the read-only counterpart to GetOrCreateSeries's target
+// resolution, for storage.GetRef.
+func (h *Head) lookupTarget(target TargetLabels) ([targetFields]uint32, bool) {
+	var tRefs [targetFields]uint32
+	for i, s := range [targetFields]string{
+		target.Cluster, target.Namespace, target.Pod, target.Container, target.Node, target.Job,
+	} {
+		id, ok := h.symbols.Lookup(s)
+		if !ok {
+			return tRefs, false
+		}
+		tRefs[i] = id
+	}
+	if _, ok := h.targetIndex[tRefs]; !ok {
+		return tRefs, false
+	}
+	return tRefs, true
+}
+
+// lookupSeries returns the series ref for (tRefs, metricName, localLabel) and whether
+// it's already known, without creating anything.
+func (h *Head) lookupSeries(tRefs [targetFields]uint32, metricName, localLabel string) (uint32, bool) {
+	targetID, ok := h.targetIndex[tRefs]
+	if !ok {
+		return 0, false
+	}
+	nameID32, ok := h.symbols.Lookup(metricName)
+	if !ok || nameID32 > math.MaxUint16 {
+		return 0, false
+	}
+	var localRef uint16
+	if localLabel != "" {
+		localRef32, ok := h.symbols.Lookup(localLabel)
+		if !ok || localRef32 > math.MaxUint16 {
+			return 0, false
+		}
+		localRef = uint16(localRef32)
+	}
+	ref, ok := h.seriesIndex[seriesKey{targetID, uint16(nameID32), localRef}]
+	return ref, ok
+}
+
 // Append encodes one sample for the series at ref.
 func (h *Head) Append(ref uint32, ts int64, v float64) error {
 	return h.series.Append(ref, ts, v)

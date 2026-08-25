@@ -39,6 +39,16 @@ func (li *liveInterner) Intern(s string) uint32 {
 	return id
 }
 
+// Lookup returns s's id without creating one - unlike Intern, a read-only check. A
+// pure lookup path (e.g. storage.GetRef, which must not create series as a side
+// effect of checking whether one exists) needs this instead of Intern: calling Intern
+// there would silently pollute the symbol table with an entry for every never-seen
+// label value a caller merely asked about.
+func (li *liveInterner) Lookup(s string) (uint32, bool) {
+	id, ok := li.index[s]
+	return id, ok
+}
+
 // String returns the interned string for id.
 func (li *liveInterner) String(id uint32) string {
 	return string(li.blob[li.offset[id]:li.offset[id+1]])
