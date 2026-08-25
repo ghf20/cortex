@@ -319,3 +319,39 @@ func (it *HistogramIterator) Next() bool {
 func (it *HistogramIterator) At() (int64, *histogram.Histogram) {
 	return it.curTS, it.curH
 }
+
+// Truncate drops every sample with ts < mint from ref's histogram stream, re-encoding
+// the retained range as a fresh stream in place - the same decode/re-encode approach
+// as SeriesStore.Truncate, for the same reason (no seek/cut point in a cross-sample
+// delta-encoded stream). Returns the number of samples retained. A no-op (returns 0)
+// if ref has no histogram stream at all (Has(ref) false) - not a caller bug, since a
+// mixed-type Head can have plenty of refs with no histogram samples.
+//
+// If every sample ages out, ref's entry is dropped from the map entirely rather than
+// kept as an empty placeholder: Has(ref) then reports false, and the read path falls
+// back to treating ref as float-typed - which is harmless here, since SeriesStore's
+// own record for a pure-histogram ref was never appended to and already reports zero
+// samples on that path too. A later real histogram sample on the same ref recreates
+// the entry exactly as Append already does for any first-ever sample.
+func (hst *HistogramStore) Truncate(ref uint32, mint int64) int {
+	if !hst.Has(ref) {
+		return 0
+	}
+	it := hst.Iterator(ref)
+	var tss []int64
+	var kept []*histogram.Histogram
+	for it.Next() {
+		ts, h := it.At()
+		if ts < mint {
+			continue
+		}
+		tss = append(tss, ts)
+		kept = append(kept, h)
+	}
+
+	delete(hst.series, ref)
+	for i, ts := range tss {
+		_ = hst.Append(ref, ts, kept[i])
+	}
+	return len(kept)
+}

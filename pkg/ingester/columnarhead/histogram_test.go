@@ -191,3 +191,102 @@ func TestHistogramStoreUnknownRefIteratorIsEmpty(t *testing.T) {
 		t.Fatal("Next() on an unknown ref = true, want false")
 	}
 }
+
+// TestHistogramStoreTruncate covers the same decode/re-encode path as
+// SeriesStore.Truncate, but for the map-backed histogram store: samples older than
+// mint are dropped, retained ones round-trip exactly, and a neighboring series is
+// untouched.
+func TestHistogramStoreTruncate(t *testing.T) {
+	hst := NewHistogramStore()
+	mk := func(count uint64, buckets []int64) *histogram.Histogram {
+		return &histogram.Histogram{
+			Schema:          0,
+			ZeroThreshold:   0.001,
+			Count:           count,
+			Sum:             float64(count),
+			PositiveSpans:   []histogram.Span{{Offset: 0, Length: 3}},
+			PositiveBuckets: buckets,
+		}
+	}
+	samples := []*histogram.Histogram{
+		mk(10, []int64{1, 0, 0}),
+		mk(20, []int64{1, 1, 0}),
+		mk(30, []int64{2, -1, 1}),
+		mk(40, []int64{0, 1, 0}),
+	}
+	ts := int64(1700000000000)
+	var timestamps []int64
+	for _, h := range samples {
+		if err := hst.Append(0, ts, h); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+		timestamps = append(timestamps, ts)
+		ts += 15000
+	}
+	otherH := mk(1, []int64{1, 0, 0})
+	if err := hst.Append(1, 1700000000000, otherH); err != nil {
+		t.Fatalf("Append(other): %v", err)
+	}
+
+	n := hst.Truncate(0, timestamps[2])
+	if n != 2 {
+		t.Fatalf("Truncate returned %d, want 2", n)
+	}
+
+	it := hst.Iterator(0)
+	i := 2
+	for it.Next() {
+		gotTS, gotH := it.At()
+		if gotTS != timestamps[i] {
+			t.Fatalf("sample %d: ts = %d, want %d", i-2, gotTS, timestamps[i])
+		}
+		histEqual(t, gotH, samples[i])
+		i++
+	}
+	if i != len(samples) {
+		t.Fatalf("decoded up to index %d, want %d", i, len(samples))
+	}
+
+	// The untouched neighbor must still decode correctly.
+	oit := hst.Iterator(1)
+	if !oit.Next() {
+		t.Fatal("other series: Next() = false, want true")
+	}
+	_, gotOther := oit.At()
+	histEqual(t, gotOther, otherH)
+}
+
+// TestHistogramStoreTruncateToEmptyThenReappend covers mint past every existing
+// sample: Has(ref) drops to false (see Truncate's doc comment on why that's fine),
+// and a later real Append recreates the series exactly like any first-ever sample.
+func TestHistogramStoreTruncateToEmptyThenReappend(t *testing.T) {
+	hst := NewHistogramStore()
+	h := &histogram.Histogram{
+		Schema: 0, Count: 1, Sum: 1,
+		PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{1},
+	}
+	if err := hst.Append(0, 1700000000000, h); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	if n := hst.Truncate(0, 1800000000000); n != 0 {
+		t.Fatalf("Truncate returned %d, want 0", n)
+	}
+	if hst.Has(0) {
+		t.Fatal("Has(0) = true after truncate-to-empty, want false")
+	}
+
+	h2 := &histogram.Histogram{
+		Schema: 0, Count: 2, Sum: 2,
+		PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{2},
+	}
+	if err := hst.Append(0, 1800000000000, h2); err != nil {
+		t.Fatalf("Append after truncate-to-empty: %v", err)
+	}
+	it := hst.Iterator(0)
+	if !it.Next() {
+		t.Fatal("Next() = false after re-append, want true")
+	}
+	_, got := it.At()
+	histEqual(t, got, h2)
+}

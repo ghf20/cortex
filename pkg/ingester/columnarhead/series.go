@@ -252,3 +252,48 @@ func (it *Iterator) Next() bool {
 func (it *Iterator) At() (int64, float64) {
 	return it.curTS, it.curVal
 }
+
+// Truncate drops every sample with ts < mint from ref's stream, re-encoding the
+// retained range as a fresh stream in place. Returns the number of samples retained -
+// 0 means every existing sample was older than mint, and ref stays allocated with an
+// empty stream rather than being removed (see Head.Truncate's doc comment on why).
+//
+// There is no seek/cut point in this format to make this an offset move: every
+// sample's encoding depends on all prior encoder state (delta-of-delta timestamps,
+// Gorilla XOR values - see tsState/valueState), so truncating means fully decoding the
+// retained range and re-encoding it from scratch, exactly as if every retained sample
+// were being appended for the first time. The old bits aren't reused (bitOff/nSamples/
+// ts/val reset to zero state before re-appending) but the slot itself is - re-Append
+// never needs to grow past ref's current slotCap, since the retained range is a subset
+// of what already fit there.
+func (s *SeriesStore) Truncate(ref uint32, mint int64) int {
+	it := s.Iterator(ref)
+	var tss []int64
+	var vs []float64
+	for it.Next() {
+		ts, v := it.At()
+		if ts < mint {
+			continue
+		}
+		tss = append(tss, ts)
+		vs = append(vs, v)
+	}
+
+	// writeBits ORs new bits into arena (see alloc's doc comment) - re-encoding into
+	// the old, un-cleared region would silently corrupt the result with leftover
+	// bits from the previous, longer encoding. Must clear before resetting bitOff.
+	base, cap := s.slotOff[ref], s.slotCap[ref]
+	clear(s.arena[base : base+cap])
+
+	s.bitOff[ref] = 0
+	s.nSamples[ref] = 0
+	s.ts[ref] = tsState{}
+	s.val[ref] = newValueState()
+
+	for i, ts := range tss {
+		// Append only fails past 65,535 samples (ErrTooManySamples) - impossible here
+		// since tss is a subset of what already fit under that same limit.
+		_ = s.Append(ref, ts, vs[i])
+	}
+	return len(tss)
+}

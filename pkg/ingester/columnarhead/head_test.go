@@ -5,6 +5,7 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 )
 
@@ -153,6 +154,65 @@ func TestHeadAppendAndIterate(t *testing.T) {
 		got = append(got, sample{ts, v})
 	}
 	assertSamplesEqual(t, got, want)
+}
+
+// TestHeadTruncate covers Head.Truncate's role as orchestrator across both stores:
+// a float series and a histogram series each get some samples dropped, one series
+// (the counter) gets truncated down to zero remaining samples entirely, and the head
+// itself keeps reporting the same series count throughout - no series is ever removed
+// by Truncate (see its doc comment).
+func TestHeadTruncate(t *testing.T) {
+	h := NewHead(2, 2, 2)
+	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
+
+	gaugeRef, err := h.GetOrCreateSeries(tgt, "temperature", "", "")
+	if err != nil {
+		t.Fatalf("GetOrCreateSeries(gauge): %v", err)
+	}
+	gauge := []sample{
+		{1700000000000, 10}, {1700000015000, 20}, {1700000030000, 30}, {1700000045000, 40},
+	}
+	for _, sm := range gauge {
+		if err := h.Append(gaugeRef, sm.ts, sm.v); err != nil {
+			t.Fatalf("Append(gauge): %v", err)
+		}
+	}
+
+	histRef, err := h.GetOrCreateSeries(tgt, "request_latency", "", "")
+	if err != nil {
+		t.Fatalf("GetOrCreateSeries(hist): %v", err)
+	}
+	hists := []*histogram.Histogram{
+		{Schema: 0, Count: 1, Sum: 1, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{1}},
+		{Schema: 0, Count: 2, Sum: 2, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{1}},
+	}
+	histTS := []int64{1700000000000, 1700000015000}
+	for i, hg := range hists {
+		if err := h.AppendHistogram(histRef, histTS[i], hg); err != nil {
+			t.Fatalf("AppendHistogram: %v", err)
+		}
+	}
+
+	// Truncate everything before the gauge's 3rd sample - drops the histogram
+	// series' entire range too (its last sample is older than the new mint).
+	h.Truncate(1700000030000)
+
+	var gotGauge []sample
+	git := h.Iterator(gaugeRef)
+	for git.Next() {
+		ts, v := git.At()
+		gotGauge = append(gotGauge, sample{ts, v})
+	}
+	assertSamplesEqual(t, gotGauge, gauge[2:])
+
+	hit := h.HistogramIterator(histRef)
+	if hit.Next() {
+		t.Fatal("histogram series: Next() = true after truncating its whole range, want false")
+	}
+
+	if h.NumSeries() != 2 {
+		t.Fatalf("NumSeries() = %d after Truncate, want 2 (no series ever removed)", h.NumSeries())
+	}
 }
 
 // TestHeadAtScale measures the real, honest end-to-end memory cost of the actual

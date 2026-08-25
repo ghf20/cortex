@@ -231,6 +231,96 @@ func TestSeriesStoreFreeListReuseIsZeroed(t *testing.T) {
 	}
 }
 
+// TestSeriesStoreTruncate covers the core decode/re-encode path: samples older than
+// mint are dropped, samples at or after mint survive bit-for-bit, and a neighboring
+// series (sharing the same underlying arena) is untouched.
+func TestSeriesStoreTruncate(t *testing.T) {
+	s := NewSeriesStore(2)
+	ref := s.Create(0, 0, 0, 0, false)
+	other := s.Create(1, 1, 0, 1, false)
+
+	all := []sample{
+		{1700000000000, 1.5},
+		{1700000015000, 2.5},
+		{1700000030000, 3.5},
+		{1700000045000, 4.5},
+		{1700000060000, 5.5},
+	}
+	for _, sm := range all {
+		if err := s.Append(ref, sm.ts, sm.v); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+	wantOther := []sample{{1700000000000, 42}, {1700000015000, 43}}
+	for _, sm := range wantOther {
+		if err := s.Append(other, sm.ts, sm.v); err != nil {
+			t.Fatalf("Append(other): %v", err)
+		}
+	}
+
+	n := s.Truncate(ref, 1700000030000)
+	if n != 3 {
+		t.Fatalf("Truncate returned %d, want 3", n)
+	}
+	assertSamplesEqual(t, decodeAll(t, s, ref), all[2:])
+	if s.nSamples[ref] != 3 {
+		t.Fatalf("nSamples[ref] = %d, want 3", s.nSamples[ref])
+	}
+	assertSamplesEqual(t, decodeAll(t, s, other), wantOther)
+}
+
+// TestSeriesStoreTruncateToEmpty covers mint past every existing sample: the series
+// stays allocated with zero samples rather than erroring or panicking.
+func TestSeriesStoreTruncateToEmpty(t *testing.T) {
+	s := NewSeriesStore(1)
+	ref := s.Create(0, 0, 0, 0, false)
+	want := []sample{{1700000000000, 1}, {1700000015000, 2}}
+	for _, sm := range want {
+		if err := s.Append(ref, sm.ts, sm.v); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+
+	if n := s.Truncate(ref, 1800000000000); n != 0 {
+		t.Fatalf("Truncate returned %d, want 0", n)
+	}
+	if got := decodeAll(t, s, ref); len(got) != 0 {
+		t.Fatalf("decoded %d samples after truncate-to-empty, want 0", len(got))
+	}
+	if s.NumSeries() != 1 {
+		t.Fatalf("NumSeries() = %d, want 1 (series must stay allocated, not removed)", s.NumSeries())
+	}
+}
+
+// TestSeriesStoreTruncateThenAppendMore checks that a truncated series' encoder state
+// is genuinely reset, not left pointing at stale deltas: appending after a truncate
+// must encode correctly relative to the new first retained sample, not the original
+// (now-dropped) first sample.
+func TestSeriesStoreTruncateThenAppendMore(t *testing.T) {
+	s := NewSeriesStore(1)
+	ref := s.Create(0, 0, 0, 0, false)
+	before := []sample{
+		{1700000000000, 100},
+		{1700000015000, 200},
+		{1700000030000, 300},
+	}
+	for _, sm := range before {
+		if err := s.Append(ref, sm.ts, sm.v); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+	s.Truncate(ref, 1700000015000) // drops the first sample only
+
+	more := []sample{{1700000045000, 400}, {1700000060000, 500}}
+	for _, sm := range more {
+		if err := s.Append(ref, sm.ts, sm.v); err != nil {
+			t.Fatalf("Append after Truncate: %v", err)
+		}
+	}
+	want := append(append([]sample{}, before[1:]...), more...)
+	assertSamplesEqual(t, decodeAll(t, s, ref), want)
+}
+
 func TestSeriesStoreNumSeries(t *testing.T) {
 	s := NewSeriesStore(0)
 	if s.NumSeries() != 0 {

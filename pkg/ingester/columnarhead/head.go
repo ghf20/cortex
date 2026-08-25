@@ -359,6 +359,33 @@ func (h *Head) SeriesRefsForName(metricName string) ([]uint32, bool) {
 	return refs, ok
 }
 
+// Truncate drops every sample with ts < mint across every series, both float
+// (SeriesStore) and histogram (HistogramStore) - this package's counterpart to real
+// Prometheus's tsdb.Head.Truncate, needed to keep a running head's memory bounded once
+// compaction has made a range durable elsewhere (see CHECKLIST.md's Phase 5a: without
+// this, the columnar arena only ever grows). Unlike real Prometheus, which drops
+// per-series memChunk object references directly, this format has no seek/cut point -
+// each series is one continuous cross-sample-encoded stream, so truncating means
+// fully decoding and re-encoding the retained range (see SeriesStore.Truncate/
+// HistogramStore.Truncate's doc comments).
+//
+// No series is ever removed from the head's indexes here: refs are permanent for the
+// process's life (targetIndex/seriesIndex/namePostings all key on them directly), so a
+// series truncated down to zero remaining samples just stays allocated and empty -
+// exactly the already-supported "matcher hits, zero samples in range" case Querier's
+// doc comment describes, not a new kind of state. That means this reclaims arena
+// bytes for aged-out sample data (real, bounded memory reclaim) but NOT the
+// O(1)-per-series index/postings/full-scan cost of series nobody will ever query
+// again - full removal of wholly-empty series from those structures is a further,
+// not-yet-built step.
+func (h *Head) Truncate(mint int64) {
+	n := uint32(h.series.NumSeries())
+	for ref := uint32(0); ref < n; ref++ {
+		h.series.Truncate(ref, mint)
+		h.histograms.Truncate(ref, mint)
+	}
+}
+
 // NumSeries, NumTargets, NumSymbols report the head's current cardinality.
 func (h *Head) NumSeries() int  { return h.series.NumSeries() }
 func (h *Head) NumTargets() int { return h.targets.NumTargets() }
