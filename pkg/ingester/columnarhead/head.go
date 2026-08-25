@@ -3,7 +3,17 @@ package columnarhead
 import (
 	"errors"
 	"math"
+
+	"github.com/prometheus/prometheus/model/exemplar"
+	"github.com/prometheus/prometheus/model/histogram"
+	"github.com/prometheus/prometheus/model/metadata"
 )
+
+// defaultExemplarCapacity is a placeholder default for exemplarStorage's ring size,
+// not a tuned value - real Cortex configures this per-tenant (maxExemplarsForUser in
+// pkg/ingester/ingester.go). NewHead doesn't expose it as a parameter yet; that's the
+// natural next step if/when this gets wired into real per-tenant config.
+const defaultExemplarCapacity = 10_000
 
 // ErrTooManySymbols is returned by GetOrCreateSeries if a metric name or local label
 // value would be the 65,537th distinct one interned - SeriesStore's nameID/localRef
@@ -34,6 +44,11 @@ type Head struct {
 
 	targetIndex map[[targetFields]uint32]uint32
 	seriesIndex map[seriesKey]uint32
+
+	metadata   *seriesMetadata
+	lastST     map[uint32]int64 // series ref -> most recent start-timestamp recorded via SetSTZeroSample
+	exemplars  *exemplarStorage
+	histograms *HistogramStore
 }
 
 // TargetLabels is the fixed 6-label shared block every series belongs to (§3.1).
@@ -55,6 +70,10 @@ func NewHead(expectedSeries, expectedTargets, expectedSymbols int) *Head {
 		series:      NewSeriesStore(expectedSeries),
 		targetIndex: make(map[[targetFields]uint32]uint32, expectedTargets),
 		seriesIndex: make(map[seriesKey]uint32, expectedSeries),
+		metadata:    newSeriesMetadata(),
+		lastST:      make(map[uint32]int64),
+		exemplars:   newExemplarStorage(defaultExemplarCapacity),
+		histograms:  NewHistogramStore(),
 	}
 }
 
@@ -149,6 +168,81 @@ func (h *Head) lookupSeries(tRefs [targetFields]uint32, metricName, localLabel s
 // Append encodes one sample for the series at ref.
 func (h *Head) Append(ref uint32, ts int64, v float64) error {
 	return h.series.Append(ref, ts, v)
+}
+
+// ErrSeriesNotFound is returned by SetMetadata when ref doesn't correspond to a series
+// this Head has created - unlike GetOrCreateSeries, metadata updates don't implicitly
+// create series (matches storage.MetadataUpdater's documented contract: "If the series
+// does not exist, UpdateMetadata returns an error").
+var ErrSeriesNotFound = errors.New("columnarhead: series not found")
+
+// SetMetadata records m for the series at ref. Returns ErrSeriesNotFound if ref is out
+// of range for this Head.
+func (h *Head) SetMetadata(ref uint32, m metadata.Metadata) error {
+	if ref >= uint32(h.series.NumSeries()) {
+		return ErrSeriesNotFound
+	}
+	h.metadata.set(ref, m)
+	return nil
+}
+
+// Metadata returns the metadata recorded for ref, if any.
+func (h *Head) Metadata(ref uint32) (metadata.Metadata, bool) {
+	return h.metadata.get(ref)
+}
+
+// ErrSTZeroSampleCollision is returned by SetSTZeroSample when st is not strictly
+// before the incoming sample's timestamp t - storage.StartTimestampAppender's
+// documented contract says the real sample has priority in that case.
+var ErrSTZeroSampleCollision = errors.New("columnarhead: start-timestamp collides with the incoming sample")
+
+// ErrSTZeroSampleTooOld is returned by SetSTZeroSample when st is not after the most
+// recently recorded start-timestamp for this series - a stale or duplicate zero
+// sample, per storage.StartTimestampAppender's "st is too old" rejection case.
+var ErrSTZeroSampleTooOld = errors.New("columnarhead: start-timestamp is not newer than the last one recorded")
+
+// SetSTZeroSample records a synthetic zero-value sample at st for the series at ref,
+// via the same value/timestamp encoding path a real Append uses. Must be called
+// before the corresponding real sample's Append at timestamp t - see
+// ErrSTZeroSampleCollision/ErrSTZeroSampleTooOld for the two rejection cases
+// storage.StartTimestampAppender's contract documents.
+func (h *Head) SetSTZeroSample(ref uint32, t, st int64) error {
+	if st >= t {
+		return ErrSTZeroSampleCollision
+	}
+	if last, ok := h.lastST[ref]; ok && st <= last {
+		return ErrSTZeroSampleTooOld
+	}
+	if err := h.series.Append(ref, st, 0); err != nil {
+		return err
+	}
+	h.lastST[ref] = st
+	return nil
+}
+
+// AppendExemplar stores e for the series at ref. Does not validate ref against
+// NumSeries() the way SetMetadata/Append do: an out-of-range ref just means the
+// stored exemplar can never be retrieved by a real series, not a corruption risk
+// (exemplarStorage indexes by ref value only, never dereferences it into SeriesStore).
+func (h *Head) AppendExemplar(ref uint32, e exemplar.Exemplar) {
+	h.exemplars.append(ref, e)
+}
+
+// Exemplars returns every currently retained exemplar for ref, oldest first.
+func (h *Head) Exemplars(ref uint32) []exemplarEntry {
+	return h.exemplars.forSeries(ref)
+}
+
+// AppendHistogram encodes one histogram sample for the series at ref. See
+// HistogramStore's doc comment for what this does and does not support (stable
+// schema/zero-threshold/span layout only, no custom buckets).
+func (h *Head) AppendHistogram(ref uint32, ts int64, hg *histogram.Histogram) error {
+	return h.histograms.Append(ref, ts, hg)
+}
+
+// HistogramIterator returns an iterator over ref's encoded histogram samples.
+func (h *Head) HistogramIterator(ref uint32) *HistogramIterator {
+	return h.histograms.Iterator(ref)
 }
 
 // Iterator returns an iterator over ref's encoded samples.

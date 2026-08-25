@@ -23,11 +23,11 @@ import (
 // CHECKLIST.md.
 var ErrUnsupportedLabelShape = errors.New("columnarhead: label set has more than one non-target, non-__name__ label - unsupported by this prototype")
 
-// ErrNotImplemented is returned by every Appender method this prototype doesn't
-// support yet: exemplars, native histograms, metadata, and start-timestamp zero
-// samples. Design doc §9 gap #1 already calls these out as missing; returning a clear
-// error here (rather than silently succeeding and dropping the data) makes that gap
-// visible to any caller instead of a silent correctness hole.
+// ErrNotImplemented now guards exactly one remaining gap: AppendHistogramSTZeroSample
+// (see its own doc comment for why). Exemplars, native histograms (the stable-layout
+// case), metadata, and float start-timestamp zero samples - all originally listed
+// here as missing, per design doc §9 gap #1 - are now implemented; see metadata.go,
+// exemplar.go, histogram.go, and Head.SetSTZeroSample.
 var ErrNotImplemented = errors.New("columnarhead: not implemented in this prototype")
 
 const (
@@ -198,22 +198,133 @@ func (a *headAppender) SetOptions(*storage.AppendOptions) {
 func (a *headAppender) Commit() error   { return nil }
 func (a *headAppender) Rollback() error { return nil }
 
-func (a *headAppender) AppendExemplar(storage.SeriesRef, labels.Labels, exemplar.Exemplar) (storage.SeriesRef, error) {
-	return 0, ErrNotImplemented
+// AppendExemplar resolves l to a series and stores e for it. Does NOT create a series
+// that doesn't already exist - the real storage.ExemplarAppender's doc comment treats
+// AppendExemplar generating a new series reference as "possible erroneous behaviour"
+// (exemplars conceptually attach to an existing series' samples), so this returns
+// ErrSeriesNotFound rather than silently creating a phantom series with no target/
+// metric labels behind it - same posture as UpdateMetadata.
+func (a *headAppender) AppendExemplar(ref storage.SeriesRef, l labels.Labels, e exemplar.Exemplar) (storage.SeriesRef, error) {
+	if ref != 0 {
+		if internalRef, ok := toInternalRef(ref, a.h.NumSeries()); ok {
+			a.h.AppendExemplar(internalRef, e)
+			return ref, nil
+		}
+	}
+	target, metricName, localLabel, err := splitLabels(l)
+	if err != nil {
+		return 0, err
+	}
+	tRefs, ok := a.h.lookupTarget(target)
+	if !ok {
+		return 0, ErrSeriesNotFound
+	}
+	internalRef, ok := a.h.lookupSeries(tRefs, metricName, localLabel)
+	if !ok {
+		return 0, ErrSeriesNotFound
+	}
+	a.h.AppendExemplar(internalRef, e)
+	return toExternalRef(internalRef), nil
 }
 
-func (a *headAppender) AppendHistogram(storage.SeriesRef, labels.Labels, int64, *histogram.Histogram, *histogram.FloatHistogram) (storage.SeriesRef, error) {
-	return 0, ErrNotImplemented
+// AppendHistogram resolves l to a series (creating it if needed, same as Append) and
+// records h. Only *histogram.Histogram is supported - fh (*histogram.FloatHistogram)
+// returns ErrFloatHistogramUnsupported, a stated scope limit (see HistogramStore's
+// doc comment), not silently mishandled. See Head.AppendHistogram /
+// HistogramStore.Append for what layouts are supported.
+func (a *headAppender) AppendHistogram(ref storage.SeriesRef, l labels.Labels, t int64, h *histogram.Histogram, fh *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	if h == nil {
+		return 0, ErrFloatHistogramUnsupported
+	}
+	if ref != 0 {
+		if internalRef, ok := toInternalRef(ref, a.h.NumSeries()); ok {
+			if err := a.h.AppendHistogram(internalRef, t, h); err != nil {
+				return 0, err
+			}
+			return ref, nil
+		}
+	}
+	target, metricName, localLabel, err := splitLabels(l)
+	if err != nil {
+		return 0, err
+	}
+	seriesRef, err := a.h.GetOrCreateSeries(target, metricName, localLabel)
+	if err != nil {
+		return 0, err
+	}
+	if err := a.h.AppendHistogram(seriesRef, t, h); err != nil {
+		return 0, err
+	}
+	return toExternalRef(seriesRef), nil
 }
 
+// AppendHistogramSTZeroSample is a deliberate, stated gap, not an oversight: it must
+// be called BEFORE the paired AppendHistogram (per the interface's documented
+// contract), meaning the series' schema/span layout isn't known yet - but
+// HistogramStore's whole encoding model requires the FIRST sample to establish that
+// layout (see its doc comment). Synthesizing a correct "zero histogram" with an
+// as-yet-unknown layout is real complexity the float path's AppendSTZeroSample
+// doesn't have (a float zero-sample is trivially 0.0 regardless of what follows).
 func (a *headAppender) AppendHistogramSTZeroSample(storage.SeriesRef, labels.Labels, int64, int64, *histogram.Histogram, *histogram.FloatHistogram) (storage.SeriesRef, error) {
 	return 0, ErrNotImplemented
 }
 
-func (a *headAppender) UpdateMetadata(storage.SeriesRef, labels.Labels, metadata.Metadata) (storage.SeriesRef, error) {
-	return 0, ErrNotImplemented
+// UpdateMetadata records m for the series ref/l resolves to. Unlike Append, this does
+// NOT create a series that doesn't already exist - matches storage.MetadataUpdater's
+// documented contract ("If the series does not exist, UpdateMetadata returns an
+// error"). Uses the same ref fast path as Append (bounds-checked, falls back to label
+// resolution on a stale/zero ref) before falling back to the read-only lookup path
+// GetRef also uses.
+func (a *headAppender) UpdateMetadata(ref storage.SeriesRef, l labels.Labels, m metadata.Metadata) (storage.SeriesRef, error) {
+	if ref != 0 {
+		if internalRef, ok := toInternalRef(ref, a.h.NumSeries()); ok {
+			if err := a.h.SetMetadata(internalRef, m); err != nil {
+				return 0, err
+			}
+			return ref, nil
+		}
+	}
+	target, metricName, localLabel, err := splitLabels(l)
+	if err != nil {
+		return 0, err
+	}
+	tRefs, ok := a.h.lookupTarget(target)
+	if !ok {
+		return 0, ErrSeriesNotFound
+	}
+	internalRef, ok := a.h.lookupSeries(tRefs, metricName, localLabel)
+	if !ok {
+		return 0, ErrSeriesNotFound
+	}
+	if err := a.h.SetMetadata(internalRef, m); err != nil {
+		return 0, err
+	}
+	return toExternalRef(internalRef), nil
 }
 
-func (a *headAppender) AppendSTZeroSample(storage.SeriesRef, labels.Labels, int64, int64) (storage.SeriesRef, error) {
-	return 0, ErrNotImplemented
+// AppendSTZeroSample resolves l to a series (creating it if needed, same as Append -
+// this is typically the first call for a new series, establishing its start time
+// before the corresponding real sample) and records a synthetic zero sample at st.
+// Uses the same ref fast path as Append.
+func (a *headAppender) AppendSTZeroSample(ref storage.SeriesRef, l labels.Labels, t, st int64) (storage.SeriesRef, error) {
+	if ref != 0 {
+		if internalRef, ok := toInternalRef(ref, a.h.NumSeries()); ok {
+			if err := a.h.SetSTZeroSample(internalRef, t, st); err != nil {
+				return 0, err
+			}
+			return ref, nil
+		}
+	}
+	target, metricName, localLabel, err := splitLabels(l)
+	if err != nil {
+		return 0, err
+	}
+	seriesRef, err := a.h.GetOrCreateSeries(target, metricName, localLabel)
+	if err != nil {
+		return 0, err
+	}
+	if err := a.h.SetSTZeroSample(seriesRef, t, st); err != nil {
+		return 0, err
+	}
+	return toExternalRef(seriesRef), nil
 }

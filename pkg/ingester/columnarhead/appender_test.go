@@ -4,7 +4,9 @@ import (
 	"context"
 	"testing"
 
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/exemplar"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/metadata"
 	"github.com/prometheus/prometheus/storage"
@@ -199,20 +201,236 @@ func TestAppenderUnimplementedMethodsFailLoudly(t *testing.T) {
 	app := h.Appender(context.Background())
 	l := labels.EmptyLabels()
 
-	if _, err := app.AppendExemplar(0, l, exemplar.Exemplar{}); err != ErrNotImplemented {
-		t.Errorf("AppendExemplar = %v, want ErrNotImplemented", err)
-	}
-	if _, err := app.AppendHistogram(0, l, 0, nil, nil); err != ErrNotImplemented {
-		t.Errorf("AppendHistogram = %v, want ErrNotImplemented", err)
-	}
 	if _, err := app.AppendHistogramSTZeroSample(0, l, 0, 0, nil, nil); err != ErrNotImplemented {
 		t.Errorf("AppendHistogramSTZeroSample = %v, want ErrNotImplemented", err)
 	}
-	if _, err := app.UpdateMetadata(0, l, metadata.Metadata{}); err != ErrNotImplemented {
-		t.Errorf("UpdateMetadata = %v, want ErrNotImplemented", err)
+}
+
+func TestAppenderHistogram(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	app := h.Appender(context.Background())
+	l := labels.FromStrings(
+		labels.MetricName, "request_duration_seconds",
+		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+	)
+
+	hist := &histogram.Histogram{
+		Schema:          0,
+		ZeroThreshold:   0.001,
+		ZeroCount:       2,
+		Count:           10,
+		Sum:             42.5,
+		PositiveSpans:   []histogram.Span{{Offset: 0, Length: 2}},
+		PositiveBuckets: []int64{3, 1},
 	}
-	if _, err := app.AppendSTZeroSample(0, l, 0, 0); err != ErrNotImplemented {
-		t.Errorf("AppendSTZeroSample = %v, want ErrNotImplemented", err)
+	ref, err := app.AppendHistogram(0, l, 1700000000000, hist, nil)
+	if err != nil {
+		t.Fatalf("AppendHistogram: %v", err)
+	}
+	if ref == 0 {
+		t.Fatal("AppendHistogram returned ref 0 for a real series")
+	}
+
+	it := h.HistogramIterator(uint32(ref) - 1)
+	if !it.Next() {
+		t.Fatal("HistogramIterator.Next() = false")
+	}
+	gotTS, gotH := it.At()
+	if gotTS != 1700000000000 {
+		t.Fatalf("ts = %d, want 1700000000000", gotTS)
+	}
+	histEqual(t, gotH, hist)
+
+	// FloatHistogram is a stated, explicit gap, not silently mishandled.
+	if _, err := app.AppendHistogram(0, l, 1700000015000, nil, &histogram.FloatHistogram{}); err != ErrFloatHistogramUnsupported {
+		t.Fatalf("AppendHistogram with only a FloatHistogram = %v, want ErrFloatHistogramUnsupported", err)
+	}
+
+	// The ref fast path must also work.
+	hist2 := &histogram.Histogram{
+		Schema: 0, ZeroThreshold: 0.001, ZeroCount: 2, Count: 12, Sum: 50,
+		PositiveSpans: hist.PositiveSpans, PositiveBuckets: []int64{4, 0},
+	}
+	if _, err := app.AppendHistogram(ref, labels.EmptyLabels(), 1700000030000, hist2, nil); err != nil {
+		t.Fatalf("AppendHistogram via ref fast path: %v", err)
+	}
+	// HistogramIterator is a fixed snapshot at creation time (same established
+	// pattern as SeriesStore.Iterator) - a fresh call is needed to see the new sample.
+	it2 := h.HistogramIterator(uint32(ref) - 1)
+	if !it2.Next() {
+		t.Fatal("fresh HistogramIterator should have a first sample")
+	}
+	if !it2.Next() {
+		t.Fatal("fresh HistogramIterator should have a second sample")
+	}
+	_, gotH2 := it2.At()
+	histEqual(t, gotH2, hist2)
+}
+
+func TestAppenderExemplar(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	app := h.Appender(context.Background())
+	l := labels.FromStrings(
+		labels.MetricName, "requests_total",
+		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+	)
+
+	// Exemplars must NOT create a series - same posture as UpdateMetadata.
+	if _, err := app.AppendExemplar(0, l, exemplar.Exemplar{Value: 1, Ts: 1700000000000}); err != ErrSeriesNotFound {
+		t.Fatalf("AppendExemplar on an unknown series = %v, want ErrSeriesNotFound", err)
+	}
+	if h.NumSeries() != 0 {
+		t.Fatalf("NumSeries() = %d after AppendExemplar on an unknown series, want 0", h.NumSeries())
+	}
+
+	ref, err := app.Append(0, l, 1700000000000, 1)
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	traceLabels := labels.FromStrings("trace_id", "abc123")
+	want := exemplar.Exemplar{Labels: traceLabels, Value: 42.5, Ts: 1700000000000, HasTs: true}
+	gotRef, err := app.AppendExemplar(0, l, want)
+	if err != nil {
+		t.Fatalf("AppendExemplar: %v", err)
+	}
+	if gotRef != ref {
+		t.Fatalf("AppendExemplar returned ref %d, want %d", gotRef, ref)
+	}
+
+	got := h.Exemplars(uint32(ref) - 1)
+	if len(got) != 1 {
+		t.Fatalf("Exemplars(ref) has %d entries, want 1", len(got))
+	}
+	if got[0].value != want.Value || got[0].ts != want.Ts || got[0].labels["trace_id"] != "abc123" {
+		t.Fatalf("Exemplars(ref)[0] = %+v, want value=%v ts=%v trace_id=abc123", got[0], want.Value, want.Ts)
+	}
+
+	// The ref fast path must also work.
+	second := exemplar.Exemplar{Value: 99, Ts: 1700000015000}
+	if _, err := app.AppendExemplar(ref, labels.EmptyLabels(), second); err != nil {
+		t.Fatalf("AppendExemplar via ref fast path: %v", err)
+	}
+	got = h.Exemplars(uint32(ref) - 1)
+	if len(got) != 2 {
+		t.Fatalf("Exemplars(ref) has %d entries after a second append, want 2", len(got))
+	}
+}
+
+// TestExemplarStorageRingWraps verifies the ring buffer actually overwrites the
+// oldest entry when full, rather than growing unboundedly or silently dropping new
+// writes - the core property that makes it a bounded, real implementation instead of
+// just a slice with extra steps.
+func TestExemplarStorageRingWraps(t *testing.T) {
+	es := newExemplarStorage(3)
+	for i := 0; i < 5; i++ {
+		es.append(1, exemplar.Exemplar{Value: float64(i), Ts: int64(i)})
+	}
+	if es.Len() != 3 {
+		t.Fatalf("Len() = %d, want 3 (capacity)", es.Len())
+	}
+	got := es.forSeries(1)
+	if len(got) != 3 {
+		t.Fatalf("forSeries(1) has %d entries, want 3", len(got))
+	}
+	// Entries 0 and 1 were overwritten; 2, 3, 4 should remain, oldest first.
+	wantTS := []int64{2, 3, 4}
+	for i, e := range got {
+		if e.ts != wantTS[i] {
+			t.Fatalf("forSeries(1)[%d].ts = %d, want %d", i, e.ts, wantTS[i])
+		}
+	}
+}
+
+func TestAppenderSTZeroSample(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	app := h.Appender(context.Background())
+	l := labels.FromStrings(
+		labels.MetricName, "requests_total",
+		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+	)
+
+	// A collision with the incoming sample's own timestamp must be rejected -
+	// storage.StartTimestampAppender's contract gives the real sample priority.
+	if _, err := app.AppendSTZeroSample(0, l, 1700000015000, 1700000015000); err != ErrSTZeroSampleCollision {
+		t.Fatalf("AppendSTZeroSample(st == t) = %v, want ErrSTZeroSampleCollision", err)
+	}
+	if _, err := app.AppendSTZeroSample(0, l, 1700000015000, 1700000020000); err != ErrSTZeroSampleCollision {
+		t.Fatalf("AppendSTZeroSample(st > t) = %v, want ErrSTZeroSampleCollision", err)
+	}
+
+	// Normal case: ST strictly before the real sample, called first (as the contract
+	// requires), creates the series.
+	ref, err := app.AppendSTZeroSample(0, l, 1700000015000, 1700000000000)
+	if err != nil {
+		t.Fatalf("AppendSTZeroSample: %v", err)
+	}
+	if ref == 0 {
+		t.Fatal("AppendSTZeroSample returned ref 0 for a real series")
+	}
+	if _, err := app.Append(ref, l, 1700000015000, 1); err != nil {
+		t.Fatalf("Append (the real sample): %v", err)
+	}
+
+	it := h.Iterator(uint32(ref) - 1)
+	var got []sample
+	for it.Next() {
+		ts, v := it.At()
+		got = append(got, sample{ts, v})
+	}
+	assertSamplesEqual(t, got, []sample{{1700000000000, 0}, {1700000015000, 1}})
+
+	// A stale/duplicate ST (not after the one already recorded) must be rejected.
+	if _, err := app.AppendSTZeroSample(ref, l, 1700000030000, 1700000000000); err != ErrSTZeroSampleTooOld {
+		t.Fatalf("AppendSTZeroSample with a repeated st = %v, want ErrSTZeroSampleTooOld", err)
+	}
+	if _, err := app.AppendSTZeroSample(ref, l, 1700000030000, 1699999999999); err != ErrSTZeroSampleTooOld {
+		t.Fatalf("AppendSTZeroSample with an older st = %v, want ErrSTZeroSampleTooOld", err)
+	}
+}
+
+func TestAppenderUpdateMetadata(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	app := h.Appender(context.Background())
+	l := labels.FromStrings(
+		labels.MetricName, "up",
+		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+	)
+
+	// UpdateMetadata must NOT create a series - it's an error against an unknown one.
+	if _, err := app.UpdateMetadata(0, l, metadata.Metadata{Type: model.MetricTypeGauge}); err != ErrSeriesNotFound {
+		t.Fatalf("UpdateMetadata on an unknown series = %v, want ErrSeriesNotFound", err)
+	}
+	if h.NumSeries() != 0 {
+		t.Fatalf("NumSeries() = %d after UpdateMetadata on an unknown series, want 0 (must not create)", h.NumSeries())
+	}
+
+	ref, err := app.Append(0, l, 1700000000000, 1)
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	want := metadata.Metadata{Type: model.MetricTypeCounter, Unit: "seconds", Help: "cpu time"}
+	gotRef, err := app.UpdateMetadata(0, l, want)
+	if err != nil {
+		t.Fatalf("UpdateMetadata: %v", err)
+	}
+	if gotRef != ref {
+		t.Fatalf("UpdateMetadata returned ref %d, want %d", gotRef, ref)
+	}
+	got, ok := h.Metadata(uint32(ref) - 1)
+	if !ok || got != want {
+		t.Fatalf("Metadata(ref) = (%v, %v), want (%v, true)", got, ok, want)
+	}
+
+	// The ref fast path must also work, without re-resolving via labels.
+	updated := metadata.Metadata{Type: model.MetricTypeCounter, Unit: "seconds", Help: "updated"}
+	if _, err := app.UpdateMetadata(ref, labels.EmptyLabels(), updated); err != nil {
+		t.Fatalf("UpdateMetadata via ref fast path: %v", err)
+	}
+	got, ok = h.Metadata(uint32(ref) - 1)
+	if !ok || got != updated {
+		t.Fatalf("Metadata(ref) after ref-based update = (%v, %v), want (%v, true)", got, ok, updated)
 	}
 }
 
