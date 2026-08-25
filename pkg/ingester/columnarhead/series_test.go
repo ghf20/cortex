@@ -90,12 +90,6 @@ func TestSeriesStoreRoundTrip_Patterns(t *testing.T) {
 func TestSeriesStoreRoundTrip_Random(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 	s := NewSeriesStore(1)
-	// Wider than the default slot: case 2 below is adversarially high-entropy (a fresh
-	// near-max-precision random float every sample, forcing a new encoder window each
-	// time), not representative of real workloads - the default-slot behavior under
-	// realistic entropy is what TestSeriesStoreSlotFull and the bench/ bit-rate
-	// measurements cover.
-	s.slotBytes = 1024
 	ref := s.Create(0, 0, 0)
 
 	var want []sample
@@ -150,32 +144,39 @@ func TestSeriesStoreIsolatesSeries(t *testing.T) {
 	assertSamplesEqual(t, decodeAll(t, s, refC), wantC)
 }
 
-func TestSeriesStoreSlotFull(t *testing.T) {
-	s := NewSeriesStore(1)
+// TestSeriesStoreGrowsAcrossManySamples appends far more samples than the 16-byte
+// initial slot can hold, forcing many grow events (each copies the series' bits to a
+// fresh arena region). This is the case that would surface a copy-offset bug or a
+// growth event corrupting a neighboring series' still-live slot.
+func TestSeriesStoreGrowsAcrossManySamples(t *testing.T) {
+	s := NewSeriesStore(2)
 	ref := s.Create(0, 0, 0)
+	other := s.Create(1, 1, 1) // must survive ref's many grow events untouched
 
-	var want []sample
+	var want, wantOther []sample
 	ts := int64(1700000000000)
-	var appendErr error
+	otherTS := int64(1700000000000)
 	for i := 0; i < 1000; i++ {
 		ts += 15000
 		v := float64(i) * 1.7 // irregular deltas, avoids the cheap 1-bit "unchanged" path
 		if err := s.Append(ref, ts, v); err != nil {
-			appendErr = err
-			break
+			t.Fatalf("Append at sample %d: %v", i, err)
 		}
 		want = append(want, sample{ts, v})
+
+		if i%10 == 0 {
+			otherTS += 15000
+			if err := s.Append(other, otherTS, 42); err != nil {
+				t.Fatalf("Append(other) at sample %d: %v", i, err)
+			}
+			wantOther = append(wantOther, sample{otherTS, 42})
+		}
 	}
-	if appendErr != ErrSlotFull {
-		t.Fatalf("expected ErrSlotFull once the fixed slot fills, got %v", appendErr)
+	if s.slotCap[ref] <= initialSlotBytes {
+		t.Fatalf("slotCap[ref] = %d, expected growth past the %d-byte initial slot", s.slotCap[ref], initialSlotBytes)
 	}
-	if len(want) == 0 {
-		t.Fatal("expected at least some samples to fit before the slot filled")
-	}
-	// Samples written before the overflow must still decode correctly - a bounds-check
-	// bug that partially writes past the slot would corrupt the neighboring series
-	// instead of failing cleanly here.
 	assertSamplesEqual(t, decodeAll(t, s, ref), want)
+	assertSamplesEqual(t, decodeAll(t, s, other), wantOther)
 }
 
 func TestSeriesStoreNumSeries(t *testing.T) {

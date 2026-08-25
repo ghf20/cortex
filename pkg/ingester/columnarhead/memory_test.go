@@ -51,21 +51,26 @@ func TestMemoryPerSeries(t *testing.T) {
 	heapBytes := after.HeapAlloc - before.HeapAlloc
 	bPerSeries := float64(heapBytes) / n
 	t.Logf("heap: %.1f MB (%.1f B/series) for %d series x %d rounds, incl. timestamps, "+
-		"slot=%d B (generous, uncompacted)", float64(heapBytes)/1e6, bPerSeries, n, rounds, defaultSlotBytes)
+		"growable slots (initial %d B, geometric doubling)", float64(heapBytes)/1e6, bPerSeries, n, rounds, initialSlotBytes)
 
-	var usedBits uint64
-	for _, off := range s.bitOff {
+	var usedBits, liveCapBytes uint64
+	for i, off := range s.bitOff {
 		usedBits += uint64(off)
+		liveCapBytes += uint64(s.slotCap[i])
 	}
 	usedBPerSeries := float64(usedBits) / 8 / n
-	t.Logf("actual arena usage: %.2f B/series (vs %d B/series slot budget) - the gap is "+
-		"what a compacted arena (bench/05_compact_arena's approach, not yet ported here) would recover",
-		usedBPerSeries, defaultSlotBytes)
+	liveCapBPerSeries := float64(liveCapBytes) / n
+	totalArenaBPerSeries := float64(len(s.arena)) / n
+	t.Logf("arena: %.2f B/series actually used, %.2f B/series in the current live slot, "+
+		"%.2f B/series total arena consumed (len(arena)/n) - the gap between live-slot and "+
+		"total is abandoned regions from earlier grow events, permanently unreclaimed",
+		usedBPerSeries, liveCapBPerSeries, totalArenaBPerSeries)
 
-	// Loose bounds, not a tight assertion: catches gross regressions (e.g. a slot-size
-	// change or an accidental per-series allocation) without being brittle to GC noise.
-	if bPerSeries < 30 || bPerSeries > 250 {
-		t.Errorf("B/series = %.1f, expected roughly 30-250 for this workload/slot size", bPerSeries)
+	// Loose bounds, not a tight assertion: catches gross regressions without being
+	// brittle to GC noise. Growable slots without reclaim are NOT assumed to beat a
+	// fixed slot here - see the arena log line above for why (abandoned-region waste).
+	if bPerSeries < 20 || bPerSeries > 250 {
+		t.Errorf("B/series = %.1f, expected roughly 20-250 for this workload", bPerSeries)
 	}
 }
 
