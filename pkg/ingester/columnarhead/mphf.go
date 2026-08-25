@@ -1,6 +1,7 @@
 package columnarhead
 
 import (
+	"encoding/binary"
 	"errors"
 	"hash/maphash"
 	"math/bits"
@@ -64,9 +65,25 @@ const bucketLambda = 4
 const slotSlack = 1.23
 
 // rankBlockWords is the granularity of the stored rank prefix-sum array: one uint32
-// covers rankBlockWords 64-bit words. Larger blocks mean less stored overhead but more
-// popcount work per Lookup (bounded, still O(1) - just a larger constant).
-const rankBlockWords = 8
+// covers rankBlockWords 64-bit words. Larger blocks mean a smaller stored array but
+// more popcount work per Lookup (a loop over up to rankBlockWords-1 extra words).
+// Measured the actual curve at 500k keys rather than guessing (see CHECKLIST.md):
+//
+//	rankBlockWords  bits/key  MPHFLookup ns/op  (Go map baseline: 24.49 ns/op)
+//	1               4.10      10.85
+//	2               3.79      18.66
+//	4               3.88      23.11
+//	8               3.56      25.93
+//
+// 1 wins on BOTH axes above 2: it's the smallest useful granularity (one rank entry per
+// word, no scan loop - rank() below degenerates to a single array access plus one
+// masked popcount) and it's the fastest, because removing the loop entirely matters
+// more than the array being slightly bigger. The apparent non-monotonicity at 2/4/8
+// (size doesn't shrink monotonically with fewer entries) is dispWidth jitter between
+// runs, not a real trend - only the 1-vs-rest gap is a first-order effect worth acting
+// on. Every other value is dominated; keeping this at 1 is a measured choice, not
+// arbitrary.
+const rankBlockWords = 1
 
 // maxDisplacementAttempts bounds how many displacement values one bucket tries before
 // giving up on the current seed - generous but finite, so a pathological key set fails
@@ -112,7 +129,7 @@ func BuildMPHF(keys []string) (*MPHF, error) {
 				numSlots:   numSlots,
 				numBuckets: numBuckets,
 				dispWidth:  width,
-				disp:       packDisplacements(disp, width),
+				disp:       packFixedWidth(disp, width),
 				occupied:   occupied,
 				rankBlock:  rankBlock,
 			}, nil
@@ -143,7 +160,7 @@ func tryBuild(keys []string, seed maphash.Seed, n, numSlots, numBuckets uint32) 
 	for i, k := range keys {
 		h := maphash.String(seed, k)
 		hashes[i] = h
-		b := uint32(h % uint64(numBuckets))
+		b := reduceRange(h, numBuckets)
 		bucketOf[i] = b
 		bucketSize[b]++
 	}
@@ -229,7 +246,18 @@ func mixSlot(h uint64, d uint32, n uint32) uint32 {
 	x ^= x >> 33
 	x *= 0xc4ceb9fe1a85ec53
 	x ^= x >> 33
-	return uint32(x % uint64(n))
+	return reduceRange(x, n)
+}
+
+// reduceRange maps a uniform 64-bit hash h onto [0, n) without integer division - a
+// generalization of Lemire's fastrange trick to a full 64x64->128 bit multiply via
+// bits.Mul64 (a single MULQ on amd64). Division (the % it replaces) costs ~20-40 cycles
+// and Lookup needs two of them (bucket selection, then this call inside mixSlot);
+// removing both was the largest measured contributor to closing the gap with a Go map
+// lookup - see CHECKLIST.md. hi = floor(h*n / 2^64), uniform in [0, n) for uniform h.
+func reduceRange(h uint64, n uint32) uint32 {
+	hi, _ := bits.Mul64(h, uint64(n))
+	return uint32(hi)
 }
 
 func dispWidthFor(disp []uint32) uint32 {
@@ -246,14 +274,41 @@ func dispWidthFor(disp []uint32) uint32 {
 	return w
 }
 
-func packDisplacements(disp []uint32, width uint32) []byte {
-	totalBits := uint32(len(disp)) * width
-	packed := make([]byte, (totalBits+7)/8)
-	var off uint32
-	for _, d := range disp {
-		off = writeBits(packed, 0, off, uint64(d), width)
+// packFixedWidth packs vals (each < 2^width) into a byte array supporting O(1) random
+// access via unpackFixedWidth: value at logical index i occupies bits [i*width,
+// i*width+width), LSB-first, starting from the low bit of the byte at (i*width)/8.
+//
+// This is deliberately a different bit convention from bits.go's writeBits/readBits.
+// Those are for SEQUENTIAL streams of VARIABLE-width fields (the Gorilla/timestamp
+// encoders) and read/write byte-at-a-time, MSB-first within each byte - appropriate for
+// a forward-only decoder, wrong tool for this: a FIXED-width array needing RANDOM
+// access on every Lookup. unpackFixedWidth does one 8-byte load, shift, and mask - no
+// loop - which is why this exists instead of reusing readBits here.
+func packFixedWidth(vals []uint32, width uint32) []byte {
+	totalBits := uint64(len(vals)) * uint64(width)
+	// +8 bytes of zero padding so unpackFixedWidth can always safely load a full 8-byte
+	// little-endian window even for the last few entries.
+	buf := make([]byte, (totalBits+7)/8+8)
+	for i, v := range vals {
+		off := uint64(i) * uint64(width)
+		byteIdx := off / 8
+		bitIdx := off % 8
+		word := binary.LittleEndian.Uint64(buf[byteIdx : byteIdx+8])
+		word |= uint64(v) << bitIdx
+		binary.LittleEndian.PutUint64(buf[byteIdx:byteIdx+8], word)
 	}
-	return packed
+	return buf
+}
+
+// unpackFixedWidth reads the width-bit value at logical index i, packed by
+// packFixedWidth. O(1): one 8-byte load, shift, mask.
+func unpackFixedWidth(buf []byte, i uint32, width uint32) uint32 {
+	off := uint64(i) * uint64(width)
+	byteIdx := off / 8
+	bitIdx := off % 8
+	word := binary.LittleEndian.Uint64(buf[byteIdx : byteIdx+8])
+	mask := uint64(1)<<width - 1
+	return uint32((word >> bitIdx) & mask)
 }
 
 // buildRankBlocks precomputes, for every rankBlockWords-word block of occupied, the
@@ -310,16 +365,10 @@ func (m *MPHF) Lookup(key string) uint32 {
 		return 0
 	}
 	h := maphash.String(m.seed, key)
-	b := uint32(h % uint64(m.numBuckets))
-	d := m.readDisp(b)
+	b := reduceRange(h, m.numBuckets)
+	d := unpackFixedWidth(m.disp, b, m.dispWidth)
 	raw := mixSlot(h, d, m.numSlots)
 	return m.rank(raw)
-}
-
-func (m *MPHF) readDisp(bucket uint32) uint32 {
-	off := bucket * m.dispWidth
-	v, _ := readBits(m.disp, 0, off, m.dispWidth)
-	return uint32(v)
 }
 
 // SizeBytes returns the MPHF's own memory footprint: the packed displacement array,
