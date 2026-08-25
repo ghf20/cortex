@@ -30,7 +30,7 @@ func newTrackerCounter() *trackerCounter {
 
 // updateConfig applies new tracker configuration. If trackers changed, backfills
 // counts from the TSDB head index.
-func (tc *trackerCounter) updateConfig(ctx context.Context, db *tsdb.DB, trackers validation.ActiveSeriesTrackersConfig) {
+func (tc *trackerCounter) updateConfig(ctx context.Context, db tsdbStore, trackers validation.ActiveSeriesTrackersConfig) {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 

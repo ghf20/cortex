@@ -375,8 +375,27 @@ func (r tsdbCloseCheckResult) shouldClose() bool {
 	return r == tsdbIdle || r == tsdbTenantMarkedForDeletion
 }
 
+// tsdbStore is the subset of *tsdb.DB that userTSDB uses, extracted to make userTSDB mockable in tests.
+type tsdbStore interface {
+	Appender(ctx context.Context) storage.Appender
+	Querier(mint, maxt int64) (storage.Querier, error)
+	ChunkQuerier(mint, maxt int64) (storage.ChunkQuerier, error)
+	ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier, error)
+	Head() *tsdb.Head
+	Blocks() []*tsdb.Block
+	Close() error
+	Compact(ctx context.Context) error
+	StartTime() (int64, error)
+	CompactHead(head *tsdb.RangeHead) error
+	CompactOOOHead(ctx context.Context) error
+	ApplyConfig(conf *config.Config) error
+	Dir() string
+}
+
+var _ tsdbStore = (*tsdb.DB)(nil)
+
 type userTSDB struct {
-	db                  *tsdb.DB
+	db                  tsdbStore
 	userID              string
 	logger              log.Logger
 	activeSeries        *ActiveSeries
@@ -603,7 +622,12 @@ func (u *userTSDB) blocksToDelete(blocks []*tsdb.Block) map[ulid.ULID]struct{} {
 	if u.db == nil {
 		return nil
 	}
-	deletable := tsdb.DefaultBlocksToDelete(u.db)(blocks)
+	// tsdb.DefaultBlocksToDelete is vendored and needs the concrete *tsdb.DB.
+	realDB, ok := u.db.(*tsdb.DB)
+	if !ok {
+		return nil
+	}
+	deletable := tsdb.DefaultBlocksToDelete(realDB)(blocks)
 
 	now := time.Now().UnixMilli()
 	for _, b := range blocks {
