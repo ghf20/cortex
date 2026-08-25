@@ -179,6 +179,58 @@ func TestSeriesStoreGrowsAcrossManySamples(t *testing.T) {
 	assertSamplesEqual(t, decodeAll(t, s, other), wantOther)
 }
 
+// TestSeriesStoreFreeListReuseIsZeroed specifically targets the free-list's most
+// dangerous failure mode: writeBits ORs new bits into arena, so if alloc() ever handed
+// back a reused region without zeroing it first, stale 1-bits left over from the
+// previous occupant would silently corrupt the new series' encoding instead of failing
+// loudly. Forces reuse by growing series until their initial 16B slots are freed, then
+// creating a fresh series and confirming its very first (all-ones-adjacent) sample
+// round-trips exactly.
+func TestSeriesStoreFreeListReuseIsZeroed(t *testing.T) {
+	s := NewSeriesStore(4)
+
+	// Fill several series' initial slots with maximally "dirty" bit patterns (large
+	// XOR deltas via alternating extreme values), then force each to grow, freeing its
+	// 16B initial slot back to the free list.
+	var refs []uint32
+	for i := 0; i < 4; i++ {
+		ref := s.Create(0, 0, 0)
+		refs = append(refs, ref)
+		vals := []float64{math.MaxFloat64, -math.MaxFloat64, math.SmallestNonzeroFloat64}
+		ts := int64(1700000000000)
+		for _, v := range vals {
+			ts += 15000
+			if err := s.Append(ref, ts, v); err != nil {
+				t.Fatalf("series %d: %v", i, err)
+			}
+		}
+	}
+	if len(s.freeList[initialSlotBytes]) == 0 {
+		t.Fatal("expected at least one 16B region freed by growth - test setup didn't force growth")
+	}
+
+	// A fresh series should now be handed one of those freed, dirty regions.
+	newRef := s.Create(9, 9, 9)
+	want := []sample{{1700000000000, 0}} // value 0 => raw bits all zero; any leftover 1-bit corrupts this
+	if err := s.Append(newRef, want[0].ts, want[0].v); err != nil {
+		t.Fatal(err)
+	}
+	assertSamplesEqual(t, decodeAll(t, s, newRef), want)
+
+	// The older series must also still decode correctly - reuse must not have
+	// clobbered a still-live region.
+	for i, ref := range refs {
+		it := s.Iterator(ref)
+		count := 0
+		for it.Next() {
+			count++
+		}
+		if count != 3 {
+			t.Fatalf("series %d: decoded %d samples after reuse elsewhere, want 3", i, count)
+		}
+	}
+}
+
 func TestSeriesStoreNumSeries(t *testing.T) {
 	s := NewSeriesStore(0)
 	if s.NumSeries() != 0 {

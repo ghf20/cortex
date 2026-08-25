@@ -16,11 +16,18 @@ var ErrTooManySamples = errors.New("columnarhead: series sample count overflow")
 // series in a realistic workload (near-constant gauges, in particular) never need more.
 const initialSlotBytes = 16
 
-// maxSampleBits is a conservative worst-case bound on bits written by one Append call:
-// timestamp worst case (4-bit prefix + 64-bit raw fallback = 68) plus value worst case
-// (2-bit prefix + 5 + 6 + 64-bit fallback = 77). Used only to decide whether a slot needs
-// to grow before writing, so overshooting is safe - it just grows slightly earlier than
-// the exact bit count would strictly require.
+// firstSampleBits is the exact (not worst-case) cost of a series' first sample: a raw
+// 64-bit timestamp plus a raw 64-bit value, both always written in full. Using the exact
+// figure here (rather than maxSampleBits below) matters: every series pays this cost
+// once, so an unnecessarily conservative bound here would force a needless grow event
+// for every single series right out of the gate.
+const firstSampleBits = 128
+
+// maxSampleBits is a conservative worst-case bound on bits written by one Append call
+// past the first sample: timestamp worst case (4-bit prefix + 64-bit raw fallback = 68)
+// plus value worst case (2-bit prefix + 5 + 6 + 64-bit fallback = 77). Used only to
+// decide whether a slot needs to grow before writing, so overshooting is safe - it just
+// grows slightly earlier than the exact bit count would strictly require.
 const maxSampleBits = 145
 
 // SeriesStore holds columnar, pointerless per-series state: a tight parallel-slice
@@ -29,10 +36,13 @@ const maxSampleBits = 145
 // and §3.2.
 //
 // Each series' slot grows geometrically (like append) rather than using one large fixed
-// size. Growing copies the series' bits to a fresh, larger region at the end of arena;
-// the old region is abandoned, not reclaimed - full compaction/reclaim (bench/05's
-// approach, or tying reclaim to chunk-cut/flush boundaries the way Prometheus's real
-// head does) is a follow-up, not solved here.
+// size. Growing moves the series' bits to a fresh, larger region and frees the old one
+// into a size-classed free list (freeList), so a later Create or grow of a matching size
+// reuses it instead of the arena growing unboundedly. Measured: without this, geometric
+// growth alone is no better than one large fixed slot (see CHECKLIST.md) - reuse is what
+// actually recovers the space. Reclaim is still partial: an abandoned region only helps
+// if something else later requests exactly that size class: no splitting, no merging
+// across classes. Full compaction (bench/05's approach) would do better; not built here.
 type SeriesStore struct {
 	targetID []uint16
 	nameID   []uint16
@@ -46,7 +56,16 @@ type SeriesStore struct {
 	val []valueState
 	ts  []tsState
 
-	arena []byte
+	arena    []byte
+	freeList map[uint32][]uint32 // size class (bytes) -> free byte offsets of that size
+
+	// Diagnostics: how often alloc reused a freed region, and the free list's net
+	// effect on arena growth for this run. AllocBytesRequested sums size across every
+	// alloc() call (hit or miss); len(arena) only grows on misses - so
+	// AllocBytesRequested-len(arena) is exactly how many bytes of fresh arena growth
+	// the free list avoided, with no need for a separate control run.
+	AllocHits, AllocMisses uint64
+	AllocBytesRequested    uint64
 }
 
 // NewSeriesStore returns an empty store with capacity preallocated for expectedSeries.
@@ -62,7 +81,32 @@ func NewSeriesStore(expectedSeries int) *SeriesStore {
 		val:      make([]valueState, 0, expectedSeries),
 		ts:       make([]tsState, 0, expectedSeries),
 		arena:    make([]byte, 0, expectedSeries*initialSlotBytes),
+		freeList: make(map[uint32][]uint32),
 	}
+}
+
+// alloc returns the byte offset of a zeroed region of exactly size bytes, reusing a
+// freed region of the same size class if one exists. Zeroing is not just cleanliness:
+// writeBits ORs new bits into arena, so a reused region with stale bits from its
+// previous occupant would silently corrupt the new series' encoding.
+func (s *SeriesStore) alloc(size uint32) uint32 {
+	s.AllocBytesRequested += uint64(size)
+	if free := s.freeList[size]; len(free) > 0 {
+		off := free[len(free)-1]
+		s.freeList[size] = free[:len(free)-1]
+		clear(s.arena[off : off+size])
+		s.AllocHits++
+		return off
+	}
+	s.AllocMisses++
+	off := uint32(len(s.arena))
+	s.arena = append(s.arena, make([]byte, size)...)
+	return off
+}
+
+// free returns a size-byte region at off to the free list for reuse.
+func (s *SeriesStore) free(off, size uint32) {
+	s.freeList[size] = append(s.freeList[size], off)
 }
 
 // Create allocates a new series and returns its ref.
@@ -76,8 +120,7 @@ func (s *SeriesStore) Create(targetID, nameID, localRef uint16) uint32 {
 	s.val = append(s.val, newValueState())
 	s.ts = append(s.ts, tsState{})
 
-	off := uint32(len(s.arena))
-	s.arena = append(s.arena, make([]byte, initialSlotBytes)...)
+	off := s.alloc(initialSlotBytes)
 	s.slotOff = append(s.slotOff, off)
 	s.slotCap = append(s.slotCap, initialSlotBytes)
 	return ref
@@ -97,9 +140,13 @@ func (s *SeriesStore) Append(ref uint32, ts int64, v float64) error {
 		return ErrTooManySamples
 	}
 
+	need := uint32(maxSampleBits)
+	if n == 0 {
+		need = firstSampleBits
+	}
 	off := uint32(s.bitOff[ref])
 	cap := s.slotCap[ref]
-	for off+maxSampleBits > cap*8 {
+	for off+need > cap*8 {
 		cap *= 2
 	}
 	if cap != s.slotCap[ref] {
@@ -116,14 +163,15 @@ func (s *SeriesStore) Append(ref uint32, ts int64, v float64) error {
 }
 
 // growSlot moves ref's encoded bits into a fresh region of arena with capacity newCap,
-// updating slotOff/slotCap. The old region is left behind, unreclaimed.
+// updating slotOff/slotCap, and frees the old region for reuse by a future alloc of the
+// same size.
 func (s *SeriesStore) growSlot(ref uint32, newCap uint32) {
-	oldOff := s.slotOff[ref]
+	oldOff, oldCap := s.slotOff[ref], s.slotCap[ref]
 	usedBytes := (uint32(s.bitOff[ref]) + 7) / 8
 
-	newOff := uint32(len(s.arena))
-	s.arena = append(s.arena, make([]byte, newCap)...)
+	newOff := s.alloc(newCap)
 	copy(s.arena[newOff:newOff+usedBytes], s.arena[oldOff:oldOff+usedBytes])
+	s.free(oldOff, oldCap)
 
 	s.slotOff[ref] = newOff
 	s.slotCap[ref] = newCap
