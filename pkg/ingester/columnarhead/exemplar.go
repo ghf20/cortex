@@ -18,10 +18,8 @@ type exemplarEntry struct {
 // level: a bounded, best-effort ring, not unbounded retention. When full, the oldest
 // entry is silently overwritten.
 //
-// No query path exists yet - nothing in this package has a Querier yet (see
-// CHECKLIST.md). forSeries proves exemplars are genuinely stored and retrievable, not
-// silently dropped on the floor, the same bar Append already meets for samples; a real
-// storage.ExemplarQuerier is separate, later work.
+// See exemplar_querier.go for the real storage.ExemplarQuerier built over this -
+// forSeries/all are its read primitives.
 type exemplarStorage struct {
 	entries []exemplarEntry
 	next    int  // next write position
@@ -69,6 +67,25 @@ func (es *exemplarStorage) forSeries(seriesRef uint32) []exemplarEntry {
 		if e.seriesRef == seriesRef {
 			out = append(out, e)
 		}
+	}
+	return out
+}
+
+// all returns every currently retained exemplar, oldest first, across every
+// series - the read path storage.ExemplarQuerier's Select needs (see
+// exemplar_querier.go), unlike forSeries' single-series scan.
+func (es *exemplarStorage) all() []exemplarEntry {
+	n := len(es.entries)
+	if n == 0 {
+		return nil
+	}
+	start, count := 0, es.next
+	if es.filled {
+		start, count = es.next, n
+	}
+	out := make([]exemplarEntry, count)
+	for i := 0; i < count; i++ {
+		out[i] = es.entries[(start+i)%n]
 	}
 	return out
 }
