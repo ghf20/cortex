@@ -1028,3 +1028,77 @@ func TestDurableHeadHistogramTruncateThenFlush(t *testing.T) {
 		t.Fatal("HistogramIterator has more samples than expected after reload - truncation wasn't reflected")
 	}
 }
+
+// TestDurableHeadPersistsMinMaxTime confirms Head.MinTime/MaxTime survive a
+// simulated crash and reload (headtimes.bin) - added alongside OOO support,
+// since MinTime/MaxTime are also what OOO's window check depends on. Also
+// confirms a durable head that crashes before its FIRST Flush ever ran doesn't
+// error on reload (decodeHeadTimes' empty-buf case).
+func TestDurableHeadPersistsMinMaxTime(t *testing.T) {
+	dir := t.TempDir()
+	dh, err := CreateDurableHead(dir, 2, 1, 8)
+	if err != nil {
+		t.Fatalf("CreateDurableHead: %v", err)
+	}
+
+	l := labels.FromStrings(labels.MetricName, "up", "cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j")
+	app := dh.Appender(context.Background())
+	base := int64(1700000000000)
+	if _, err := app.Append(0, l, base, 1); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if _, err := app.Append(0, l, base+30000, 2); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if dh.MinTime() != base || dh.MaxTime() != base+30000 {
+		t.Fatalf("before flush: MinTime/MaxTime = %d/%d, want %d/%d", dh.MinTime(), dh.MaxTime(), base, base+30000)
+	}
+
+	if _, err := dh.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if err := dh.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reloaded, err := LoadDurableHead(dir)
+	if err != nil {
+		t.Fatalf("LoadDurableHead: %v", err)
+	}
+	defer reloaded.Close()
+
+	if reloaded.MinTime() != base {
+		t.Fatalf("reloaded MinTime() = %d, want %d", reloaded.MinTime(), base)
+	}
+	if reloaded.MaxTime() != base+30000 {
+		t.Fatalf("reloaded MaxTime() = %d, want %d", reloaded.MaxTime(), base+30000)
+	}
+}
+
+// TestDurableHeadEmptyHeadTimesFile confirms a durable head that crashes before
+// its first Flush ever ran reloads correctly (headtimes.bin is 0 bytes), rather
+// than erroring - matching how the other never-flushed files (exemplars.bin,
+// histograms.bin) already handle this.
+func TestDurableHeadEmptyHeadTimesFile(t *testing.T) {
+	dir := t.TempDir()
+	dh, err := CreateDurableHead(dir, 1, 1, 1)
+	if err != nil {
+		t.Fatalf("CreateDurableHead: %v", err)
+	}
+	if err := dh.Close(); err != nil { // crash before any Flush
+		t.Fatalf("Close: %v", err)
+	}
+
+	reloaded, err := LoadDurableHead(dir)
+	if err != nil {
+		t.Fatalf("LoadDurableHead: %v", err)
+	}
+	defer reloaded.Close()
+
+	if reloaded.MinTime() != math.MaxInt64 {
+		t.Fatalf("MinTime() = %d, want math.MaxInt64 (sentinel for never-flushed)", reloaded.MinTime())
+	}
+	if reloaded.MaxTime() != math.MinInt64 {
+		t.Fatalf("MaxTime() = %d, want math.MinInt64 (sentinel for never-flushed)", reloaded.MaxTime())
+	}
+}

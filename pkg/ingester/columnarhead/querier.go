@@ -227,13 +227,18 @@ func (s *headSeries) Iterator(_ chunkenc.Iterator) chunkenc.Iterator {
 	if s.h.histograms.Has(s.ref) {
 		return &histogramSampleIterator{it: s.h.HistogramIterator(s.ref), mint: s.mint, maxt: s.maxt}
 	}
-	return &floatSampleIterator{it: s.h.Iterator(s.ref), mint: s.mint, maxt: s.maxt}
+	var src floatSource = s.h.Iterator(s.ref)
+	if ooo := s.h.ooo.samples(s.ref); len(ooo) > 0 {
+		src = newMergedIterator(src, ooo)
+	}
+	return &floatSampleIterator{it: src, mint: s.mint, maxt: s.maxt}
 }
 
-// floatSampleIterator adapts *Iterator (this package's float sample iterator) to
-// chunkenc.Iterator, bounded to [mint, maxt] inclusive.
+// floatSampleIterator adapts a floatSource (this package's raw in-order
+// *Iterator, or a *mergedIterator when the series has OOO samples too - see
+// ooo.go) to chunkenc.Iterator, bounded to [mint, maxt] inclusive.
 type floatSampleIterator struct {
-	it         *Iterator
+	it         floatSource
 	mint, maxt int64
 	started    bool
 	done       bool

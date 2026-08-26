@@ -142,7 +142,11 @@ type singleChunkIterator struct {
 }
 
 func newSingleChunkIterator(h *Head, ref uint32, mint, maxt int64) *singleChunkIterator {
-	it := &floatSampleIterator{it: h.Iterator(ref), mint: mint, maxt: maxt}
+	var src floatSource = h.Iterator(ref)
+	if ooo := h.ooo.samples(ref); len(ooo) > 0 {
+		src = newMergedIterator(src, ooo)
+	}
+	it := &floatSampleIterator{it: src, mint: mint, maxt: maxt}
 	xc := chunkenc.NewXORChunk()
 	app, _ := xc.Appender()
 

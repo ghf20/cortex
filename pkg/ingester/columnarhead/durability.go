@@ -64,6 +64,7 @@ const (
 	fileMetadata       = "metadata.bin"
 	fileExemplars      = "exemplars.bin"
 	fileHistograms     = "histograms.bin"
+	fileHeadTimes      = "headtimes.bin"
 )
 
 // seriesMetaRecordSize is one series' fixed-width persisted record: targetID(4) +
@@ -535,6 +536,34 @@ func decodeHistogramStore(buf []byte) (*HistogramStore, error) {
 	return hst, nil
 }
 
+// encodeHeadTimes/decodeHeadTimes persist Head.minTime/maxTime as a tiny
+// fixed-size (16-byte) record, full-rewrite-per-Flush like the rest of this
+// file's non-append-only state - small and constant-size, so there's no
+// incremental-tracking question to even ask here.
+func encodeHeadTimes(minTime, maxTime int64) []byte {
+	buf := make([]byte, 16)
+	binary.LittleEndian.PutUint64(buf[0:8], uint64(minTime))
+	binary.LittleEndian.PutUint64(buf[8:16], uint64(maxTime))
+	return buf
+}
+
+// decodeHeadTimes is encodeHeadTimes's inverse. An empty buf (a durable head
+// that crashed before its first Flush ever ran) decodes as the same
+// math.MaxInt64/math.MinInt64 sentinel NewHead itself starts with, not an
+// error - matching decodeExemplarStorage's same treatment of a never-flushed
+// file.
+func decodeHeadTimes(buf []byte) (minTime, maxTime int64, err error) {
+	if len(buf) == 0 {
+		return math.MaxInt64, math.MinInt64, nil
+	}
+	if len(buf) != 16 {
+		return 0, 0, fmt.Errorf("headtimes.bin size %d, want 16", len(buf))
+	}
+	minTime = int64(binary.LittleEndian.Uint64(buf[0:8]))
+	maxTime = int64(binary.LittleEndian.Uint64(buf[8:16]))
+	return minTime, maxTime, nil
+}
+
 // DurableHead wraps a Head with on-disk persistence for its append-only structures.
 // Not wired into the real ingest path - a standalone harness for measuring whether
 // the underlying mechanism (see this file's package-level doc comment) is viable.
@@ -542,7 +571,7 @@ type DurableHead struct {
 	*Head
 	dir string
 
-	blobFile, offsetFile, targetsFile, arenaFile, metaFile, metadataFile, exemplarsFile, histogramsFile *os.File
+	blobFile, offsetFile, targetsFile, arenaFile, metaFile, metadataFile, exemplarsFile, histogramsFile, headTimesFile *os.File
 
 	// High-water marks: how much of each append-only structure is already durable.
 	// Units match what's being flushed - bytes for blob, element counts (multiplied
@@ -584,7 +613,7 @@ type DurableHead struct {
 // one). Fails if any of the five files already exist, rather than silently
 // overwriting a prior head's data.
 func CreateDurableHead(dir string, expectedSeries, expectedTargets, expectedSymbols int) (*DurableHead, error) {
-	for _, name := range []string{fileSymbolsBlob, fileSymbolsOffsets, fileTargets, fileArena, fileSeriesMeta, fileMetadata, fileExemplars, fileHistograms} {
+	for _, name := range []string{fileSymbolsBlob, fileSymbolsOffsets, fileTargets, fileArena, fileSeriesMeta, fileMetadata, fileExemplars, fileHistograms, fileHeadTimes} {
 		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
 			return nil, fmt.Errorf("columnarhead: %s already exists in %s - use LoadDurableHead", name, dir)
 		}
@@ -613,6 +642,9 @@ func CreateDurableHead(dir string, expectedSeries, expectedTargets, expectedSymb
 		return nil, err
 	}
 	if dh.histogramsFile, err = os.OpenFile(filepath.Join(dir, fileHistograms), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
+		return nil, err
+	}
+	if dh.headTimesFile, err = os.OpenFile(filepath.Join(dir, fileHeadTimes), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
 		return nil, err
 	}
 	return dh, nil
@@ -682,10 +714,24 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 	if err != nil {
 		return nil, fmt.Errorf("columnarhead: decode %s: %w", fileHistograms, err)
 	}
+	headTimesBytes, err := os.ReadFile(filepath.Join(dir, fileHeadTimes))
+	if err != nil {
+		return nil, err
+	}
 	numSeries := len(metaBytes) / seriesMetaRecordSize
 	numTargets := len(targetBytes) / 4 / targetFields
 
-	li := newLiveInterner(len(offsetBytes)/4 - 1)
+	// len(offsetBytes)/4 - 1 is the real expected symbol count, but a never-
+	// flushed durable head (crash before the first Flush) has an empty
+	// offsetBytes, which would go negative here - newLiveInterner(-1) panics
+	// (make([]uint32, 1, 0) - cap < len). Found by TestDurableHeadEmptyHeadTimesFile,
+	// the first test to load a head that was created and closed without ever
+	// calling Flush; clamp to 0, since this is only a preallocation size hint.
+	expectedSymbols := len(offsetBytes)/4 - 1
+	if expectedSymbols < 0 {
+		expectedSymbols = 0
+	}
+	li := newLiveInterner(expectedSymbols)
 	li.blob = blob
 	li.offset = li.offset[:0]
 	for i := 0; i+4 <= len(offsetBytes); i += 4 {
@@ -719,6 +765,11 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 		ss.ts = append(ss.ts, tst)
 	}
 
+	minTime, maxTime, err := decodeHeadTimes(headTimesBytes)
+	if err != nil {
+		return nil, fmt.Errorf("columnarhead: decode %s: %w", fileHeadTimes, err)
+	}
+
 	h := &Head{
 		symbols:      li,
 		targets:      ts,
@@ -730,6 +781,16 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 		lastST:       make(map[uint32]int64),
 		exemplars:    exemplars,
 		histograms:   histograms,
+		// ooo (the live OOO buffers) is NOT persisted - a real, stated gap: a
+		// crash loses samples still sitting in the OOO buffer, even ones that
+		// arrived well before the crash. Scoped this way deliberately, matching
+		// how histograms/metadata/exemplars each got their own persistence pass
+		// rather than everything at once - not silently dropped, just not yet
+		// built. minTime/maxTime ARE persisted (headtimes.bin) since they're
+		// small, fixed-size, and cheap to get right immediately.
+		ooo:     newOOOStore(),
+		minTime: minTime,
+		maxTime: maxTime,
 	}
 	for id := uint32(0); id < uint32(numTargets); id++ {
 		h.targetIndex[ts.Get(id)] = id
@@ -785,6 +846,9 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 		return nil, err
 	}
 	if dh.histogramsFile, err = os.OpenFile(filepath.Join(dir, fileHistograms), os.O_RDWR, 0o644); err != nil {
+		return nil, err
+	}
+	if dh.headTimesFile, err = os.OpenFile(filepath.Join(dir, fileHeadTimes), os.O_RDWR, 0o644); err != nil {
 		return nil, err
 	}
 	return dh, nil
@@ -933,7 +997,12 @@ func (dh *DurableHead) Flush() (FlushStats, error) {
 	}
 	stats.HistogramBytes = len(histogramsBuf)
 
-	for _, f := range []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.arenaFile, dh.metaFile, dh.metadataFile, dh.exemplarsFile, dh.histogramsFile} {
+	headTimesBuf := encodeHeadTimes(dh.minTime, dh.maxTime)
+	if _, err := dh.headTimesFile.WriteAt(headTimesBuf, 0); err != nil {
+		return stats, fmt.Errorf("write %s: %w", fileHeadTimes, err)
+	}
+
+	for _, f := range []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.arenaFile, dh.metaFile, dh.metadataFile, dh.exemplarsFile, dh.histogramsFile, dh.headTimesFile} {
 		if err := f.Sync(); err != nil {
 			return stats, fmt.Errorf("sync: %w", err)
 		}
@@ -1059,7 +1128,7 @@ func (dh *DurableHead) Close() error {
 		dh.stopAutoFlush = nil
 	}
 	var err error
-	for _, f := range []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.arenaFile, dh.metaFile, dh.metadataFile, dh.exemplarsFile, dh.histogramsFile} {
+	for _, f := range []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.arenaFile, dh.metaFile, dh.metadataFile, dh.exemplarsFile, dh.histogramsFile, dh.headTimesFile} {
 		if cerr := f.Close(); cerr != nil {
 			err = errors.Join(err, cerr)
 		}

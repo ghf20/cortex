@@ -9,6 +9,7 @@ import (
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/metadata"
+	"github.com/prometheus/prometheus/storage"
 )
 
 // defaultExemplarCapacity is a placeholder default for exemplarStorage's ring size,
@@ -82,6 +83,23 @@ type Head struct {
 	lastST     map[uint32]int64 // series ref -> most recent start-timestamp recorded via SetSTZeroSample
 	exemplars  *exemplarStorage
 	histograms *HistogramStore
+
+	// ooo, oooTimeWindow: out-of-order float sample support (see ooo.go). A
+	// sample older than the in-order stream's own last timestamp is rejected
+	// with storage.ErrOutOfOrderSample/ErrDuplicateSampleForTimestamp unless it
+	// falls within oooTimeWindow of maxTime, in which case it lands in ooo
+	// instead - matching real Prometheus's own default-disabled (oooTimeWindow
+	// == 0) semantics until SetOOOTimeWindow is called with something positive.
+	ooo           *oooStore
+	oooTimeWindow int64
+
+	// minTime, maxTime track the earliest and latest timestamp ever accepted
+	// (in-order or OOO) across the whole head - maintained incrementally in
+	// Append/AppendHistogram, not computed by a scan, matching real
+	// tsdb.Head's own MinTime/MaxTime. Sentinel values (math.MaxInt64/
+	// math.MinInt64) before any sample exists, mirroring real Prometheus's own
+	// convention for an empty head.
+	minTime, maxTime int64
 }
 
 // TargetLabels is the fixed 6-label shared block every series belongs to (§3.1).
@@ -113,8 +131,30 @@ func NewHead(expectedSeries, expectedTargets, expectedSymbols int) *Head {
 		lastST:       make(map[uint32]int64),
 		exemplars:    newExemplarStorage(defaultExemplarCapacity),
 		histograms:   NewHistogramStore(),
+		ooo:          newOOOStore(),
+		minTime:      math.MaxInt64,
+		maxTime:      math.MinInt64,
 	}
 }
+
+// SetOOOTimeWindow configures how far behind the head's current max timestamp
+// an out-of-order float sample may land and still be accepted (into the OOO
+// buffer, see ooo.go) rather than rejected outright. 0 (NewHead's default)
+// matches real Prometheus's own default-disabled behavior: any sample older
+// than the in-order stream's last timestamp is rejected with
+// storage.ErrOutOfOrderSample, not buffered. This is the mechanism
+// tsdbStore.ApplyConfig would call into once real ingester wiring exists (see
+// CHECKLIST.md) - exposed as its own method now so it's independently testable
+// without that wiring.
+func (h *Head) SetOOOTimeWindow(w int64) {
+	h.oooTimeWindow = w
+}
+
+// MinTime, MaxTime return the earliest/latest timestamp accepted by the head so
+// far (in-order or OOO), or (math.MaxInt64, math.MinInt64) if no sample has
+// ever been accepted - matching real tsdb.Head's own empty-head convention.
+func (h *Head) MinTime() int64 { return h.minTime }
+func (h *Head) MaxTime() int64 { return h.maxTime }
 
 // GetOrCreateSeries resolves target+metricName+(localName,localLabel) to a series
 // ref, creating the target, symbols, and series record as needed - repeated calls
@@ -217,9 +257,94 @@ func (h *Head) lookupSeries(tRefs [targetFields]uint32, metricName, localName, l
 	return ref, ok
 }
 
-// Append encodes one sample for the series at ref.
+// Append encodes one sample for the series at ref, after resolving whether it's
+// in-order, out-of-order-but-acceptable, an allowed exact duplicate, or must be
+// rejected - see appendable's doc comment for the exact rules, which mirror
+// real Prometheus's own (see CHECKLIST.md's OOO scoping pass for the citations).
 func (h *Head) Append(ref uint32, ts int64, v float64) error {
-	return h.series.Append(ref, ts, v)
+	action, err := h.appendable(ref, ts, v)
+	switch action {
+	case appendReject:
+		return err
+	case appendSkip:
+		return nil
+	case appendOOO:
+		h.ooo.insert(ref, ts, v)
+	default: // appendInOrder
+		if err := h.series.Append(ref, ts, v); err != nil {
+			return err
+		}
+	}
+	h.updateMinMaxTime(ts)
+	if h.oooTimeWindow > 0 {
+		h.ooo.trim(ref, h.maxTime-h.oooTimeWindow)
+	}
+	return nil
+}
+
+// updateMinMaxTime folds ts into the head-wide MinTime/MaxTime, called by every
+// path that accepts a sample (float in-order/OOO, histogram, ST-zero) so those
+// two accessors reflect the whole head regardless of sample type.
+func (h *Head) updateMinMaxTime(ts int64) {
+	if ts < h.minTime {
+		h.minTime = ts
+	}
+	if ts > h.maxTime {
+		h.maxTime = ts
+	}
+}
+
+type appendAction int
+
+const (
+	appendInOrder appendAction = iota
+	appendOOO
+	appendSkip   // exact (ts, value) duplicate of the last in-order sample - a real, valid case (federation, retries), not an error
+	appendReject // err is set to the real storage sentinel the caller should see
+)
+
+// appendable decides how (ts, v) relates to ref's existing in-order float
+// stream, matching real Prometheus's own memSeries.appendable semantics
+// (vendor/.../tsdb/head_append.go) rather than inventing new ones:
+//   - no samples yet: always in-order.
+//   - ts strictly after the last in-order timestamp: in-order.
+//   - ts equal to the last in-order timestamp: identical value is a silent
+//     no-op (allowed - federation and retries produce exact duplicates in
+//     valid, non-noteworthy cases); a different value is rejected with
+//     storage.ErrDuplicateSampleForTimestamp, matching real Prometheus refusing
+//     to let a later write silently override an earlier one at the same time.
+//   - ts before the last in-order timestamp: accepted into the OOO buffer if
+//     within oooTimeWindow of the head's current max timestamp, otherwise
+//     rejected with storage.ErrOutOfOrderSample (oooTimeWindow == 0, real
+//     Prometheus's own default) or storage.ErrTooOldSample (outside the window
+//     but OOO is enabled).
+//
+// Does NOT check ts against every historical in-order timestamp, only the
+// latest - matching real Prometheus's own scope exactly (their msMaxt check is
+// the same single comparison), not exceeding it. An OOO sample landing on the
+// same timestamp as some non-latest in-order sample isn't specially detected
+// here, mirroring that real Prometheus doesn't detect it either.
+func (h *Head) appendable(ref uint32, ts int64, v float64) (appendAction, error) {
+	lastTS, lastBits, ok := h.series.LastSample(ref)
+	if !ok {
+		return appendInOrder, nil
+	}
+	if ts > lastTS {
+		return appendInOrder, nil
+	}
+	if ts == lastTS {
+		if lastBits == math.Float64bits(v) {
+			return appendSkip, nil
+		}
+		return appendReject, storage.NewDuplicateFloatErr(ts, math.Float64frombits(lastBits), v)
+	}
+	if h.oooTimeWindow > 0 && ts >= h.maxTime-h.oooTimeWindow {
+		return appendOOO, nil
+	}
+	if h.oooTimeWindow > 0 {
+		return appendReject, storage.ErrTooOldSample
+	}
+	return appendReject, storage.ErrOutOfOrderSample
 }
 
 // SeriesLabels reconstructs ref's full label set: the six target labels, __name__,
@@ -334,6 +459,7 @@ func (h *Head) SetSTZeroSample(ref uint32, t, st int64) error {
 		return err
 	}
 	h.lastST[ref] = st
+	h.updateMinMaxTime(st)
 	return nil
 }
 
@@ -354,7 +480,11 @@ func (h *Head) Exemplars(ref uint32) []exemplarEntry {
 // HistogramStore's doc comment for what this does and does not support (stable
 // schema/zero-threshold/span layout only, no custom buckets).
 func (h *Head) AppendHistogram(ref uint32, ts int64, hg *histogram.Histogram) error {
-	return h.histograms.Append(ref, ts, hg)
+	if err := h.histograms.Append(ref, ts, hg); err != nil {
+		return err
+	}
+	h.updateMinMaxTime(ts)
+	return nil
 }
 
 // HistogramIterator returns an iterator over ref's encoded histogram samples.

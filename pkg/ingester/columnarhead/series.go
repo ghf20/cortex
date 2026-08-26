@@ -189,6 +189,19 @@ func (s *SeriesStore) LocalName(ref uint32) uint16 { return s.localName[ref] }
 func (s *SeriesStore) LocalRef(ref uint32) uint16  { return s.localRef[ref] }
 func (s *SeriesStore) HasLocal(ref uint32) bool    { return s.hasLocal[ref] }
 
+// LastSample returns ref's most recently appended timestamp and the raw bit
+// pattern of its most recently appended value (matching valueState.lastBits'
+// own representation - no float round-trip needed for a bit-exact duplicate
+// check), and whether ref has any samples at all yet. The out-of-order/
+// duplicate detection in Head.Append needs exactly this, without reaching past
+// SeriesStore's field boundary into tsState/valueState's internal shape.
+func (s *SeriesStore) LastSample(ref uint32) (ts int64, valueBits uint64, ok bool) {
+	if s.nSamples[ref] == 0 {
+		return 0, 0, false
+	}
+	return s.ts[ref].lastTS, s.val[ref].lastBits, true
+}
+
 // Append encodes one (timestamp, value) sample for the series at ref. Timestamps are
 // not required to be monotonic here - that validation belongs to the Appender layer
 // (not yet built), which is also where out-of-order handling belongs.
