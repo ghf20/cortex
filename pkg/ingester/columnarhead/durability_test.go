@@ -10,7 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/metadata"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 )
 
@@ -769,4 +771,67 @@ func fileSize(t *testing.T, path string) int64 {
 		t.Fatalf("Stat(%s): %v", path, err)
 	}
 	return fi.Size()
+}
+
+// TestDurableHeadPersistsMetadata is the decisive test for metadata persistence:
+// UpdateMetadata via the real Appender, Flush, simulate a crash, reload, and
+// confirm the metadata survives - via Head.Metadata, the same accessor real
+// callers would use, not by poking internal fields.
+func TestDurableHeadPersistsMetadata(t *testing.T) {
+	dir := t.TempDir()
+	dh, err := CreateDurableHead(dir, 2, 1, 8)
+	if err != nil {
+		t.Fatalf("CreateDurableHead: %v", err)
+	}
+
+	l := labels.FromStrings(labels.MetricName, "up", "cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j")
+	app := dh.Appender(context.Background())
+	if _, err := app.Append(0, l, 1700000000000, 1); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	want := metadata.Metadata{Type: model.MetricTypeGauge, Unit: "seconds", Help: "a test gauge with a reasonably long help string to exercise real byte lengths"}
+	if _, err := app.UpdateMetadata(0, l, want); err != nil {
+		t.Fatalf("UpdateMetadata: %v", err)
+	}
+
+	stats, err := dh.Flush()
+	if err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if stats.MetadataBytes == 0 {
+		t.Fatal("Flush reported 0 metadata bytes after a real UpdateMetadata call")
+	}
+
+	// Update it again to something SHORTER, then flush again - the case that
+	// needs metadataFile.Truncate (encoded size can shrink, unlike series_meta.bin).
+	shorter := metadata.Metadata{Type: model.MetricTypeGauge, Unit: "s", Help: "short"}
+	if _, err := app.UpdateMetadata(0, l, shorter); err != nil {
+		t.Fatalf("UpdateMetadata (shorter): %v", err)
+	}
+	if _, err := dh.Flush(); err != nil {
+		t.Fatalf("second Flush: %v", err)
+	}
+	want = shorter
+
+	if err := dh.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reloaded, err := LoadDurableHead(dir)
+	if err != nil {
+		t.Fatalf("LoadDurableHead: %v", err)
+	}
+	defer reloaded.Close()
+
+	refs, ok := reloaded.SeriesRefsForName("up")
+	if !ok || len(refs) != 1 {
+		t.Fatalf("series 'up' not found as expected: %v %v", refs, ok)
+	}
+	got, ok := reloaded.Metadata(refs[0])
+	if !ok {
+		t.Fatal("Metadata not found after reload")
+	}
+	if got != want {
+		t.Fatalf("Metadata after reload = %+v, want %+v", got, want)
+	}
 }

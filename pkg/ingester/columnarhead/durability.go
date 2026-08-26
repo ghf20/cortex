@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/metadata"
 )
 
 // This file is the Phase 5 spike design doc §7 asks for before building a
@@ -43,16 +46,17 @@ import (
 // reproduces real data corruption after reload. Free-list reuse is therefore always
 // enabled - NewHead/NewSeriesStore are used directly, no separate durable variant.
 //
-// Scope, stated plainly: floats only, matching Phase 2's own precedent - histograms,
-// exemplars, metadata, and start-timestamps are NOT persisted here. A crash loses
-// them even if this were wired into the real ingest path (which it isn't yet - this
-// proves the mechanism, it is not itself the finished Phase 5 feature).
+// Scope, stated plainly: metadata is persisted (see encodeMetadataMap), but
+// histograms, exemplars, and start-timestamps are NOT - a crash loses them even if
+// this were wired into the real ingest path (which it isn't yet - this proves the
+// mechanism, it is not itself the finished Phase 5 feature).
 const (
 	fileSymbolsBlob    = "symbols_blob.bin"
 	fileSymbolsOffsets = "symbols_offsets.bin"
 	fileTargets        = "targets.bin"
 	fileArena          = "arena.bin"
 	fileSeriesMeta     = "series_meta.bin"
+	fileMetadata       = "metadata.bin"
 )
 
 // seriesMetaRecordSize is one series' fixed-width persisted record: targetID(4) +
@@ -105,6 +109,71 @@ func decodeSeriesMetaRecord(buf []byte) (targetID uint32, nameID, localName, loc
 	return
 }
 
+// encodeMetadataMap serializes m as a sequence of variable-length records (ref
+// uint32, then Type/Unit/Help each as a uint16 length prefix + bytes) - unlike
+// SeriesStore's fixed-width records, metadata.Metadata's fields are strings, so
+// there's no fixed record size to exploit. Small and bounded (at most one entry per
+// series) either way, so a full rewrite on every Flush is the same acceptable
+// tradeoff series_meta.bin already makes, not a new one.
+func encodeMetadataMap(byRef map[uint32]metadata.Metadata) []byte {
+	var buf []byte
+	putStr := func(s string) {
+		var lenBuf [2]byte
+		binary.LittleEndian.PutUint16(lenBuf[:], uint16(len(s)))
+		buf = append(buf, lenBuf[:]...)
+		buf = append(buf, s...)
+	}
+	for ref, m := range byRef {
+		var refBuf [4]byte
+		binary.LittleEndian.PutUint32(refBuf[:], ref)
+		buf = append(buf, refBuf[:]...)
+		putStr(string(m.Type))
+		putStr(m.Unit)
+		putStr(m.Help)
+	}
+	return buf
+}
+
+// decodeMetadataMap is encodeMetadataMap's inverse.
+func decodeMetadataMap(buf []byte) (map[uint32]metadata.Metadata, error) {
+	byRef := make(map[uint32]metadata.Metadata)
+	off := 0
+	getStr := func() (string, error) {
+		if off+2 > len(buf) {
+			return "", fmt.Errorf("truncated metadata record at offset %d", off)
+		}
+		n := int(binary.LittleEndian.Uint16(buf[off : off+2]))
+		off += 2
+		if off+n > len(buf) {
+			return "", fmt.Errorf("truncated metadata string at offset %d", off)
+		}
+		s := string(buf[off : off+n])
+		off += n
+		return s, nil
+	}
+	for off < len(buf) {
+		if off+4 > len(buf) {
+			return nil, fmt.Errorf("truncated metadata ref at offset %d", off)
+		}
+		ref := binary.LittleEndian.Uint32(buf[off : off+4])
+		off += 4
+		typ, err := getStr()
+		if err != nil {
+			return nil, err
+		}
+		unit, err := getStr()
+		if err != nil {
+			return nil, err
+		}
+		help, err := getStr()
+		if err != nil {
+			return nil, err
+		}
+		byRef[ref] = metadata.Metadata{Type: model.MetricType(typ), Unit: unit, Help: help}
+	}
+	return byRef, nil
+}
+
 // DurableHead wraps a Head with on-disk persistence for its append-only structures.
 // Not wired into the real ingest path - a standalone harness for measuring whether
 // the underlying mechanism (see this file's package-level doc comment) is viable.
@@ -112,7 +181,7 @@ type DurableHead struct {
 	*Head
 	dir string
 
-	blobFile, offsetFile, targetsFile, arenaFile, metaFile *os.File
+	blobFile, offsetFile, targetsFile, arenaFile, metaFile, metadataFile *os.File
 
 	// High-water marks: how much of each append-only structure is already durable.
 	// Units match what's being flushed - bytes for blob, element counts (multiplied
@@ -154,7 +223,7 @@ type DurableHead struct {
 // one). Fails if any of the five files already exist, rather than silently
 // overwriting a prior head's data.
 func CreateDurableHead(dir string, expectedSeries, expectedTargets, expectedSymbols int) (*DurableHead, error) {
-	for _, name := range []string{fileSymbolsBlob, fileSymbolsOffsets, fileTargets, fileArena, fileSeriesMeta} {
+	for _, name := range []string{fileSymbolsBlob, fileSymbolsOffsets, fileTargets, fileArena, fileSeriesMeta, fileMetadata} {
 		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
 			return nil, fmt.Errorf("columnarhead: %s already exists in %s - use LoadDurableHead", name, dir)
 		}
@@ -174,6 +243,9 @@ func CreateDurableHead(dir string, expectedSeries, expectedTargets, expectedSymb
 		return nil, err
 	}
 	if dh.metaFile, err = os.OpenFile(filepath.Join(dir, fileSeriesMeta), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
+		return nil, err
+	}
+	if dh.metadataFile, err = os.OpenFile(filepath.Join(dir, fileMetadata), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
 		return nil, err
 	}
 	return dh, nil
@@ -219,6 +291,14 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 	if len(metaBytes)%seriesMetaRecordSize != 0 {
 		return nil, fmt.Errorf("columnarhead: %s size %d not a multiple of record size %d", fileSeriesMeta, len(metaBytes), seriesMetaRecordSize)
 	}
+	metadataBytes, err := os.ReadFile(filepath.Join(dir, fileMetadata))
+	if err != nil {
+		return nil, err
+	}
+	metadataByRef, err := decodeMetadataMap(metadataBytes)
+	if err != nil {
+		return nil, fmt.Errorf("columnarhead: decode %s: %w", fileMetadata, err)
+	}
 	numSeries := len(metaBytes) / seriesMetaRecordSize
 	numTargets := len(targetBytes) / 4 / targetFields
 
@@ -263,7 +343,7 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 		targetIndex:  make(map[[targetFields]uint32]uint32, numTargets),
 		seriesIndex:  make(map[seriesKey]uint32, numSeries),
 		namePostings: make(map[uint16][]uint32),
-		metadata:     newSeriesMetadata(),
+		metadata:     &seriesMetadata{byRef: metadataByRef},
 		lastST:       make(map[uint32]int64),
 		exemplars:    newExemplarStorage(defaultExemplarCapacity),
 		histograms:   NewHistogramStore(),
@@ -315,6 +395,9 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 	if dh.metaFile, err = os.OpenFile(filepath.Join(dir, fileSeriesMeta), os.O_RDWR, 0o644); err != nil {
 		return nil, err
 	}
+	if dh.metadataFile, err = os.OpenFile(filepath.Join(dir, fileMetadata), os.O_RDWR, 0o644); err != nil {
+		return nil, err
+	}
 	return dh, nil
 }
 
@@ -324,6 +407,7 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 type FlushStats struct {
 	NewBlobBytes, NewTargetBytes, NewArenaBytes int
 	SeriesMetaBytes                             int // always a full rewrite - see seriesMetaRecordSize's doc comment
+	MetadataBytes                               int // always a full rewrite - see encodeMetadataMap's doc comment
 }
 
 // Flush durably persists everything appended since the last Flush (or since
@@ -413,7 +497,24 @@ func (dh *DurableHead) Flush() (FlushStats, error) {
 	}
 	stats.SeriesMetaBytes = len(metaBuf)
 
-	for _, f := range []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.arenaFile, dh.metaFile} {
+	// Metadata's encoded size, unlike series_meta.bin's, is NOT guaranteed
+	// non-decreasing across flushes: entry count never shrinks (SetMetadata never
+	// deletes), but a value update for an EXISTING ref (a shorter Help string
+	// replacing a longer one) can shrink the total encoded size - so, unlike
+	// series_meta.bin, this needs an explicit Truncate after WriteAt or stale
+	// trailing bytes from a previous, longer encoding would linger in the file.
+	metadataBuf := encodeMetadataMap(dh.metadata.byRef)
+	if len(metadataBuf) > 0 {
+		if _, err := dh.metadataFile.WriteAt(metadataBuf, 0); err != nil {
+			return stats, fmt.Errorf("write %s: %w", fileMetadata, err)
+		}
+	}
+	if err := dh.metadataFile.Truncate(int64(len(metadataBuf))); err != nil {
+		return stats, fmt.Errorf("truncate %s: %w", fileMetadata, err)
+	}
+	stats.MetadataBytes = len(metadataBuf)
+
+	for _, f := range []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.arenaFile, dh.metaFile, dh.metadataFile} {
 		if err := f.Sync(); err != nil {
 			return stats, fmt.Errorf("sync: %w", err)
 		}
@@ -539,7 +640,7 @@ func (dh *DurableHead) Close() error {
 		dh.stopAutoFlush = nil
 	}
 	var err error
-	for _, f := range []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.arenaFile, dh.metaFile} {
+	for _, f := range []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.arenaFile, dh.metaFile, dh.metadataFile} {
 		if cerr := f.Close(); cerr != nil {
 			err = errors.Join(err, cerr)
 		}
