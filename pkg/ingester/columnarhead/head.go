@@ -143,6 +143,13 @@ type Head struct {
 
 	shards []*seriesShard
 
+	// lifecycleCallback, if set (SetSeriesLifecycleCallback), is invoked exactly
+	// around genuine series creation in GetOrCreateSeries - see
+	// SeriesLifecycleCallback's own doc comment. nil by default: every existing
+	// NewHead/NewHeadWithShards caller and test is unaffected, no signature
+	// churn needed to add this.
+	lifecycleCallback SeriesLifecycleCallback
+
 	// oooTimeWindow: out-of-order float sample support (see ooo.go). A sample older
 	// than the in-order stream's own last timestamp is rejected with
 	// storage.ErrOutOfOrderSample/ErrDuplicateSampleForTimestamp unless it falls
@@ -239,6 +246,49 @@ func (h *Head) SetOOOTimeWindow(w int64) {
 	h.oooTimeWindow.Store(w)
 }
 
+// SeriesLifecycleCallback mirrors real tsdb.SeriesLifecycleCallback's PreCreation/
+// PostCreation shape (vendor/.../tsdb/head.go) - a real, previously-missing hook
+// found by an external review of Phase 7's ingester wiring: without it, a
+// columnarhead-backed tenant's per-metric-name limit, per-label-set limits, active-
+// series tracker, and MaxInMemorySeries/memory_series_created_total accounting all
+// silently no-op, since nothing ever called into them (Cortex's userTSDB implements
+// the real 3-method interface and is passed as tsdb.Options.SeriesLifecycleCallback
+// for the real backend, but the columnar path had no equivalent hook at all).
+//
+// PostDeletion is deliberately NOT part of this interface: columnarhead never
+// removes a series from its indexes at all, even after Truncate empties every
+// sample it has (Head.Truncate's own doc comment states this explicitly) - there is
+// no "series deleted" event to ever fire PostDeletion for. A real, stated
+// consequence, not silently glossed over: counters PostDeletion would normally
+// decrement (seriesInMetric, labelSetCounter, trackerCounter, instanceSeriesCount)
+// only ever GROW for a columnar-backed tenant while its TSDB stays open, unlike the
+// real backend where per-series GC keeps them accurate over time - they only reset
+// when the whole tenant's TSDB is closed. A caller (e.g. Cortex's userTSDB) that
+// already implements the full 3-method tsdb.SeriesLifecycleCallback interface
+// satisfies this narrower one for free, no adapter needed.
+type SeriesLifecycleCallback interface {
+	// PreCreation is called before a genuinely new series is created (never on a
+	// dedup hit against an existing one) - returning an error rejects the
+	// creation, propagated as GetOrCreateSeries' own error.
+	PreCreation(labels.Labels) error
+	// PostCreation is called after a genuinely new series has been created.
+	PostCreation(labels.Labels)
+}
+
+// SetSeriesLifecycleCallback installs cb, invoked around every genuinely new
+// series GetOrCreateSeries creates from now on - see SeriesLifecycleCallback's own
+// doc comment for what this does and does not cover. nil (NewHead/
+// NewHeadWithShards' default) means no callback fires at all, preserving every
+// existing caller's behavior. Self-locking (indexMu) - safe to call concurrently
+// with real ingest traffic, though real callers set this once, right after
+// construction, before any real traffic (matching how Cortex sets userTSDB.limiter
+// post-construction for the identical "don't limit during reload" reason).
+func (h *Head) SetSeriesLifecycleCallback(cb SeriesLifecycleCallback) {
+	h.indexMu.Lock()
+	defer h.indexMu.Unlock()
+	h.lifecycleCallback = cb
+}
+
 // MinTime, MaxTime return the earliest/latest timestamp accepted by the head so
 // far (in-order or OOO), or (math.MaxInt64, math.MinInt64) if no sample has
 // ever been accepted - matching real tsdb.Head's own empty-head convention.
@@ -321,6 +371,29 @@ func (h *Head) GetOrCreateSeries(target TargetLabels, metricName, localName, loc
 		return ref, nil
 	}
 
+	// A genuinely new series - the one point PreCreation/PostCreation fire, not
+	// on a dedup hit above. See SeriesLifecycleCallback's own doc comment for
+	// why this exists and what it deliberately doesn't cover.
+	var lbls labels.Labels
+	if h.lifecycleCallback != nil {
+		lbls = buildLabels(target, metricName, localName, localLabel)
+		// PreCreation (e.g. userDB's) commonly calls back into NumSeries or
+		// PostingsForMatchers, both of which need indexMu themselves - held
+		// non-reentrantly, so it must be released across this call or every
+		// such callback self-deadlocks (confirmed by a hanging test before
+		// this fix). Re-check the dedup key on reacquire: another goroutine
+		// may have created this exact series while we were unlocked.
+		h.indexMu.Unlock()
+		err := h.lifecycleCallback.PreCreation(lbls)
+		h.indexMu.Lock()
+		if err != nil {
+			return 0, err
+		}
+		if ref, ok := h.seriesIndex[key]; ok {
+			return ref, nil
+		}
+	}
+
 	ref := h.nextRef
 	shard, localIdx := h.shardFor(ref)
 	shard.mu.Lock()
@@ -336,7 +409,41 @@ func (h *Head) GetOrCreateSeries(target TargetLabels, metricName, localName, loc
 	h.nextRef++
 	h.seriesIndex[key] = ref
 	h.namePostings[nameID] = append(h.namePostings[nameID], ref)
+
+	if h.lifecycleCallback != nil {
+		h.lifecycleCallback.PostCreation(lbls)
+	}
 	return ref, nil
+}
+
+// buildLabels reconstructs the full label set GetOrCreateSeries's own arguments
+// represent - the same shape SeriesLabels reconstructs from an already-created
+// series' ref, but usable BEFORE a ref exists yet (SeriesLifecycleCallback.
+// PreCreation needs the labels before creation, not after). Omits an empty
+// target label, matching SeriesLabels' own real-Prometheus-compatible
+// "empty-valued label == absent" fix (CHECKLIST.md's Phase 7 step 5 note) - kept
+// in sync deliberately, not by accident, since both reconstruct the identical
+// shape from the identical inputs.
+func buildLabels(target TargetLabels, metricName, localName, localLabel string) labels.Labels {
+	b := labels.NewScratchBuilder(8)
+	b.Add(labels.MetricName, metricName)
+	addIfNotEmptyLabel(&b, labelCluster, target.Cluster)
+	addIfNotEmptyLabel(&b, labelNamespace, target.Namespace)
+	addIfNotEmptyLabel(&b, labelPod, target.Pod)
+	addIfNotEmptyLabel(&b, labelContainer, target.Container)
+	addIfNotEmptyLabel(&b, labelNode, target.Node)
+	addIfNotEmptyLabel(&b, labelJob, target.Job)
+	if localLabel != "" {
+		b.Add(localName, localLabel)
+	}
+	b.Sort()
+	return b.Labels()
+}
+
+func addIfNotEmptyLabel(b *labels.ScratchBuilder, name, value string) {
+	if value != "" {
+		b.Add(name, value)
+	}
 }
 
 // LookupSeriesRef returns the series ref for (target, metricName, localName,

@@ -1,6 +1,7 @@
 package columnarhead
 
 import (
+	"errors"
 	"fmt"
 	"runtime"
 	"testing"
@@ -8,6 +9,110 @@ import (
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 )
+
+// mockLifecycleCallback records every PreCreation/PostCreation call it sees, and
+// can be configured to reject a specific metric name - just enough to test
+// SetSeriesLifecycleCallback's contract without depending on Cortex's own
+// userTSDB (a real, separate package).
+type mockLifecycleCallback struct {
+	reject    map[string]error
+	preCalls  []labels.Labels
+	postCalls []labels.Labels
+}
+
+func (m *mockLifecycleCallback) PreCreation(l labels.Labels) error {
+	m.preCalls = append(m.preCalls, l)
+	if err, ok := m.reject[l.Get(labels.MetricName)]; ok {
+		return err
+	}
+	return nil
+}
+
+func (m *mockLifecycleCallback) PostCreation(l labels.Labels) {
+	m.postCalls = append(m.postCalls, l)
+}
+
+// TestHeadSeriesLifecycleCallback is the decisive test for
+// SetSeriesLifecycleCallback: PreCreation fires exactly once per genuinely new
+// series (never on a dedup hit), a PreCreation error blocks creation entirely
+// (no series, no ref consumed), and PostCreation fires exactly once per series
+// actually created.
+func TestHeadSeriesLifecycleCallback(t *testing.T) {
+	h := NewHead(4, 1, 4)
+	cb := &mockLifecycleCallback{reject: map[string]error{"blocked_metric": errors.New("rejected by limiter")}}
+	h.SetSeriesLifecycleCallback(cb)
+
+	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
+
+	ref1, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	if err != nil {
+		t.Fatalf("GetOrCreateSeries(up): %v", err)
+	}
+	if len(cb.preCalls) != 1 || len(cb.postCalls) != 1 {
+		t.Fatalf("after first creation: preCalls=%d postCalls=%d, want 1/1", len(cb.preCalls), len(cb.postCalls))
+	}
+
+	// A dedup hit (same target+metric+no local label) must NOT fire either
+	// callback again.
+	ref1Again, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	if err != nil {
+		t.Fatalf("GetOrCreateSeries(up) again: %v", err)
+	}
+	if ref1Again != ref1 {
+		t.Fatalf("dedup broke: got ref %d, want %d", ref1Again, ref1)
+	}
+	if len(cb.preCalls) != 1 || len(cb.postCalls) != 1 {
+		t.Fatalf("after dedup hit: preCalls=%d postCalls=%d, want unchanged 1/1", len(cb.preCalls), len(cb.postCalls))
+	}
+
+	// A rejected PreCreation must block creation entirely - no series created,
+	// no PostCreation call, the error propagated verbatim.
+	before := h.NumSeries()
+	_, err = h.GetOrCreateSeries(tgt, "blocked_metric", "", "")
+	if err == nil || err.Error() != "rejected by limiter" {
+		t.Fatalf("GetOrCreateSeries(blocked_metric) = %v, want the PreCreation rejection error", err)
+	}
+	if h.NumSeries() != before {
+		t.Fatalf("NumSeries() = %d after a rejected creation, want unchanged %d", h.NumSeries(), before)
+	}
+	if len(cb.postCalls) != 1 {
+		t.Fatalf("PostCreation called %d times after a PreCreation rejection, want still 1 (unchanged)", len(cb.postCalls))
+	}
+
+	// A second, genuinely different series must fire both callbacks again,
+	// with the correct reconstructed labels (see buildLabels).
+	ref2, err := h.GetOrCreateSeries(tgt, "down", "", "")
+	if err != nil {
+		t.Fatalf("GetOrCreateSeries(down): %v", err)
+	}
+	if ref2 == ref1 {
+		t.Fatal("down got the same ref as up - dedup incorrectly matched a different metric")
+	}
+	// preCalls is 3 here, not 2: PreCreation legitimately fired (and rejected)
+	// for the blocked_metric attempt above too - that's the whole point of it
+	// being able to reject. postCalls stays at 2 since that attempt never
+	// completed creation.
+	if len(cb.preCalls) != 3 || len(cb.postCalls) != 2 {
+		t.Fatalf("after second creation: preCalls=%d postCalls=%d, want 3/2", len(cb.preCalls), len(cb.postCalls))
+	}
+	wantLbls := labels.FromStrings(labels.MetricName, "down", "cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j")
+	if !labels.Equal(cb.preCalls[2], wantLbls) {
+		t.Fatalf("PreCreation labels = %v, want %v", cb.preCalls[2], wantLbls)
+	}
+	if !labels.Equal(cb.postCalls[1], wantLbls) {
+		t.Fatalf("PostCreation labels = %v, want %v", cb.postCalls[1], wantLbls)
+	}
+}
+
+// TestHeadNoLifecycleCallbackIsSafeDefault confirms every existing caller
+// (nothing sets a callback) is completely unaffected - the nil default.
+func TestHeadNoLifecycleCallbackIsSafeDefault(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
+	if _, err := h.GetOrCreateSeries(tgt, "up", "", ""); err != nil {
+		t.Fatalf("GetOrCreateSeries with no callback set: %v", err)
+	}
+}
 
 func TestHeadDedupesTargetsAndSeries(t *testing.T) {
 	h := NewHead(10, 10, 10)

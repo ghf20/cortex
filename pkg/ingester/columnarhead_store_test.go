@@ -2,8 +2,10 @@ package ingester
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -17,6 +19,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/stretchr/testify/require"
+	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/middleware"
 	"github.com/weaveworks/common/user"
 	"google.golang.org/grpc"
@@ -474,4 +477,60 @@ func TestIngester_UseColumnarHead_QueryStream(t *testing.T) {
 			require.Equal(t, expectedResponseChunks, lastResp)
 		})
 	}
+}
+
+// TestIngester_UseColumnarHead_EnforcesPerMetricLimit is the decisive end-to-end
+// test for the real gap an external review of this branch found (not something
+// any earlier test here covered): a columnar-backed tenant's
+// SeriesLifecycleCallback was never wired up at all, so limits enforced through
+// it (per-metric series, per-label-set, active-series tracker,
+// MaxInMemorySeries/memory_series_created_total accounting) all silently
+// no-opped. This checks the most direct one - MaxLocalSeriesPerMetric - through
+// the real ingester Push path, the same real limiter and error path
+// TestIngesterMetricLimitExceeded already proves for the native backend, just
+// with the flag on.
+func TestIngester_UseColumnarHead_EnforcesPerMetricLimit(t *testing.T) {
+	limits := defaultLimitsTestConfig()
+	limits.MaxLocalSeriesPerMetric = 1
+
+	cfg := defaultIngesterTestConfig(t)
+	cfg.BlocksStorageConfig.TSDB.UseColumnarHead = true
+
+	i, err := prepareIngesterWithBlocksStorageAndLimits(t, cfg, limits, nil, "", prometheus.NewRegistry())
+	require.NoError(t, err)
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
+	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
+
+	test.Poll(t, 1*time.Second, ring.ACTIVE, func() any {
+		return i.lifecycler.GetState()
+	})
+
+	ctx := user.InjectOrgID(context.Background(), userID)
+	lbls1 := labels.FromStrings(labels.MetricName, "testmetric", "pod", "p1")
+	lbls2 := labels.FromStrings(labels.MetricName, "testmetric", "pod", "p2")
+
+	req1, _ := mockWriteRequest(t, lbls1, 1, 0)
+	_, err = i.Push(ctx, req1)
+	require.NoError(t, err)
+
+	db, err := i.getTSDB(userID)
+	require.NoError(t, err)
+	_, ok := db.db.(*columnarheadTSDBStore)
+	require.True(t, ok, "userTSDB.db is a %T, want *columnarheadTSDBStore", db.db)
+
+	// A second, DIFFERENT series for the SAME metric name must now be rejected -
+	// before the SeriesLifecycleCallback fix, this silently succeeded regardless
+	// of MaxLocalSeriesPerMetric.
+	req2, _ := mockWriteRequest(t, lbls2, 2, 1)
+	_, err = i.Push(ctx, req2)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errMaxSeriesPerMetricLimitExceeded) || httpStatusIndicatesLimit(err),
+		"Push of a second series for the same metric = %v, want a per-metric-series-limit error", err)
+
+	require.Equal(t, uint64(1), db.NumSeries(), "the rejected series must not have been created")
+}
+
+func httpStatusIndicatesLimit(err error) bool {
+	httpResp, ok := httpgrpc.HTTPResponseFromError(err)
+	return ok && httpResp.Code == http.StatusBadRequest
 }

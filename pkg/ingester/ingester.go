@@ -3261,6 +3261,21 @@ func (i *Ingester) createTSDB(userID string) (*userTSDB, error) {
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to open columnar head TSDB: %s", udir)
 		}
+		// userTSDB already implements the full 3-method tsdb.SeriesLifecycleCallback
+		// interface (used directly below as the real backend's own
+		// tsdb.Options.SeriesLifecycleCallback), which structurally satisfies
+		// columnarhead's narrower 2-method one too - no adapter needed. Without
+		// this, per-metric/per-label-set/active-series-tracker limits and the
+		// MaxInMemorySeries/memory_series_created_total accounting all silently
+		// no-op for a columnar-backed tenant (a real gap an external review of
+		// this wiring found - see columnarhead.SeriesLifecycleCallback's own doc
+		// comment for what it does and does not cover). Set here, right after
+		// construction and before any real traffic reaches this store, same as
+		// userDB.limiter below - reloading existing series from disk
+		// (columnarhead.LoadDurableHead, inside newColumnarheadTSDBStore above)
+		// never goes through GetOrCreateSeries, so there's no "don't limit during
+		// reload" ordering hazard to avoid here.
+		store.head.SetSeriesLifecycleCallback(userDB)
 		if err := store.ApplyConfig(&config.Config{StorageConfig: config.StorageConfig{TSDBConfig: &config.TSDBConfig{OutOfOrderTimeWindow: time.Duration(oooTimeWindow).Milliseconds()}}}); err != nil {
 			if closeErr := store.Close(); closeErr != nil {
 				level.Warn(userLogger).Log("msg", "failed to close columnar head TSDB after ApplyConfig failure", "err", closeErr)
