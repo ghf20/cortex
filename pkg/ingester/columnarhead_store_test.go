@@ -412,21 +412,12 @@ func TestIngester_UseColumnarHead_QueryStream(t *testing.T) {
 			case "float":
 				req, expectedResponseChunks = mockWriteRequest(t, lbls, 456, 123000)
 			case "histogram":
+				// Real histogram chunk data expected, bit-exact - the
+				// ChunkQuerier gap this test originally surfaced (histogram
+				// series silently returning zero chunks over the real gRPC
+				// path) is fixed; see chunk_querier.go's newHistogramChunksIterator
+				// and columnarhead's own TestChunkQuerierHistogramSeriesRoundTrip.
 				req, expectedResponseChunks = mockHistogramWriteRequest(t, lbls, 456, 123000, false)
-				// Real, verified gap this test surfaced (not something it was
-				// built to newly cover): Head.ChunkQuerier's headChunkSeries.
-				// Iterator returns an already-exhausted iterator for any
-				// series that ever received a histogram sample
-				// (chunk_querier.go: "Histogram chunks: stated gap" -
-				// Phase 2's own documented scope limit). That means the
-				// series itself still comes back over QueryStream (chunks),
-				// just with zero chunks - a real querier reading a
-				// columnarhead-backed ingester over the actual gRPC chunks
-				// path gets NO histogram data back, silently, today. Asserted
-				// here explicitly rather than expecting the real chunk bytes,
-				// so this stays a real, documented, test-enforced limitation
-				// instead of a misleadingly "passing" bit-exact comparison.
-				expectedResponseChunks.Chunkseries[0].Chunks = nil
 			}
 			_, err = i.Push(ctx, req)
 			require.NoError(t, err)

@@ -130,16 +130,29 @@ func TestChunkQuerierNoSamplesInRange(t *testing.T) {
 	}
 }
 
-func TestChunkQuerierHistogramSeriesReturnsNoChunks(t *testing.T) {
+// TestChunkQuerierHistogramSeriesRoundTrip is the decisive test for real
+// histogram chunk encoding (see Head.ChunkQuerier's doc comment for why this
+// used to be a stated gap): a stable-layout, no-counter-reset sequence must
+// round-trip through ONE real chunkenc.HistogramChunk, decodable by real
+// Prometheus code, bit-exact via histEqual - not just "doesn't return an empty
+// iterator anymore."
+func TestChunkQuerierHistogramSeriesRoundTrip(t *testing.T) {
 	h := NewHead(1, 1, 1)
 	app := h.Appender(context.Background())
 	l := labels.FromStrings(
 		labels.MetricName, "request_latency",
 		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
 	)
-	hist := &histogram.Histogram{Schema: 0, Count: 1, Sum: 1, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{1}}
-	if _, err := app.AppendHistogram(0, l, 1700000000000, hist, nil); err != nil {
-		t.Fatalf("AppendHistogram: %v", err)
+	base := int64(1700000000000)
+	samples := []*histogram.Histogram{
+		{Schema: 0, Count: 1, Sum: 1, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{1}},
+		{Schema: 0, Count: 3, Sum: 4, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{3}},
+		{Schema: 0, Count: 6, Sum: 9, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{6}},
+	}
+	for i, hg := range samples {
+		if _, err := app.AppendHistogram(0, l, base+int64(i)*15000, hg, nil); err != nil {
+			t.Fatalf("AppendHistogram %d: %v", i, err)
+		}
 	}
 
 	cq, err := h.ChunkQuerier(math.MinInt64, math.MaxInt64)
@@ -152,9 +165,109 @@ func TestChunkQuerierHistogramSeriesReturnsNoChunks(t *testing.T) {
 		t.Fatal("Select found no series")
 	}
 	cit := css.At().Iterator(nil)
-	if cit.Next() {
-		t.Fatal("histogram series should return no chunks (stated gap - see Head.ChunkQuerier doc comment), not fabricate one")
+	if !cit.Next() {
+		t.Fatalf("chunks.Iterator returned no chunks: %v", cit.Err())
 	}
+	meta := cit.At()
+	if cit.Next() {
+		t.Fatal("expected exactly one chunk for a stable-layout, no-counter-reset sequence")
+	}
+	if err := cit.Err(); err != nil {
+		t.Fatalf("chunks.Iterator error: %v", err)
+	}
+	wantMinTime, wantMaxTime := base, base+int64(len(samples)-1)*15000
+	if meta.MinTime != wantMinTime || meta.MaxTime != wantMaxTime {
+		t.Fatalf("meta.MinTime/MaxTime = %d/%d, want %d/%d", meta.MinTime, meta.MaxTime, wantMinTime, wantMaxTime)
+	}
+
+	it := meta.Chunk.Iterator(nil)
+	for i, want := range samples {
+		if it.Next() != chunkenc.ValHistogram {
+			t.Fatalf("sample %d: real chunk iterator exhausted early", i)
+		}
+		gotTS, got := it.AtHistogram(nil)
+		wantTS := base + int64(i)*15000
+		if gotTS != wantTS {
+			t.Fatalf("sample %d: ts = %d, want %d", i, gotTS, wantTS)
+		}
+		histEqual(t, got, want)
+	}
+	if it.Next() != chunkenc.ValNone {
+		t.Fatal("real chunk iterator has more samples than expected")
+	}
+	if it.Err() != nil {
+		t.Fatalf("real chunk iterator error: %v", it.Err())
+	}
+}
+
+// TestChunkQuerierHistogramSeriesCounterResetSplitsChunk confirms the
+// multi-chunk case Head.ChunkQuerier's doc comment describes actually happens:
+// HistogramStore itself never detects or rejects a counter reset (a histogram
+// whose bucket counts shrink relative to the previous sample - see its doc
+// comment), so real chunkenc.HistogramAppender must be the one to catch it when
+// building the real chunk, splitting into a new chunk rather than silently
+// encoding an inconsistent one.
+func TestChunkQuerierHistogramSeriesCounterResetSplitsChunk(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	app := h.Appender(context.Background())
+	l := labels.FromStrings(
+		labels.MetricName, "request_latency",
+		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+	)
+	base := int64(1700000000000)
+	big := &histogram.Histogram{Schema: 0, Count: 100, Sum: 500, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{100}}
+	// A real counter reset: bucket count and total Count both drop sharply,
+	// exactly what a process restart looks like to a native histogram.
+	small := &histogram.Histogram{Schema: 0, Count: 1, Sum: 2, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{1}}
+
+	if _, err := app.AppendHistogram(0, l, base, big, nil); err != nil {
+		t.Fatalf("AppendHistogram(big): %v", err)
+	}
+	if _, err := app.AppendHistogram(0, l, base+15000, small, nil); err != nil {
+		t.Fatalf("AppendHistogram(small): %v", err)
+	}
+
+	cq, err := h.ChunkQuerier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("ChunkQuerier: %v", err)
+	}
+	defer cq.Close()
+	css := cq.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "request_latency"))
+	if !css.Next() {
+		t.Fatal("Select found no series")
+	}
+	cit := css.At().Iterator(nil)
+
+	var metas []struct {
+		ts int64
+		h  *histogram.Histogram
+	}
+	for cit.Next() {
+		meta := cit.At()
+		it := meta.Chunk.Iterator(nil)
+		if it.Next() != chunkenc.ValHistogram {
+			t.Fatalf("chunk has no samples: %v", it.Err())
+		}
+		ts, hg := it.AtHistogram(nil)
+		metas = append(metas, struct {
+			ts int64
+			h  *histogram.Histogram
+		}{ts, hg})
+		if it.Next() != chunkenc.ValNone {
+			t.Fatal("expected exactly one sample per chunk in this test's setup")
+		}
+	}
+	if err := cit.Err(); err != nil {
+		t.Fatalf("chunks.Iterator error: %v", err)
+	}
+	if len(metas) != 2 {
+		t.Fatalf("got %d chunks, want 2 (the counter reset should have split into a new chunk)", len(metas))
+	}
+	if metas[0].ts != base || metas[1].ts != base+15000 {
+		t.Fatalf("chunk timestamps = [%d, %d], want [%d, %d]", metas[0].ts, metas[1].ts, base, base+15000)
+	}
+	histEqual(t, metas[0].h, big)
+	histEqual(t, metas[1].h, small)
 }
 
 func TestChunkQuerierLabelValuesAndNames(t *testing.T) {
