@@ -383,15 +383,14 @@ func TestIngester_UseColumnarHead(t *testing.T) {
 // been driven through end-to-end. Modeled directly on the existing
 // TestIngester_QueryStream (same real gRPC server/client round-trip,
 // same mockWriteRequest/mockHistogramWriteRequest fixtures), just with the
-// flag on.
-//
-// Float histograms are out of scope here too - a real, separately-documented
-// HistogramStore gap (ErrFloatHistogramUnsupported, Phase 3).
+// flag on. Covers all three encodings real TestIngester_QueryStream does -
+// FloatHistogram support (native columnar storage, not the earlier
+// ErrFloatHistogramUnsupported gap) is now built too.
 func TestIngester_UseColumnarHead_QueryStream(t *testing.T) {
 	cfg := defaultIngesterTestConfig(t)
 	cfg.BlocksStorageConfig.TSDB.UseColumnarHead = true
 
-	for _, enc := range []string{"float", "histogram"} {
+	for _, enc := range []string{"float", "histogram", "floathistogram"} {
 		t.Run(enc, func(t *testing.T) {
 			i, err := prepareIngesterWithBlocksStorage(t, cfg, prometheus.NewRegistry())
 			require.NoError(t, err)
@@ -418,6 +417,12 @@ func TestIngester_UseColumnarHead_QueryStream(t *testing.T) {
 				// path) is fixed; see chunk_querier.go's newHistogramChunksIterator
 				// and columnarhead's own TestChunkQuerierHistogramSeriesRoundTrip.
 				req, expectedResponseChunks = mockHistogramWriteRequest(t, lbls, 456, 123000, false)
+			case "floathistogram":
+				// Native FloatHistogram support, closing the loop through the
+				// real gRPC path too - see chunk_querier.go's
+				// newFloatHistogramChunksIterator and columnarhead's own
+				// TestChunkQuerierFloatHistogramSeriesRoundTrip.
+				req, expectedResponseChunks = mockHistogramWriteRequest(t, lbls, 456, 123000, true)
 			}
 			_, err = i.Push(ctx, req)
 			require.NoError(t, err)

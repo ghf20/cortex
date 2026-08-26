@@ -270,6 +270,139 @@ func TestChunkQuerierHistogramSeriesCounterResetSplitsChunk(t *testing.T) {
 	histEqual(t, metas[1].h, small)
 }
 
+// TestChunkQuerierFloatHistogramSeriesRoundTrip is
+// TestChunkQuerierHistogramSeriesRoundTrip's FloatHistogram counterpart - a
+// stable-layout, no-counter-reset sequence must round-trip through ONE real
+// chunkenc.FloatHistogramChunk, bit-exact via floatHistEqual.
+func TestChunkQuerierFloatHistogramSeriesRoundTrip(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	app := h.Appender(context.Background())
+	l := labels.FromStrings(
+		labels.MetricName, "request_latency",
+		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+	)
+	base := int64(1700000000000)
+	samples := []*histogram.FloatHistogram{
+		{Schema: 0, Count: 1, Sum: 1, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []float64{1}},
+		{Schema: 0, Count: 3, Sum: 4, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []float64{3}},
+		{Schema: 0, Count: 6, Sum: 9, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []float64{6}},
+	}
+	for i, hg := range samples {
+		if _, err := app.AppendHistogram(0, l, base+int64(i)*15000, nil, hg); err != nil {
+			t.Fatalf("AppendHistogram(FloatHistogram) %d: %v", i, err)
+		}
+	}
+
+	cq, err := h.ChunkQuerier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("ChunkQuerier: %v", err)
+	}
+	defer cq.Close()
+	css := cq.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "request_latency"))
+	if !css.Next() {
+		t.Fatal("Select found no series")
+	}
+	cit := css.At().Iterator(nil)
+	if !cit.Next() {
+		t.Fatalf("chunks.Iterator returned no chunks: %v", cit.Err())
+	}
+	meta := cit.At()
+	if cit.Next() {
+		t.Fatal("expected exactly one chunk for a stable-layout, no-counter-reset sequence")
+	}
+	if err := cit.Err(); err != nil {
+		t.Fatalf("chunks.Iterator error: %v", err)
+	}
+	wantMinTime, wantMaxTime := base, base+int64(len(samples)-1)*15000
+	if meta.MinTime != wantMinTime || meta.MaxTime != wantMaxTime {
+		t.Fatalf("meta.MinTime/MaxTime = %d/%d, want %d/%d", meta.MinTime, meta.MaxTime, wantMinTime, wantMaxTime)
+	}
+
+	it := meta.Chunk.Iterator(nil)
+	for i, want := range samples {
+		if it.Next() != chunkenc.ValFloatHistogram {
+			t.Fatalf("sample %d: real chunk iterator exhausted early", i)
+		}
+		gotTS, got := it.AtFloatHistogram(nil)
+		wantTS := base + int64(i)*15000
+		if gotTS != wantTS {
+			t.Fatalf("sample %d: ts = %d, want %d", i, gotTS, wantTS)
+		}
+		floatHistEqual(t, got, want)
+	}
+	if it.Next() != chunkenc.ValNone {
+		t.Fatal("real chunk iterator has more samples than expected")
+	}
+	if it.Err() != nil {
+		t.Fatalf("real chunk iterator error: %v", it.Err())
+	}
+}
+
+// TestChunkQuerierFloatHistogramSeriesCounterResetSplitsChunk is
+// TestChunkQuerierHistogramSeriesCounterResetSplitsChunk's FloatHistogram
+// counterpart - confirms the real chunkenc.FloatHistogramAppender's own
+// counter-reset detection splits into a new chunk here too.
+func TestChunkQuerierFloatHistogramSeriesCounterResetSplitsChunk(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	app := h.Appender(context.Background())
+	l := labels.FromStrings(
+		labels.MetricName, "request_latency",
+		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+	)
+	base := int64(1700000000000)
+	big := &histogram.FloatHistogram{Schema: 0, Count: 100, Sum: 500, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []float64{100}}
+	small := &histogram.FloatHistogram{Schema: 0, Count: 1, Sum: 2, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []float64{1}}
+
+	if _, err := app.AppendHistogram(0, l, base, nil, big); err != nil {
+		t.Fatalf("AppendHistogram(big): %v", err)
+	}
+	if _, err := app.AppendHistogram(0, l, base+15000, nil, small); err != nil {
+		t.Fatalf("AppendHistogram(small): %v", err)
+	}
+
+	cq, err := h.ChunkQuerier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("ChunkQuerier: %v", err)
+	}
+	defer cq.Close()
+	css := cq.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "request_latency"))
+	if !css.Next() {
+		t.Fatal("Select found no series")
+	}
+	cit := css.At().Iterator(nil)
+
+	var metas []struct {
+		ts int64
+		h  *histogram.FloatHistogram
+	}
+	for cit.Next() {
+		meta := cit.At()
+		it := meta.Chunk.Iterator(nil)
+		if it.Next() != chunkenc.ValFloatHistogram {
+			t.Fatalf("chunk has no samples: %v", it.Err())
+		}
+		ts, hg := it.AtFloatHistogram(nil)
+		metas = append(metas, struct {
+			ts int64
+			h  *histogram.FloatHistogram
+		}{ts, hg})
+		if it.Next() != chunkenc.ValNone {
+			t.Fatal("expected exactly one sample per chunk in this test's setup")
+		}
+	}
+	if err := cit.Err(); err != nil {
+		t.Fatalf("chunks.Iterator error: %v", err)
+	}
+	if len(metas) != 2 {
+		t.Fatalf("got %d chunks, want 2 (the counter reset should have split into a new chunk)", len(metas))
+	}
+	if metas[0].ts != base || metas[1].ts != base+15000 {
+		t.Fatalf("chunk timestamps = [%d, %d], want [%d, %d]", metas[0].ts, metas[1].ts, base, base+15000)
+	}
+	floatHistEqual(t, metas[0].h, big)
+	floatHistEqual(t, metas[1].h, small)
+}
+
 func TestChunkQuerierLabelValuesAndNames(t *testing.T) {
 	h := buildQueryHead(t)
 	cq, err := h.ChunkQuerier(math.MinInt64, math.MaxInt64)

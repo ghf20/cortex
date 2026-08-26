@@ -672,8 +672,8 @@ func (h *Head) Exemplars(ref uint32) []exemplarEntry {
 	return h.exemplars.forSeries(ref)
 }
 
-// AppendHistogram encodes one histogram sample for the series at ref. See
-// HistogramStore's doc comment for what this does and does not support (stable
+// AppendHistogram encodes one integer-count histogram sample for the series at ref.
+// See HistogramStore's doc comment for what this does and does not support (stable
 // schema/zero-threshold/span layout only, no custom buckets). Self-locking: ref's
 // shard's write lock for the call.
 func (h *Head) AppendHistogram(ref uint32, ts int64, hg *histogram.Histogram) error {
@@ -688,11 +688,35 @@ func (h *Head) AppendHistogram(ref uint32, ts int64, hg *histogram.Histogram) er
 	return nil
 }
 
-// HistogramIterator returns an iterator over ref's encoded histogram samples. Not
-// self-locking - see SeriesLabels.
+// AppendFloatHistogram encodes one float-count histogram sample for the series at
+// ref - the FloatHistogram counterpart to AppendHistogram. Self-locking: ref's
+// shard's write lock for the call.
+func (h *Head) AppendFloatHistogram(ref uint32, ts int64, hg *histogram.FloatHistogram) error {
+	shard, localIdx := h.shardFor(ref)
+	shard.mu.Lock()
+	err := shard.histograms.AppendFloat(localIdx, ts, hg)
+	shard.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	h.updateMinMaxTime(ts)
+	return nil
+}
+
+// HistogramIterator returns an iterator over ref's encoded histogram samples (either
+// integer- or float-typed - see HasFloatHistogram/HistogramIterator's own doc
+// comment on At vs AtFloat). Not self-locking - see SeriesLabels.
 func (h *Head) HistogramIterator(ref uint32) *HistogramIterator {
 	shard, localIdx := h.shardFor(ref)
 	return shard.histograms.Iterator(localIdx)
+}
+
+// HasFloatHistogram reports whether ref's histogram samples are FloatHistogram-typed
+// - meaningless (and false) if !HasHistogram(ref). Not self-locking - see
+// SeriesLabels.
+func (h *Head) HasFloatHistogram(ref uint32) bool {
+	shard, localIdx := h.shardFor(ref)
+	return shard.histograms.IsFloat(localIdx)
 }
 
 // Iterator returns an iterator over ref's encoded samples. Not self-locking - see

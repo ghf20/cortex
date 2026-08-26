@@ -231,17 +231,39 @@ func (a *headAppender) AppendExemplar(ref storage.SeriesRef, l labels.Labels, e 
 }
 
 // AppendHistogram resolves l to a series (creating it if needed, same as Append) and
-// records h. Only *histogram.Histogram is supported - fh (*histogram.FloatHistogram)
-// returns ErrFloatHistogramUnsupported, a stated scope limit (see HistogramStore's
-// doc comment), not silently mishandled. See Head.AppendHistogram /
-// HistogramStore.Append for what layouts are supported.
+// records h or fh - exactly one is expected to be non-nil, matching
+// storage.Appender's own documented contract. See Head.AppendHistogram/
+// AppendFloatHistogram and HistogramStore's doc comment for what layouts are
+// supported (stable schema/zero-threshold/span layout, no custom buckets - both
+// paths share those limits) and ErrHistogramTypeChanged for what happens if a series
+// switches between the two kinds mid-stream.
 func (a *headAppender) AppendHistogram(ref storage.SeriesRef, l labels.Labels, t int64, h *histogram.Histogram, fh *histogram.FloatHistogram) (storage.SeriesRef, error) {
-	if h == nil {
-		return 0, ErrFloatHistogramUnsupported
+	if h != nil {
+		if ref != 0 {
+			if internalRef, ok := toInternalRef(ref, a.h.NumSeries()); ok {
+				if err := a.h.AppendHistogram(internalRef, t, h); err != nil {
+					return 0, err
+				}
+				return ref, nil
+			}
+		}
+		target, metricName, localName, localLabel, err := splitLabels(l)
+		if err != nil {
+			return 0, err
+		}
+		seriesRef, err := a.h.GetOrCreateSeries(target, metricName, localName, localLabel)
+		if err != nil {
+			return 0, err
+		}
+		if err := a.h.AppendHistogram(seriesRef, t, h); err != nil {
+			return 0, err
+		}
+		return toExternalRef(seriesRef), nil
 	}
+
 	if ref != 0 {
 		if internalRef, ok := toInternalRef(ref, a.h.NumSeries()); ok {
-			if err := a.h.AppendHistogram(internalRef, t, h); err != nil {
+			if err := a.h.AppendFloatHistogram(internalRef, t, fh); err != nil {
 				return 0, err
 			}
 			return ref, nil
@@ -255,7 +277,7 @@ func (a *headAppender) AppendHistogram(ref storage.SeriesRef, l labels.Labels, t
 	if err != nil {
 		return 0, err
 	}
-	if err := a.h.AppendHistogram(seriesRef, t, h); err != nil {
+	if err := a.h.AppendFloatHistogram(seriesRef, t, fh); err != nil {
 		return 0, err
 	}
 	return toExternalRef(seriesRef), nil

@@ -228,14 +228,19 @@ func (s *headSeries) Labels() labels.Labels {
 }
 
 // Iterator returns a chunkenc.Iterator over s's samples, bounded to [s.mint, s.maxt]:
-// a histogram-backed one if this series ever received a histogram sample, a
-// float-backed one otherwise. A series is one or the other, never both (matches real
-// Prometheus semantics that a series' sample type doesn't change mid-stream - see
-// HistogramStore's doc comment). The passed-in iterator (for reuse) is ignored; this
-// always allocates fresh, unlike real chunk iterators that support in-place reuse - a
-// real optimization opportunity, not attempted here.
+// an integer-histogram-backed one if this series ever received a Histogram sample, a
+// float-histogram-backed one if it ever received a FloatHistogram sample, a
+// float-backed one otherwise. A series is exactly one of the three, never more than
+// one (matches real Prometheus semantics that a series' sample type doesn't change
+// mid-stream - see HistogramStore's doc comment, and ErrHistogramTypeChanged for the
+// int/float histogram case specifically). The passed-in iterator (for reuse) is
+// ignored; this always allocates fresh, unlike real chunk iterators that support
+// in-place reuse - a real optimization opportunity, not attempted here.
 func (s *headSeries) Iterator(_ chunkenc.Iterator) chunkenc.Iterator {
 	if s.h.HasHistogram(s.ref) {
+		if s.h.HasFloatHistogram(s.ref) {
+			return &floatHistogramSampleIterator{it: s.h.HistogramIterator(s.ref), mint: s.mint, maxt: s.maxt}
+		}
 		return &histogramSampleIterator{it: s.h.HistogramIterator(s.ref), mint: s.mint, maxt: s.maxt}
 	}
 	var src floatSource = s.h.Iterator(s.ref)
@@ -383,9 +388,20 @@ func (hi *histogramSampleIterator) AtHistogram(dst *histogram.Histogram) (int64,
 // AtFloatHistogram converts the current integer histogram to a FloatHistogram,
 // matching real Prometheus's histogramIterator.AtFloatHistogram precedent (it
 // documents supporting exactly this: "It also works if the value is a histogram with
-// integer counts"). Cheap here since HistogramIterator already tracks absolute
-// per-bucket counts internally (it.it.posAbs/negAbs) - converting to float deltas is
-// the same shape as deltaEncode, just producing []float64 instead of []int64.
+// integer counts") - and real Histogram.ToFloat's exact bucket representation
+// (vendor/.../model/histogram/histogram.go): FloatHistogram.PositiveBuckets/
+// NegativeBuckets are each bucket's ABSOLUTE count directly, NOT spatially
+// delta-encoded the way Histogram's own integer buckets are ("Each represents an
+// absolute count", float_histogram.go's own doc comment). Cheap here since
+// HistogramIterator already tracks absolute per-bucket counts internally
+// (it.it.posAbs/negAbs) - just a []int64 -> []float64 conversion, no re-encoding.
+//
+// This used to incorrectly delta-encode the result (deltaEncodeFloat, since
+// removed) - a real, latent bug: the only existing test exercising this path
+// checked Count/Sum but never the buckets themselves, so it went uncaught until
+// this was re-derived carefully against real Histogram.ToFloat while building
+// native FloatHistogram storage. Fixed here; see
+// TestHistogramSampleIteratorAtFloatHistogramBucketsAreAbsolute.
 func (hi *histogramSampleIterator) AtFloatHistogram(fh *histogram.FloatHistogram) (int64, *histogram.FloatHistogram) {
 	if fh == nil {
 		fh = &histogram.FloatHistogram{}
@@ -398,25 +414,106 @@ func (hi *histogramSampleIterator) AtFloatHistogram(fh *histogram.FloatHistogram
 	fh.Sum = h.Sum
 	fh.PositiveSpans = h.PositiveSpans
 	fh.NegativeSpans = h.NegativeSpans
-	fh.PositiveBuckets = deltaEncodeFloat(hi.it.posAbs)
-	fh.NegativeBuckets = deltaEncodeFloat(hi.it.negAbs)
+	fh.PositiveBuckets = int64ToFloat64Slice(hi.it.posAbs)
+	fh.NegativeBuckets = int64ToFloat64Slice(hi.it.negAbs)
 	return hi.curTS, fh
 }
 
-// deltaEncodeFloat is deltaEncode's float64 counterpart, for AtFloatHistogram - same
-// first-absolute-then-relative-deltas shape FloatHistogram's own bucket fields use.
-func deltaEncodeFloat(abs []int64) []float64 {
+// int64ToFloat64Slice converts abs's absolute per-bucket counts to float64 - no
+// delta re-encoding, matching FloatHistogram.PositiveBuckets/NegativeBuckets'
+// already-absolute representation (see AtFloatHistogram's own doc comment).
+func int64ToFloat64Slice(abs []int64) []float64 {
 	if len(abs) == 0 {
 		return nil
 	}
 	out := make([]float64, len(abs))
-	var prev int64
 	for i, v := range abs {
-		out[i] = float64(v - prev)
-		prev = v
+		out[i] = float64(v)
 	}
 	return out
 }
 
 func (hi *histogramSampleIterator) AtT() int64 { return hi.curTS }
 func (hi *histogramSampleIterator) Err() error { return nil }
+
+// floatHistogramSampleIterator adapts *HistogramIterator to chunkenc.Iterator for a
+// genuinely float-typed series (HistogramStore.IsFloat true) - the mirror image of
+// histogramSampleIterator's integer path. Next()/Seek() report chunkenc.
+// ValFloatHistogram (not ValHistogram), AtFloatHistogram returns the REAL stored
+// float data directly (no int->float conversion - contrast with
+// histogramSampleIterator.AtFloatHistogram, which converts), and AtHistogram panics -
+// there is no lossless float->int conversion, matching real Prometheus's own
+// floatHistogramIterator precedent (vendor/.../tsdb/chunkenc/floathistogram.go).
+type floatHistogramSampleIterator struct {
+	it         *HistogramIterator
+	mint, maxt int64
+	started    bool
+	done       bool
+	curTS      int64
+	curFH      *histogram.FloatHistogram
+}
+
+var _ chunkenc.Iterator = (*floatHistogramSampleIterator)(nil)
+
+func (hi *floatHistogramSampleIterator) Next() chunkenc.ValueType {
+	for {
+		if hi.done || !hi.it.Next() {
+			hi.done = true
+			return chunkenc.ValNone
+		}
+		ts, fh := hi.it.AtFloat()
+		if ts < hi.mint {
+			continue
+		}
+		if ts > hi.maxt {
+			hi.done = true
+			return chunkenc.ValNone
+		}
+		hi.started = true
+		hi.curTS, hi.curFH = ts, fh
+		return chunkenc.ValFloatHistogram
+	}
+}
+
+func (hi *floatHistogramSampleIterator) Seek(t int64) chunkenc.ValueType {
+	if hi.done {
+		return chunkenc.ValNone
+	}
+	if hi.started && hi.curTS >= t {
+		return chunkenc.ValFloatHistogram
+	}
+	for {
+		if vt := hi.Next(); vt == chunkenc.ValNone {
+			return chunkenc.ValNone
+		}
+		if hi.curTS >= t {
+			return chunkenc.ValFloatHistogram
+		}
+	}
+}
+
+// At panics, matching real Prometheus's own floatHistogramIterator precedent
+// exactly - a caller that saw ValFloatHistogram from Next()/Seek() should never
+// call this.
+func (hi *floatHistogramSampleIterator) At() (int64, float64) {
+	panic("columnarhead: cannot call floatHistogramSampleIterator.At")
+}
+
+// AtHistogram panics: unlike the integer->float direction
+// (histogramSampleIterator.AtFloatHistogram), converting float counts back to
+// integer counts would be lossy, and real Prometheus's own chunk iterators don't
+// attempt it either.
+func (hi *floatHistogramSampleIterator) AtHistogram(*histogram.Histogram) (int64, *histogram.Histogram) {
+	panic("columnarhead: cannot call floatHistogramSampleIterator.AtHistogram - float->int would be lossy")
+}
+
+func (hi *floatHistogramSampleIterator) AtFloatHistogram(dst *histogram.FloatHistogram) (int64, *histogram.FloatHistogram) {
+	if dst != nil {
+		*dst = *hi.curFH
+		return hi.curTS, dst
+	}
+	return hi.curTS, hi.curFH
+}
+
+func (hi *floatHistogramSampleIterator) AtT() int64 { return hi.curTS }
+func (hi *floatHistogramSampleIterator) Err() error { return nil }

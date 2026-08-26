@@ -355,6 +355,79 @@ func TestQuerierSelectHistogramSeries(t *testing.T) {
 	if gotFH.Count != float64(hist.Count) || gotFH.Sum != hist.Sum {
 		t.Fatalf("AtFloatHistogram() = %+v, want Count=%v Sum=%v", gotFH, hist.Count, hist.Sum)
 	}
+	// Buckets must be ABSOLUTE (real FloatHistogram.PositiveBuckets' own
+	// representation), not spatially delta-encoded like Histogram's own -
+	// hist.PositiveBuckets = []int64{2, 1} (delta-encoded) is absolute [2, 3].
+	// A real, previously latent bug here (delta-encoding instead of absolute)
+	// went uncaught because no earlier test checked the buckets themselves.
+	wantBuckets := []float64{2, 3}
+	if !float64SliceEqual(gotFH.PositiveBuckets, wantBuckets) {
+		t.Fatalf("AtFloatHistogram().PositiveBuckets = %v, want %v (absolute, not delta-encoded)", gotFH.PositiveBuckets, wantBuckets)
+	}
+}
+
+// TestQuerierSelectFloatHistogramSeries confirms a genuinely float-typed series
+// (HistogramStore.IsFloat true) surfaces as chunkenc.ValFloatHistogram through
+// the regular Querier path, with AtFloatHistogram returning the real stored data
+// directly (no int<->float conversion, unlike TestQuerierSelectHistogramSeries'
+// int-typed series calling the SAME accessor) and AtHistogram/At panicking.
+func TestQuerierSelectFloatHistogramSeries(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	app := h.Appender(context.Background())
+	l := labels.FromStrings(
+		labels.MetricName, "request_latency",
+		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+	)
+	fh := &histogram.FloatHistogram{
+		Schema: 0, Count: 5.5, Sum: 12.5, ZeroThreshold: 0.001, ZeroCount: 1.5,
+		PositiveSpans: []histogram.Span{{Offset: 0, Length: 2}}, PositiveBuckets: []float64{2, 3},
+	}
+	if _, err := app.AppendHistogram(0, l, 1700000000000, nil, fh); err != nil {
+		t.Fatalf("AppendHistogram(FloatHistogram): %v", err)
+	}
+
+	q, err := h.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("Querier: %v", err)
+	}
+	defer q.Close()
+
+	ss := q.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "request_latency"))
+	if !ss.Next() {
+		t.Fatal("Select found no histogram series")
+	}
+	it := ss.At().Iterator(nil)
+	vt := it.Next()
+	if vt != chunkenc.ValFloatHistogram {
+		t.Fatalf("Next() = %v, want ValFloatHistogram", vt)
+	}
+	gotTS, gotFH := it.AtFloatHistogram(nil)
+	if gotTS != 1700000000000 {
+		t.Fatalf("ts = %d, want 1700000000000", gotTS)
+	}
+	floatHistEqual(t, gotFH, fh)
+
+	// At() (the plain float accessor) must panic, matching real Prometheus's own
+	// floatHistogramIterator precedent.
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("At() on a float-histogram iterator should panic")
+			}
+		}()
+		it.At()
+	}()
+
+	// AtHistogram must panic too - float->int would be lossy, unlike the
+	// (lossless) int->float direction the int-typed test above exercises.
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("AtHistogram() on a float-histogram iterator should panic")
+			}
+		}()
+		it.AtHistogram(nil)
+	}()
 }
 
 func TestFloatIteratorPanicsOnAtHistogram(t *testing.T) {

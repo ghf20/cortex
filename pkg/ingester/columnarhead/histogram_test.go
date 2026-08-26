@@ -38,6 +38,38 @@ func int64SliceEqual(a, b []int64) bool {
 	return true
 }
 
+func floatHistEqual(t *testing.T, got, want *histogram.FloatHistogram) {
+	t.Helper()
+	if got.Schema != want.Schema || got.ZeroThreshold != want.ZeroThreshold ||
+		got.ZeroCount != want.ZeroCount || got.Count != want.Count || got.Sum != want.Sum {
+		t.Fatalf("scalar fields: got %+v, want %+v", got, want)
+	}
+	if !spansEqual(got.PositiveSpans, want.PositiveSpans) {
+		t.Fatalf("PositiveSpans: got %v, want %v", got.PositiveSpans, want.PositiveSpans)
+	}
+	if !spansEqual(got.NegativeSpans, want.NegativeSpans) {
+		t.Fatalf("NegativeSpans: got %v, want %v", got.NegativeSpans, want.NegativeSpans)
+	}
+	if !float64SliceEqual(got.PositiveBuckets, want.PositiveBuckets) {
+		t.Fatalf("PositiveBuckets: got %v, want %v", got.PositiveBuckets, want.PositiveBuckets)
+	}
+	if !float64SliceEqual(got.NegativeBuckets, want.NegativeBuckets) {
+		t.Fatalf("NegativeBuckets: got %v, want %v", got.NegativeBuckets, want.NegativeBuckets)
+	}
+}
+
+func float64SliceEqual(a, b []float64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestHistogramStoreRoundTrip_SingleSample(t *testing.T) {
 	hst := NewHistogramStore()
 	h := &histogram.Histogram{
@@ -113,6 +145,64 @@ func TestHistogramStoreRoundTrip_MultipleSamples(t *testing.T) {
 	}
 }
 
+// TestHistogramStoreRoundTripFloat_MultipleSamples is
+// TestHistogramStoreRoundTrip_MultipleSamples's FloatHistogram counterpart -
+// same shape (stable layout, several samples including a genuinely unchanged
+// one), but through AppendFloat/AtFloat's per-bucket gorilla XOR encoding
+// instead of Append/At's per-bucket varbit delta encoding (see histoSeries'
+// own doc comment on why these are two different schemes, not one shared
+// path). FloatHistogram buckets are already absolute (unlike Histogram's
+// delta-encoded ones), so samples below list absolute values directly.
+func TestHistogramStoreRoundTripFloat_MultipleSamples(t *testing.T) {
+	hst := NewHistogramStore()
+	base := func(count, zeroCount, sum float64, posBuckets []float64) *histogram.FloatHistogram {
+		return &histogram.FloatHistogram{
+			Schema:          1,
+			ZeroThreshold:   0.0001,
+			ZeroCount:       zeroCount,
+			Count:           count,
+			Sum:             sum,
+			PositiveSpans:   []histogram.Span{{Offset: -2, Length: 4}},
+			NegativeSpans:   []histogram.Span{{Offset: 0, Length: 2}},
+			PositiveBuckets: posBuckets,
+			NegativeBuckets: []float64{1, 1},
+		}
+	}
+	samples := []*histogram.FloatHistogram{
+		base(10, 2, 5.5, []float64{1, 1, 1, 2}),
+		base(15, 3, 8.25, []float64{2, 3, 2, 4}),
+		base(15, 3, 8.25, []float64{2, 3, 2, 4}), // genuinely unchanged - exercises the zero-XOR-delta path
+		base(40, 9, -12.75, []float64{7, 4, 6, 5}),
+	}
+	ts := int64(1700000000000)
+	for _, h := range samples {
+		if err := hst.AppendFloat(0, ts, h); err != nil {
+			t.Fatalf("AppendFloat at ts=%d: %v", ts, err)
+		}
+		ts += 15000
+	}
+
+	if !hst.IsFloat(0) {
+		t.Fatal("IsFloat(0) = false for a series that only ever received FloatHistogram samples")
+	}
+
+	it := hst.Iterator(0)
+	i := 0
+	wantTS := int64(1700000000000)
+	for it.Next() {
+		gotTS, gotH := it.AtFloat()
+		if gotTS != wantTS {
+			t.Fatalf("sample %d: ts = %d, want %d", i, gotTS, wantTS)
+		}
+		floatHistEqual(t, gotH, samples[i])
+		wantTS += 15000
+		i++
+	}
+	if i != len(samples) {
+		t.Fatalf("decoded %d samples, want %d", i, len(samples))
+	}
+}
+
 func TestHistogramStoreRejectsCustomBuckets(t *testing.T) {
 	hst := NewHistogramStore()
 	h := &histogram.Histogram{Schema: histogram.CustomBucketsSchema, CustomValues: []float64{1, 2, 3}}
@@ -151,6 +241,89 @@ func TestHistogramStoreRejectsLayoutChange(t *testing.T) {
 				t.Fatalf("Append with %s = %v, want ErrHistogramLayoutChanged", name, err)
 			}
 		})
+	}
+}
+
+func TestHistogramStoreRejectsLayoutChangeFloat(t *testing.T) {
+	hst := NewHistogramStore()
+	h1 := &histogram.FloatHistogram{
+		Schema:          0,
+		PositiveSpans:   []histogram.Span{{Offset: 0, Length: 2}},
+		PositiveBuckets: []float64{1, 1},
+	}
+	if err := hst.AppendFloat(0, 1700000000000, h1); err != nil {
+		t.Fatalf("AppendFloat: %v", err)
+	}
+
+	cases := map[string]*histogram.FloatHistogram{
+		"schema changed": {
+			Schema: 1, PositiveSpans: h1.PositiveSpans, PositiveBuckets: []float64{1, 1},
+		},
+		"zero threshold changed": {
+			Schema: 0, ZeroThreshold: 0.5, PositiveSpans: h1.PositiveSpans, PositiveBuckets: []float64{1, 1},
+		},
+		"span layout changed": {
+			Schema:          0,
+			PositiveSpans:   []histogram.Span{{Offset: 0, Length: 3}},
+			PositiveBuckets: []float64{1, 1, 1},
+		},
+	}
+	for name, h := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := hst.AppendFloat(0, 1700000015000, h); err != ErrHistogramLayoutChanged {
+				t.Fatalf("AppendFloat with %s = %v, want ErrHistogramLayoutChanged", name, err)
+			}
+		})
+	}
+}
+
+// TestHistogramStoreIsolatesMixedTypeSeries confirms the isFloat discriminator
+// (histoSeries' own doc comment) genuinely isolates an int-typed series from a
+// float-typed one sharing the same store's map - not just that each round-trips
+// correctly in isolation (TestHistogramStoreRoundTrip_MultipleSamples/
+// RoundTripFloat_MultipleSamples already cover that), but that neither's
+// decode path is affected by the other's presence.
+func TestHistogramStoreIsolatesMixedTypeSeries(t *testing.T) {
+	hst := NewHistogramStore()
+	hInt := &histogram.Histogram{Schema: 0, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{5}}
+	hFloat := &histogram.FloatHistogram{Schema: 2, PositiveSpans: []histogram.Span{{Offset: 1, Length: 2}}, PositiveBuckets: []float64{7, 8}}
+
+	if err := hst.Append(10, 1700000000000, hInt); err != nil {
+		t.Fatalf("Append(10): %v", err)
+	}
+	if err := hst.AppendFloat(20, 1700000000000, hFloat); err != nil {
+		t.Fatalf("AppendFloat(20): %v", err)
+	}
+	if hst.NumSeries() != 2 {
+		t.Fatalf("NumSeries() = %d, want 2", hst.NumSeries())
+	}
+	if hst.IsFloat(10) {
+		t.Fatal("IsFloat(10) = true for an int-typed series")
+	}
+	if !hst.IsFloat(20) {
+		t.Fatal("IsFloat(20) = false for a float-typed series")
+	}
+
+	itInt := hst.Iterator(10)
+	if !itInt.Next() {
+		t.Fatal("series 10: Next() = false")
+	}
+	_, gotInt := itInt.At()
+	histEqual(t, gotInt, hInt)
+
+	itFloat := hst.Iterator(20)
+	if !itFloat.Next() {
+		t.Fatal("series 20: Next() = false")
+	}
+	_, gotFloat := itFloat.AtFloat()
+	floatHistEqual(t, gotFloat, hFloat)
+
+	// Mixing types on either series must be rejected.
+	if err := hst.AppendFloat(10, 1700000015000, hFloat); err != ErrHistogramTypeChanged {
+		t.Fatalf("AppendFloat on an int-typed series = %v, want ErrHistogramTypeChanged", err)
+	}
+	if err := hst.Append(20, 1700000015000, hInt); err != ErrHistogramTypeChanged {
+		t.Fatalf("Append on a float-typed series = %v, want ErrHistogramTypeChanged", err)
 	}
 }
 
@@ -254,6 +427,73 @@ func TestHistogramStoreTruncate(t *testing.T) {
 	}
 	_, gotOther := oit.At()
 	histEqual(t, gotOther, otherH)
+}
+
+// TestHistogramStoreTruncateFloat is TestHistogramStoreTruncate's FloatHistogram
+// counterpart - Truncate's decode/re-encode-in-place approach goes through a
+// completely different branch for a float-typed series (AtFloat/AppendFloat,
+// not At/Append), so this isn't implied by the int test passing.
+func TestHistogramStoreTruncateFloat(t *testing.T) {
+	hst := NewHistogramStore()
+	mk := func(count float64, buckets []float64) *histogram.FloatHistogram {
+		return &histogram.FloatHistogram{
+			Schema:          0,
+			ZeroThreshold:   0.001,
+			Count:           count,
+			Sum:             count,
+			PositiveSpans:   []histogram.Span{{Offset: 0, Length: 3}},
+			PositiveBuckets: buckets,
+		}
+	}
+	samples := []*histogram.FloatHistogram{
+		mk(10, []float64{1, 1, 1}),
+		mk(20, []float64{2, 2, 1}),
+		mk(30, []float64{4, 1, 2}),
+		mk(40, []float64{4, 2, 2}),
+	}
+	ts := int64(1700000000000)
+	var timestamps []int64
+	for _, h := range samples {
+		if err := hst.AppendFloat(0, ts, h); err != nil {
+			t.Fatalf("AppendFloat: %v", err)
+		}
+		timestamps = append(timestamps, ts)
+		ts += 15000
+	}
+	otherH := mk(1, []float64{1, 0, 0})
+	if err := hst.AppendFloat(1, 1700000000000, otherH); err != nil {
+		t.Fatalf("AppendFloat(other): %v", err)
+	}
+
+	n := hst.Truncate(0, timestamps[2])
+	if n != 2 {
+		t.Fatalf("Truncate returned %d, want 2", n)
+	}
+	if !hst.IsFloat(0) {
+		t.Fatal("IsFloat(0) = false after Truncate - the re-encoded series lost its float typing")
+	}
+
+	it := hst.Iterator(0)
+	i := 2
+	for it.Next() {
+		gotTS, gotH := it.AtFloat()
+		if gotTS != timestamps[i] {
+			t.Fatalf("sample %d: ts = %d, want %d", i-2, gotTS, timestamps[i])
+		}
+		floatHistEqual(t, gotH, samples[i])
+		i++
+	}
+	if i != len(samples) {
+		t.Fatalf("decoded up to index %d, want %d", i, len(samples))
+	}
+
+	// The untouched neighbor must still decode correctly.
+	oit := hst.Iterator(1)
+	if !oit.Next() {
+		t.Fatal("other series: Next() = false, want true")
+	}
+	_, gotOther := oit.AtFloat()
+	floatHistEqual(t, gotOther, otherH)
 }
 
 // TestHistogramStoreTruncateToEmptyThenReappend covers mint past every existing

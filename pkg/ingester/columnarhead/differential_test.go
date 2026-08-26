@@ -532,6 +532,144 @@ func TestDifferentialHistogramRealVsColumnar(t *testing.T) {
 	}
 }
 
+// floatHistDiffWorkload is histDiffWorkload's FloatHistogram counterpart -
+// same shape and same scope note (stable layout, no counter reset), buckets
+// given as absolute values directly since FloatHistogram's own representation
+// already is (unlike Histogram's delta-encoded one - see histoSeries' doc
+// comment in histogram.go).
+func floatHistDiffWorkload() []*histogram.FloatHistogram {
+	return []*histogram.FloatHistogram{
+		{Schema: 1, ZeroThreshold: 0.0001, ZeroCount: 2, Count: 9, Sum: 5.5,
+			PositiveSpans: []histogram.Span{{Offset: -2, Length: 4}}, NegativeSpans: []histogram.Span{{Offset: 0, Length: 2}},
+			PositiveBuckets: []float64{1, 1, 1, 2}, NegativeBuckets: []float64{1, 1}},
+		{Schema: 1, ZeroThreshold: 0.0001, ZeroCount: 3, Count: 17, Sum: 8.25,
+			PositiveSpans: []histogram.Span{{Offset: -2, Length: 4}}, NegativeSpans: []histogram.Span{{Offset: 0, Length: 2}},
+			PositiveBuckets: []float64{2, 3, 2, 4}, NegativeBuckets: []float64{1, 2}},
+		{Schema: 1, ZeroThreshold: 0.0001, ZeroCount: 3, Count: 17, Sum: 8.25, // genuinely unchanged
+			PositiveSpans: []histogram.Span{{Offset: -2, Length: 4}}, NegativeSpans: []histogram.Span{{Offset: 0, Length: 2}},
+			PositiveBuckets: []float64{2, 3, 2, 4}, NegativeBuckets: []float64{1, 2}},
+		{Schema: 1, ZeroThreshold: 0.0001, ZeroCount: 9, Count: 33, Sum: -12.75,
+			PositiveSpans: []histogram.Span{{Offset: -2, Length: 4}}, NegativeSpans: []histogram.Span{{Offset: 0, Length: 2}},
+			PositiveBuckets: []float64{7, 4, 6, 5}, NegativeBuckets: []float64{2, 1}},
+	}
+}
+
+func appendFloatHistogramsToReal(t *testing.T, h *tsdb.Head, l labels.Labels, base int64, hists []*histogram.FloatHistogram) {
+	t.Helper()
+	app := h.Appender(context.Background())
+	var ref storage.SeriesRef
+	ts := base
+	for _, hg := range hists {
+		var err error
+		ref, err = app.AppendHistogram(ref, l, ts, nil, hg)
+		if err != nil {
+			t.Fatalf("real head AppendHistogram(FloatHistogram, ts=%d): %v", ts, err)
+		}
+		ts += 15000
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("real head Commit: %v", err)
+	}
+}
+
+func appendFloatHistogramsToColumnar(t *testing.T, h *Head, l labels.Labels, base int64, hists []*histogram.FloatHistogram) {
+	t.Helper()
+	app := h.Appender(context.Background())
+	var ref storage.SeriesRef
+	ts := base
+	for _, hg := range hists {
+		var err error
+		ref, err = app.AppendHistogram(ref, l, ts, nil, hg)
+		if err != nil {
+			t.Fatalf("columnar head AppendHistogram(FloatHistogram, ts=%d): %v", ts, err)
+		}
+		ts += 15000
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("columnar head Commit: %v", err)
+	}
+}
+
+func collectFloatHistogramSamples(t *testing.T, ss storage.SeriesSet) []struct {
+	ts int64
+	h  *histogram.FloatHistogram
+} {
+	t.Helper()
+	if !ss.Next() {
+		t.Fatalf("SeriesSet: no series returned")
+	}
+	series := ss.At()
+	it := series.Iterator(nil)
+	var out []struct {
+		ts int64
+		h  *histogram.FloatHistogram
+	}
+	for it.Next() == chunkenc.ValFloatHistogram {
+		ts, h := it.AtFloatHistogram(nil)
+		out = append(out, struct {
+			ts int64
+			h  *histogram.FloatHistogram
+		}{ts, h})
+	}
+	if err := it.Err(); err != nil {
+		t.Fatalf("iterator error: %v", err)
+	}
+	if ss.Next() {
+		t.Fatalf("SeriesSet: more than one matching series")
+	}
+	if err := ss.Err(); err != nil {
+		t.Fatalf("SeriesSet error: %v", err)
+	}
+	return out
+}
+
+// TestDifferentialFloatHistogramRealVsColumnar is
+// TestDifferentialHistogramRealVsColumnar's FloatHistogram counterpart -
+// completes Phase 6's histogram differential coverage now that native
+// FloatHistogram storage is built.
+func TestDifferentialFloatHistogramRealVsColumnar(t *testing.T) {
+	l := labels.FromStrings(
+		labels.MetricName, "request_duration_seconds",
+		"cluster", "eks-prod-1", "namespace", "ns-7", "pod", "payments-api-1",
+		"container", "app", "node", "ip-10-1-2-3", "job", "cadvisor",
+	)
+	base := int64(1700000000000)
+	workload := floatHistDiffWorkload()
+
+	realHead := newRealHead(t)
+	appendFloatHistogramsToReal(t, realHead, l, base, workload)
+	colHead := NewHead(1, 1, 16)
+	appendFloatHistogramsToColumnar(t, colHead, l, base, workload)
+
+	realQuerier, err := tsdb.NewBlockQuerier(realHead, math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("real head querier: %v", err)
+	}
+	defer realQuerier.Close()
+	colQuerier, err := colHead.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("columnar head querier: %v", err)
+	}
+	defer colQuerier.Close()
+
+	m := labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "request_duration_seconds")
+	realSamples := collectFloatHistogramSamples(t, realQuerier.Select(context.Background(), true, nil, m))
+	colSamples := collectFloatHistogramSamples(t, colQuerier.Select(context.Background(), true, nil, m))
+
+	if len(realSamples) != len(colSamples) {
+		t.Fatalf("real head returned %d float histogram samples, columnar returned %d", len(realSamples), len(colSamples))
+	}
+	if len(realSamples) != len(workload) {
+		t.Fatalf("sanity check failed: got %d samples back, want %d (the differential test would pass vacuously otherwise)", len(realSamples), len(workload))
+	}
+	for i := range realSamples {
+		if realSamples[i].ts != colSamples[i].ts {
+			t.Fatalf("sample %d: ts real=%d columnar=%d", i, realSamples[i].ts, colSamples[i].ts)
+		}
+		floatHistEqual(t, colSamples[i].h, realSamples[i].h)
+	}
+}
+
 // newRealDBWithOOO opens a real *tsdb.DB (not a bare *tsdb.Head, unlike
 // newRealHead) with out-of-order ingestion enabled - OOO-aware querying needs
 // db.Querier's internal NewHeadAndOOOQuerier/isolation-state wiring

@@ -241,9 +241,12 @@ func TestAppenderHistogram(t *testing.T) {
 	}
 	histEqual(t, gotH, hist)
 
-	// FloatHistogram is a stated, explicit gap, not silently mishandled.
-	if _, err := app.AppendHistogram(0, l, 1700000015000, nil, &histogram.FloatHistogram{}); err != ErrFloatHistogramUnsupported {
-		t.Fatalf("AppendHistogram with only a FloatHistogram = %v, want ErrFloatHistogramUnsupported", err)
+	// A series can't switch between Histogram and FloatHistogram samples
+	// mid-stream - failed loudly (ErrHistogramTypeChanged), not silently
+	// mishandled. See TestAppenderFloatHistogram for genuine FloatHistogram
+	// support on its own series.
+	if _, err := app.AppendHistogram(0, l, 1700000015000, nil, &histogram.FloatHistogram{}); err != ErrHistogramTypeChanged {
+		t.Fatalf("AppendHistogram(FloatHistogram) on an existing int-histogram series = %v, want ErrHistogramTypeChanged", err)
 	}
 
 	// The ref fast path must also work.
@@ -265,6 +268,77 @@ func TestAppenderHistogram(t *testing.T) {
 	}
 	_, gotH2 := it2.At()
 	histEqual(t, gotH2, hist2)
+}
+
+func TestAppenderFloatHistogram(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	app := h.Appender(context.Background())
+	l := labels.FromStrings(
+		labels.MetricName, "request_duration_seconds",
+		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+	)
+
+	fh := &histogram.FloatHistogram{
+		Schema:          0,
+		ZeroThreshold:   0.001,
+		ZeroCount:       2.5,
+		Count:           10.5,
+		Sum:             42.5,
+		PositiveSpans:   []histogram.Span{{Offset: 0, Length: 2}},
+		PositiveBuckets: []float64{3, 4}, // absolute, unlike Histogram's delta-encoded buckets
+	}
+	ref, err := app.AppendHistogram(0, l, 1700000000000, nil, fh)
+	if err != nil {
+		t.Fatalf("AppendHistogram(FloatHistogram): %v", err)
+	}
+	if ref == 0 {
+		t.Fatal("AppendHistogram returned ref 0 for a real series")
+	}
+
+	if !h.HasFloatHistogram(uint32(ref) - 1) {
+		t.Fatal("HasFloatHistogram = false for a series that only ever received FloatHistogram samples")
+	}
+
+	it := h.HistogramIterator(uint32(ref) - 1)
+	if !it.Next() {
+		t.Fatal("HistogramIterator.Next() = false")
+	}
+	gotTS, gotFH := it.AtFloat()
+	if gotTS != 1700000000000 {
+		t.Fatalf("ts = %d, want 1700000000000", gotTS)
+	}
+	floatHistEqual(t, gotFH, fh)
+
+	// A series that only ever received int Histogram samples must reject a
+	// FloatHistogram, the mirror image of TestAppenderHistogram's check.
+	l2 := labels.FromStrings(
+		labels.MetricName, "other_duration_seconds",
+		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+	)
+	if _, err := app.AppendHistogram(0, l2, 1700000000000, &histogram.Histogram{PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{1}}, nil); err != nil {
+		t.Fatalf("AppendHistogram(int) on a fresh series: %v", err)
+	}
+	if _, err := app.AppendHistogram(0, l2, 1700000015000, nil, fh); err != ErrHistogramTypeChanged {
+		t.Fatalf("AppendHistogram(FloatHistogram) on an existing int-histogram series = %v, want ErrHistogramTypeChanged", err)
+	}
+
+	// The ref fast path must also work.
+	fh2 := &histogram.FloatHistogram{
+		Schema: 0, ZeroThreshold: 0.001, ZeroCount: 3, Count: 15, Sum: 50,
+		PositiveSpans: fh.PositiveSpans, PositiveBuckets: []float64{4, 5},
+	}
+	if _, err := app.AppendHistogram(ref, labels.EmptyLabels(), 1700000030000, nil, fh2); err != nil {
+		t.Fatalf("AppendHistogram(FloatHistogram) via ref fast path: %v", err)
+	}
+	it2 := h.HistogramIterator(uint32(ref) - 1)
+	if !it2.Next() {
+		t.Fatal("fresh HistogramIterator should have a first sample")
+	}
+	if !it2.Next() {
+		t.Fatal("fresh HistogramIterator should have a second sample")
+	}
+	_, gotFH2 := it2.AtFloat()
+	floatHistEqual(t, gotFH2, fh2)
 }
 
 func TestAppenderExemplar(t *testing.T) {

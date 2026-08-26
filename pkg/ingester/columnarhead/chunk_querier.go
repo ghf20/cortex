@@ -131,6 +131,9 @@ func (s *headChunkSeries) Labels() labels.Labels {
 
 func (s *headChunkSeries) Iterator(_ chunks.Iterator) chunks.Iterator {
 	if s.h.HasHistogram(s.ref) {
+		if s.h.HasFloatHistogram(s.ref) {
+			return newFloatHistogramChunksIterator(s.h, s.ref, s.mint, s.maxt)
+		}
 		return newHistogramChunksIterator(s.h, s.ref, s.mint, s.maxt)
 	}
 	return newSingleChunkIterator(s.h, s.ref, s.mint, s.maxt)
@@ -282,3 +285,83 @@ func (it *histogramChunksIterator) Next() bool {
 }
 
 func (it *histogramChunksIterator) Err() error { return it.err }
+
+// floatHistogramChunksIterator is histogramChunksIterator's FloatHistogram
+// counterpart - same potentially-multi-chunk shape (a counter reset the real
+// chunkenc.FloatHistogramAppender detects still forces a new chunk; HistogramStore
+// doesn't model resets for float-typed series any more than it does for
+// integer-typed ones), just built from floatHistogramSampleIterator/
+// chunkenc.NewFloatHistogramChunk/AppendFloatHistogram instead of the integer
+// path's equivalents.
+type floatHistogramChunksIterator struct {
+	metas []chunks.Meta
+	i     int
+	cur   chunks.Meta
+	err   error
+}
+
+// newFloatHistogramChunksIterator is newHistogramChunksIterator's FloatHistogram
+// counterpart - see that function's doc comment for the shared reasoning
+// (appendOnly=false, prevApp threading for cross-chunk counter-reset headers).
+func newFloatHistogramChunksIterator(h *Head, ref uint32, mint, maxt int64) *floatHistogramChunksIterator {
+	src := &floatHistogramSampleIterator{it: h.HistogramIterator(ref), mint: mint, maxt: maxt}
+
+	var metas []chunks.Meta
+	var chunk chunkenc.Chunk
+	var app chunkenc.Appender
+	var prevApp *chunkenc.FloatHistogramAppender
+	var first, last int64
+	n := 0
+
+	for src.Next() == chunkenc.ValFloatHistogram {
+		ts, hg := src.AtFloatHistogram(nil)
+		if chunk == nil {
+			chunk = chunkenc.NewFloatHistogramChunk()
+			var err error
+			if app, err = chunk.Appender(); err != nil {
+				return &floatHistogramChunksIterator{err: err}
+			}
+			first = ts
+			n = 0
+		}
+
+		newChunk, _, newApp, err := app.AppendFloatHistogram(prevApp, ts, hg, false)
+		if err != nil {
+			return &floatHistogramChunksIterator{err: err}
+		}
+		if newChunk != nil {
+			metas = append(metas, chunks.Meta{Chunk: chunk, MinTime: first, MaxTime: last})
+			if ha, ok := app.(*chunkenc.FloatHistogramAppender); ok {
+				prevApp = ha
+			}
+			chunk = newChunk
+			app = newApp
+			first = ts
+			n = 0
+		} else {
+			app = newApp
+		}
+		last = ts
+		n++
+	}
+	if err := src.Err(); err != nil {
+		return &floatHistogramChunksIterator{err: err}
+	}
+	if n > 0 {
+		metas = append(metas, chunks.Meta{Chunk: chunk, MinTime: first, MaxTime: last})
+	}
+	return &floatHistogramChunksIterator{metas: metas}
+}
+
+func (it *floatHistogramChunksIterator) At() chunks.Meta { return it.cur }
+
+func (it *floatHistogramChunksIterator) Next() bool {
+	if it.err != nil || it.i >= len(it.metas) {
+		return false
+	}
+	it.cur = it.metas[it.i]
+	it.i++
+	return true
+}
+
+func (it *floatHistogramChunksIterator) Err() error { return it.err }
