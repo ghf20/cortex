@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"time"
 )
 
 // This file is the Phase 5 spike design doc §7 asks for before building a
@@ -139,6 +141,12 @@ type DurableHead struct {
 	// Flush) rather than assuming it worked once the incremental-flush fix above
 	// was in place.
 	flushedBytes, flushedSlotOff, flushedGeneration []uint32
+
+	// stopAutoFlush is set by StartAutoFlush and cleared by stopping it - Close
+	// calls it automatically (see Close's doc comment) so a caller that forgets
+	// to stop the background flusher before shutting down doesn't leave it
+	// running against closed file handles.
+	stopAutoFlush func()
 }
 
 // CreateDurableHead opens a brand-new DurableHead backed by files under dir (which
@@ -413,11 +421,123 @@ func (dh *DurableHead) Flush() (FlushStats, error) {
 	return stats, nil
 }
 
+// Compact reclaims space left behind by Head.Truncate: unlike a conventional WAL
+// (multiple numbered segment files, old ones deleted after a checkpoint), this
+// design has one arena file that only ever grows via Flush - Truncate shrinks the
+// LIVE head, but nothing shrinks the DURABLE one to match, so disk usage grows
+// forever even though live memory doesn't. Compact closes that gap by rebuilding
+// the in-memory arena tightly (packing every series' current bytes back-to-back,
+// dropping truncated/abandoned space and slot headroom - the same technique
+// bench/05_compact_arena spiked in Phase 0, cited but not built here until now),
+// then reusing Flush unmodified to write the new, smaller layout, then truncating
+// the arena file down to match.
+//
+// Reusing Flush for the actual write is deliberate, not a shortcut: after
+// rebuilding, every series' slotOff differs from what Flush last knew about, so
+// the existing slotOff-mismatch detection (see flushedSlotOff's doc comment)
+// already forces a correct full reflush of every series' current bytes at their
+// new locations - no separate write path to keep in sync with Flush's.
+//
+// Real, stated cost: every series' slot becomes exactly as large as its current
+// content, with zero spare headroom - the very next Append to any series
+// immediately triggers a fresh growSlot, same tradeoff bench/05 already flagged
+// for full compaction generally. Takes Head's write lock for the rebuild step
+// only (Flush and the final truncate each take and release it again on their own),
+// so Compact blocks concurrent Appenders/Queriers similarly to a Flush of
+// comparable size, not for the whole Compact call end-to-end.
+func (dh *DurableHead) Compact() (FlushStats, error) {
+	dh.mu.Lock()
+	old := dh.series
+	newArena := make([]byte, 0, len(old.arena))
+	for ref := 0; ref < old.NumSeries(); ref++ {
+		usedBytes := (uint32(old.bitOff[ref]) + 7) / 8
+		newOff := uint32(len(newArena))
+		newArena = append(newArena, old.arena[old.slotOff[ref]:old.slotOff[ref]+usedBytes]...)
+		old.slotOff[ref] = newOff
+		old.slotCap[ref] = usedBytes
+	}
+	old.arena = newArena
+	old.freeList = make(map[uint32][]uint32)
+	dh.mu.Unlock()
+
+	stats, err := dh.Flush()
+	if err != nil {
+		return stats, fmt.Errorf("compact: flush new layout: %w", err)
+	}
+
+	dh.mu.Lock()
+	defer dh.mu.Unlock()
+	if err := dh.arenaFile.Truncate(int64(len(dh.series.arena))); err != nil {
+		return stats, fmt.Errorf("compact: truncate arena file: %w", err)
+	}
+	return stats, nil
+}
+
+// StartAutoFlush launches a background goroutine that calls Flush every interval,
+// until the returned stop function is called (Close also stops it automatically -
+// see Close's doc comment). onFlush, if non-nil, is invoked after every attempt
+// (successful or not) - the caller's hook for logging/metrics/tests, since this
+// package has no logger of its own. Calling StartAutoFlush again first stops any
+// previously running one, rather than leaking it.
+//
+// The returned stop function is idempotent (via sync.Once) - both the caller and
+// Close may end up calling it (e.g. an explicit Close followed by a deferred
+// stop()), and only the first call should actually close anything.
+//
+// Real flush timing is a genuine tradeoff, not a free choice: Flush takes Head's
+// write lock for its own duration (see Head's doc comment on why this is one
+// coarse lock, not per-series ones), so a longer interval means more new data
+// accumulates between flushes and each Flush call blocks concurrent
+// Appenders/Queriers for longer - a shorter interval trades that for more frequent
+// (individually cheaper) lock-holding and more fsync syscalls. See
+// TestFlushBlocksAppendersUnderLoad for real, measured numbers at a realistic
+// scale, not assumed ones.
+func (dh *DurableHead) StartAutoFlush(interval time.Duration, onFlush func(FlushStats, error)) (stop func()) {
+	if dh.stopAutoFlush != nil {
+		dh.stopAutoFlush()
+	}
+
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	var once sync.Once
+	stopFn := func() {
+		once.Do(func() {
+			close(done)
+			<-stopped
+		})
+	}
+
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				stats, err := dh.Flush()
+				if onFlush != nil {
+					onFlush(stats, err)
+				}
+			}
+		}
+	}()
+
+	dh.stopAutoFlush = stopFn
+	return stopFn
+}
+
 // Close closes every durable file handle without flushing - callers that want a
 // clean shutdown must Flush() first; Close alone simulates a crash (whatever
 // wasn't already flushed is lost), which is deliberately how the decisive test
-// uses it.
+// uses it. Stops any running StartAutoFlush loop first, so it never tries to
+// Flush against a closed file handle.
 func (dh *DurableHead) Close() error {
+	if dh.stopAutoFlush != nil {
+		dh.stopAutoFlush()
+		dh.stopAutoFlush = nil
+	}
 	var err error
 	for _, f := range []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.arenaFile, dh.metaFile} {
 		if cerr := f.Close(); cerr != nil {

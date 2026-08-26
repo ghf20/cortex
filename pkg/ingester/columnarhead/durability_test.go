@@ -4,7 +4,11 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
@@ -509,4 +513,260 @@ func TestDurableHeadSurvivesChainedReuse(t *testing.T) {
 	check("series_a", wantA)
 	check("series_b", wantB)
 	check("series_c", wantC)
+}
+
+// TestDurableHeadAutoFlush is the decisive test for StartAutoFlush: real samples
+// appended while a background flush loop is running must show up durably (survive
+// a simulated crash) without the test ever calling Flush itself, and samples
+// appended AFTER stop() must not.
+func TestDurableHeadAutoFlush(t *testing.T) {
+	dir := t.TempDir()
+	dh, err := CreateDurableHead(dir, 2, 1, 8)
+	if err != nil {
+		t.Fatalf("CreateDurableHead: %v", err)
+	}
+
+	flushed := make(chan FlushStats, 64)
+	stop := dh.StartAutoFlush(10*time.Millisecond, func(stats FlushStats, err error) {
+		if err != nil {
+			t.Errorf("auto-flush: %v", err)
+			return
+		}
+		flushed <- stats
+	})
+
+	l := labels.FromStrings(labels.MetricName, "up", "cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j")
+	app := dh.Appender(context.Background())
+	base := int64(1700000000000)
+	want := []sample{{base, 1}}
+	if _, err := app.Append(0, l, base, 1); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	// Wait for at least one real auto-flush to have written this sample, rather
+	// than sleeping a fixed guess.
+	deadline := time.After(2 * time.Second)
+	sawNonEmptyFlush := false
+	for !sawNonEmptyFlush {
+		select {
+		case stats := <-flushed:
+			if stats.NewArenaBytes > 0 {
+				sawNonEmptyFlush = true
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for auto-flush to pick up the appended sample")
+		}
+	}
+
+	stop()
+
+	// Appended AFTER stop - must NOT survive the simulated crash below.
+	if _, err := app.Append(0, l, base+15000, 2); err != nil {
+		t.Fatalf("Append after stop: %v", err)
+	}
+
+	if err := dh.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reloaded, err := LoadDurableHead(dir)
+	if err != nil {
+		t.Fatalf("LoadDurableHead: %v", err)
+	}
+	defer reloaded.Close()
+
+	q, err := reloaded.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("Querier: %v", err)
+	}
+	defer q.Close()
+	m := labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "up")
+	ss := q.Select(context.Background(), false, nil, m)
+	if !ss.Next() {
+		t.Fatal("series not found after reload")
+	}
+	it := ss.At().Iterator(nil)
+	var got []sample
+	for it.Next() == chunkenc.ValFloat {
+		ts, v := it.At()
+		got = append(got, sample{ts, v})
+	}
+	assertSamplesEqual(t, got, want)
+}
+
+// TestFlushBlocksAppendersUnderLoad measures, not assumes, how long a single Flush
+// call blocks concurrent Appenders at a realistic data scale - the real cost behind
+// StartAutoFlush's interval tradeoff (see its doc comment) and Phase 4's flagged
+// "one coarse lock" limitation. Not a pass/fail correctness test - reports real
+// numbers via t.Logf for the record.
+func TestFlushBlocksAppendersUnderLoad(t *testing.T) {
+	if testing.Short() {
+		t.Skip("scale measurement; skipped in -short")
+	}
+	dir := t.TempDir()
+	dh, err := CreateDurableHead(dir, 5000, 500, 64)
+	if err != nil {
+		t.Fatalf("CreateDurableHead: %v", err)
+	}
+	defer dh.Close()
+
+	const numSeries = 5000
+	const samplesPerSeriesBeforeFlush = 100
+
+	app := dh.Appender(context.Background())
+	base := int64(1700000000000)
+	for i := 0; i < numSeries; i++ {
+		l := labels.FromStrings(
+			labels.MetricName, fmt.Sprintf("series_%d", i%200),
+			"cluster", "c", "namespace", "n", "pod", fmt.Sprintf("p%d", i), "container", "co", "node", "no", "job", "j",
+		)
+		for s := 0; s < samplesPerSeriesBeforeFlush; s++ {
+			if _, err := app.Append(0, l, base+int64(s)*15000, float64(s)*1.7); err != nil {
+				t.Fatalf("Append: %v", err)
+			}
+		}
+	}
+
+	// A backlog of unflushed data (numSeries * samplesPerSeriesBeforeFlush) is now
+	// sitting in memory - this is what the upcoming Flush call has to write out,
+	// mimicking a real system's first flush after a burst of ingest.
+	var wg sync.WaitGroup
+	stopAppending := make(chan struct{})
+	var appendCount int64
+	var maxAppendLatency int64 // nanoseconds, via atomic
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		l := labels.FromStrings(labels.MetricName, "concurrent_writer", "cluster", "c", "namespace", "n", "pod", "pw", "container", "co", "node", "no", "job", "j")
+		s := 0
+		for {
+			select {
+			case <-stopAppending:
+				return
+			default:
+			}
+			start := time.Now()
+			if _, err := app.Append(0, l, base+int64(samplesPerSeriesBeforeFlush+s)*15000, float64(s)); err != nil {
+				t.Errorf("concurrent Append: %v", err)
+				return
+			}
+			if elapsed := time.Since(start).Nanoseconds(); elapsed > atomic.LoadInt64(&maxAppendLatency) {
+				atomic.StoreInt64(&maxAppendLatency, elapsed)
+			}
+			atomic.AddInt64(&appendCount, 1)
+			s++
+		}
+	}()
+
+	flushStart := time.Now()
+	stats, err := dh.Flush()
+	flushDuration := time.Since(flushStart)
+	if err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	close(stopAppending)
+	wg.Wait()
+
+	t.Logf("Flush of %d series' backlog (%d new arena bytes, %.1f B/series) took %v",
+		numSeries, stats.NewArenaBytes, float64(stats.NewArenaBytes)/numSeries, flushDuration)
+	t.Logf("during that window, %d concurrent appends completed, max single-append latency %v (the append-side view of the same lock contention)",
+		atomic.LoadInt64(&appendCount), time.Duration(atomic.LoadInt64(&maxAppendLatency)))
+}
+
+// TestDurableHeadCompactShrinksFile is the decisive test for Compact: after
+// Truncate drops old samples, the durable arena FILE must actually shrink (not
+// just the live in-memory arena), and the retained data must still survive a
+// simulated crash and reload correctly.
+func TestDurableHeadCompactShrinksFile(t *testing.T) {
+	dir := t.TempDir()
+	dh, err := CreateDurableHead(dir, 4, 1, 8)
+	if err != nil {
+		t.Fatalf("CreateDurableHead: %v", err)
+	}
+
+	l := labels.FromStrings(labels.MetricName, "up", "cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j")
+	app := dh.Appender(context.Background())
+	base := int64(1700000000000)
+	const total = 500
+	var all []sample
+	for s := 0; s < total; s++ {
+		ts := base + int64(s)*15000
+		v := float64(s) * 1.7
+		if _, err := app.Append(0, l, ts, v); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+		all = append(all, sample{ts, v})
+	}
+	if _, err := dh.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	arenaPath := dir + "/" + fileArena
+	sizeBefore := fileSize(t, arenaPath)
+
+	// Drop the first 90% of samples - a realistic post-compaction truncation.
+	cutoff := base + int64(total-total/10)*15000
+	dh.Truncate(cutoff)
+	want := all[total-total/10:]
+
+	stats, err := dh.Compact()
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	t.Logf("Compact stats: %+v", stats)
+
+	sizeAfter := fileSize(t, arenaPath)
+	if sizeAfter >= sizeBefore {
+		t.Fatalf("arena file size after Compact = %d, want smaller than before (%d) - Compact didn't reclaim space", sizeAfter, sizeBefore)
+	}
+	t.Logf("arena file shrank from %d to %d bytes after Truncate+Compact", sizeBefore, sizeAfter)
+
+	if err := dh.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reloaded, err := LoadDurableHead(dir)
+	if err != nil {
+		t.Fatalf("LoadDurableHead: %v", err)
+	}
+	defer reloaded.Close()
+
+	// Scoped, not deferred to function exit - the read lock must be released
+	// before the post-reload append below takes the write lock (see the same
+	// hazard noted in TestDurableHeadSurvivesSimulatedCrash).
+	func() {
+		q, err := reloaded.Querier(math.MinInt64, math.MaxInt64)
+		if err != nil {
+			t.Fatalf("Querier: %v", err)
+		}
+		defer q.Close()
+		m := labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "up")
+		ss := q.Select(context.Background(), false, nil, m)
+		if !ss.Next() {
+			t.Fatal("series not found after reload")
+		}
+		it := ss.At().Iterator(nil)
+		var got []sample
+		for it.Next() == chunkenc.ValFloat {
+			ts, v := it.At()
+			got = append(got, sample{ts, v})
+		}
+		assertSamplesEqual(t, got, want)
+	}()
+
+	// Still a normal, live, appendable head after Compact + reload.
+	app2 := reloaded.Appender(context.Background())
+	if _, err := app2.Append(0, l, base+int64(total+1)*15000, 999); err != nil {
+		t.Fatalf("Append after reload: %v", err)
+	}
+}
+
+func fileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat(%s): %v", path, err)
+	}
+	return fi.Size()
 }
