@@ -25,11 +25,21 @@ import (
 //
 // The one genuine complication is SeriesStore's arena: growSlot moves a series to a
 // bigger region and FREES its old one for a *different* series' later alloc() to
-// reuse and overwrite - a plain "flush everything past the last high-water mark"
-// scheme cannot see that in-place overwrite of already-flushed bytes. Solved here by
-// disabling free-list reuse entirely for a durable store (NewDurableSeriesStore) -
-// arena becomes strictly append-only too, at a real, measured memory cost (see
-// CHECKLIST.md's Phase 5 section for the actual number, not an assumed one).
+// reuse and overwrite - a plain "flush everything past a single arena-wide
+// high-water mark" scheme cannot see that in-place overwrite. An earlier version of
+// this file disabled free-list reuse entirely to sidestep the problem, at a real,
+// measured memory cost (+14.6% arena size in one workload) - retracted once
+// per-series tracking (flushedBytes/flushedSlotOff/flushedGeneration below) turned
+// out to already handle reuse correctly on its own: each series' flush state is
+// keyed by its OWN current slotOff and a generation counter (bumped by Truncate),
+// so a reused slotOff is indistinguishable from a freshly-appended one - both just
+// look like "this ref's current location differs from what was last durable,
+// reflush from scratch." Proven, not assumed: TestDurableHeadSurvivesChainedReuse
+// forces a slot to be occupied by three different series in sequence (one of them
+// already flushed once before it moved into the reused slot) and confirms correct
+// recovery; mutation-tested by removing the mismatch check and confirming it
+// reproduces real data corruption after reload. Free-list reuse is therefore always
+// enabled - NewHead/NewSeriesStore are used directly, no separate durable variant.
 //
 // Scope, stated plainly: floats only, matching Phase 2's own precedent - histograms,
 // exemplars, metadata, and start-timestamps are NOT persisted here. A crash loses
@@ -120,16 +130,15 @@ type DurableHead struct {
 	// move changes slotOff, at which point the new slot's bytes are entirely new
 	// from the file's perspective (even though they're a copy of already-durable
 	// data) and must be reflushed from scratch at their new location.
-	flushedBytes, flushedSlotOff []uint32
-}
-
-// NewDurableHead is NewHead but backs SeriesStore with NewDurableSeriesStore -
-// required for Flush to be correct (see disableReuse's doc comment). Ordinary,
-// non-durable callers should keep using plain NewHead.
-func NewDurableHead(expectedSeries, expectedTargets, expectedSymbols int) *Head {
-	h := NewHead(expectedSeries, expectedTargets, expectedSymbols)
-	h.series = NewDurableSeriesStore(expectedSeries)
-	return h
+	//
+	// flushedGeneration[ref] catches a second, distinct case a byte-count/slotOff
+	// comparison alone cannot: SeriesStore.Truncate rewrites a series' bytes from
+	// scratch AT THE SAME slotOff, and the resulting byte count can shrink or even
+	// coincidentally match what was there before - found the same way as the
+	// first case, by writing a test for exactly this interaction (Truncate then
+	// Flush) rather than assuming it worked once the incremental-flush fix above
+	// was in place.
+	flushedBytes, flushedSlotOff, flushedGeneration []uint32
 }
 
 // CreateDurableHead opens a brand-new DurableHead backed by files under dir (which
@@ -142,7 +151,7 @@ func CreateDurableHead(dir string, expectedSeries, expectedTargets, expectedSymb
 			return nil, fmt.Errorf("columnarhead: %s already exists in %s - use LoadDurableHead", name, dir)
 		}
 	}
-	dh := &DurableHead{Head: NewDurableHead(expectedSeries, expectedTargets, expectedSymbols), dir: dir}
+	dh := &DurableHead{Head: NewHead(expectedSeries, expectedTargets, expectedSymbols), dir: dir}
 	var err error
 	if dh.blobFile, err = os.OpenFile(filepath.Join(dir, fileSymbolsBlob), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
 		return nil, err
@@ -220,7 +229,7 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 		ts.refs = append(ts.refs, binary.LittleEndian.Uint32(targetBytes[i:i+4]))
 	}
 
-	ss := NewDurableSeriesStore(numSeries)
+	ss := NewSeriesStore(numSeries)
 	ss.arena = arena
 	for ref := 0; ref < numSeries; ref++ {
 		rec := metaBytes[ref*seriesMetaRecordSize : (ref+1)*seriesMetaRecordSize]
@@ -232,6 +241,7 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 		ss.hasLocal = append(ss.hasLocal, hasLocal)
 		ss.bitOff = append(ss.bitOff, bitOff)
 		ss.nSamples = append(ss.nSamples, nSamples)
+		ss.generation = append(ss.generation, 0) // not persisted - see generation's doc comment; 0 is a safe baseline since flushedGeneration below starts at 0 too
 		ss.slotOff = append(ss.slotOff, slotOff)
 		ss.slotCap = append(ss.slotCap, slotCap)
 		ss.val = append(ss.val, val)
@@ -271,11 +281,16 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 		flushedBytes[ref] = (uint32(ss.bitOff[ref]) + 7) / 8
 		flushedSlotOff[ref] = ss.slotOff[ref]
 	}
+	// flushedGeneration starts at all-zero, matching ss.generation's own reset to
+	// 0 on reload (see the reconstruction loop above) - both start from the same
+	// baseline, so the comparison in Flush is correct from the first post-reload
+	// Flush onward.
+	flushedGeneration := make([]uint32, numSeries)
 
 	dh := &DurableHead{
 		Head: h, dir: dir,
 		blobFlushed: len(blob), offsetFlushed: len(li.offset), targetsFlushed: numTargets * targetFields,
-		flushedBytes: flushedBytes, flushedSlotOff: flushedSlotOff,
+		flushedBytes: flushedBytes, flushedSlotOff: flushedSlotOff, flushedGeneration: flushedGeneration,
 	}
 	if dh.blobFile, err = os.OpenFile(filepath.Join(dir, fileSymbolsBlob), os.O_RDWR, 0o644); err != nil {
 		return nil, err
@@ -348,15 +363,23 @@ func (dh *DurableHead) Flush() (FlushStats, error) {
 	for len(dh.flushedBytes) < n {
 		dh.flushedBytes = append(dh.flushedBytes, 0)
 		dh.flushedSlotOff = append(dh.flushedSlotOff, 0)
+		dh.flushedGeneration = append(dh.flushedGeneration, 0)
 	}
 	for ref := 0; ref < n; ref++ {
 		usedBytes := (uint32(dh.series.bitOff[ref]) + 7) / 8
 		slotOff := dh.series.slotOff[ref]
+		generation := dh.series.generation[ref]
 		already := dh.flushedBytes[ref]
-		if dh.flushedSlotOff[ref] != slotOff {
-			// growSlot moved this series since its last flush - the new slot's
-			// bytes are entirely new from the file's perspective, even though
-			// they're a copy of already-durable data at the old location.
+		if dh.flushedSlotOff[ref] != slotOff || dh.flushedGeneration[ref] != generation {
+			// Either growSlot moved this series since its last flush (the new
+			// slot's bytes are entirely new from the file's perspective, even
+			// though they're a copy of already-durable data at the old location),
+			// or Truncate rewrote it from scratch at the SAME slotOff (generation
+			// bumped) - a byte-count comparison alone cannot detect the second
+			// case, since truncation can shrink the count or even coincidentally
+			// leave it unchanged while the actual bytes underneath are entirely
+			// different. Either way, nothing at this slotOff is trustworthy
+			// as "already flushed" - reflush the whole current range.
 			already = 0
 		}
 		if usedBytes <= already {
@@ -369,6 +392,7 @@ func (dh *DurableHead) Flush() (FlushStats, error) {
 		stats.NewArenaBytes += len(newBytes)
 		dh.flushedBytes[ref] = usedBytes
 		dh.flushedSlotOff[ref] = slotOff
+		dh.flushedGeneration[ref] = generation
 	}
 	metaBuf := make([]byte, n*seriesMetaRecordSize)
 	for ref := 0; ref < n; ref++ {

@@ -70,6 +70,17 @@ type SeriesStore struct {
 	bitOff   []uint16
 	nSamples []uint16
 
+	// generation counts how many times Truncate has re-encoded this series' bytes
+	// from scratch AT THE SAME slotOff - durability.go's Flush needs this: ordinary
+	// Append only ever grows a series' used-byte count (or moves it to a new
+	// slotOff via growSlot, itself detectable), but Truncate can shrink it, or
+	// even coincidentally leave it unchanged, while completely rewriting the
+	// bytes underneath - a byte-count-only high-water-mark comparison cannot
+	// distinguish "nothing changed" from "truncated to the same size," so this
+	// exists as an unambiguous signal. Bumped only by Truncate, never by Append/
+	// growSlot (their own slotOff change already signals "reflush from scratch").
+	generation []uint32
+
 	slotOff []uint32 // byte offset of this series' current slot within arena
 	slotCap []uint32 // current slot capacity, in bytes
 
@@ -78,17 +89,6 @@ type SeriesStore struct {
 
 	arena    []byte
 	freeList map[uint32][]uint32 // size class (bytes) -> free byte offsets of that size
-
-	// disableReuse, when true, makes alloc() never hand out a freed region - every
-	// alloc() is a fresh append past the current end of arena, so arena only ever
-	// grows monotonically and never has a byte in it rewritten by a DIFFERENT
-	// series after being durably flushed. See durability.go: this is what makes
-	// "arena as WAL" tractable - growSlot's normal free-then-reuse pattern would
-	// otherwise let series B silently overwrite series A's already-flushed bytes,
-	// which a simple flushed-high-water-mark scheme can't detect. The real,
-	// measured cost of this tradeoff (arena growth without reuse) is in
-	// CHECKLIST.md's Phase 5 section, not assumed.
-	disableReuse bool
 
 	// Diagnostics: how often alloc reused a freed region, and the free list's net
 	// effect on arena growth for this run. AllocBytesRequested sums size across every
@@ -102,46 +102,46 @@ type SeriesStore struct {
 // NewSeriesStore returns an empty store with capacity preallocated for expectedSeries.
 func NewSeriesStore(expectedSeries int) *SeriesStore {
 	return &SeriesStore{
-		targetID:  make([]uint32, 0, expectedSeries),
-		nameID:    make([]uint16, 0, expectedSeries),
-		localName: make([]uint16, 0, expectedSeries),
-		localRef:  make([]uint16, 0, expectedSeries),
-		hasLocal:  make([]bool, 0, expectedSeries),
-		bitOff:    make([]uint16, 0, expectedSeries),
-		nSamples:  make([]uint16, 0, expectedSeries),
-		slotOff:   make([]uint32, 0, expectedSeries),
-		slotCap:   make([]uint32, 0, expectedSeries),
-		val:       make([]valueState, 0, expectedSeries),
-		ts:        make([]tsState, 0, expectedSeries),
-		arena:     make([]byte, 0, expectedSeries*initialSlotBytes),
-		freeList:  make(map[uint32][]uint32),
+		targetID:   make([]uint32, 0, expectedSeries),
+		nameID:     make([]uint16, 0, expectedSeries),
+		localName:  make([]uint16, 0, expectedSeries),
+		localRef:   make([]uint16, 0, expectedSeries),
+		hasLocal:   make([]bool, 0, expectedSeries),
+		bitOff:     make([]uint16, 0, expectedSeries),
+		nSamples:   make([]uint16, 0, expectedSeries),
+		generation: make([]uint32, 0, expectedSeries),
+		slotOff:    make([]uint32, 0, expectedSeries),
+		slotCap:    make([]uint32, 0, expectedSeries),
+		val:        make([]valueState, 0, expectedSeries),
+		ts:         make([]tsState, 0, expectedSeries),
+		arena:      make([]byte, 0, expectedSeries*initialSlotBytes),
+		freeList:   make(map[uint32][]uint32),
 	}
 }
 
-// NewDurableSeriesStore is NewSeriesStore with disableReuse set - see that field's
-// doc comment. Used by durability.go's Persist/Load path; not for ordinary (in-memory
-// only) use, which should keep the free list's real memory-density benefit.
-func NewDurableSeriesStore(expectedSeries int) *SeriesStore {
-	s := NewSeriesStore(expectedSeries)
-	s.disableReuse = true
-	return s
-}
-
 // alloc returns the byte offset of a zeroed region of exactly size bytes, reusing a
-// freed region of the same size class if one exists (unless disableReuse is set).
-// Zeroing is not just cleanliness: writeBits ORs new bits into arena, so a reused
-// region with stale bits from its previous occupant would silently corrupt the new
-// series' encoding.
+// freed region of the same size class if one exists. Zeroing is not just cleanliness:
+// writeBits ORs new bits into arena, so a reused region with stale bits from its
+// previous occupant would silently corrupt the new series' encoding.
+//
+// Free-list reuse is safe for DurableHead's durability too (see durability.go's
+// package doc comment and generation/flushedSlotOff's comments) - per-series flush
+// tracking (keyed by slotOff and a generation counter, not a single arena-wide
+// high-water mark) correctly detects when a series' current bytes at its current
+// slotOff need reflushing from scratch, regardless of whether that slotOff was
+// freshly appended or reused from a different series. An earlier version of this
+// package disabled reuse for durable stores based on a mistaken belief that reuse
+// itself was the problem; per-series tracking already handles it, proven by
+// TestDurableHeadSurvivesChainedReuse (mutation-tested: the check it exercises,
+// removed, reproduces real data corruption after reload).
 func (s *SeriesStore) alloc(size uint32) uint32 {
 	s.AllocBytesRequested += uint64(size)
-	if !s.disableReuse {
-		if free := s.freeList[size]; len(free) > 0 {
-			off := free[len(free)-1]
-			s.freeList[size] = free[:len(free)-1]
-			clear(s.arena[off : off+size])
-			s.AllocHits++
-			return off
-		}
+	if free := s.freeList[size]; len(free) > 0 {
+		off := free[len(free)-1]
+		s.freeList[size] = free[:len(free)-1]
+		clear(s.arena[off : off+size])
+		s.AllocHits++
+		return off
 	}
 	s.AllocMisses++
 	off := uint32(len(s.arena))
@@ -151,9 +151,6 @@ func (s *SeriesStore) alloc(size uint32) uint32 {
 
 // free returns a size-byte region at off to the free list for reuse.
 func (s *SeriesStore) free(off, size uint32) {
-	if s.disableReuse {
-		return // alloc() never consults freeList in this mode - nothing to track.
-	}
 	s.freeList[size] = append(s.freeList[size], off)
 }
 
@@ -169,6 +166,7 @@ func (s *SeriesStore) Create(targetID uint32, nameID, localName, localRef uint16
 	s.hasLocal = append(s.hasLocal, hasLocal)
 	s.bitOff = append(s.bitOff, 0)
 	s.nSamples = append(s.nSamples, 0)
+	s.generation = append(s.generation, 0)
 	s.val = append(s.val, newValueState())
 	s.ts = append(s.ts, tsState{})
 
@@ -292,6 +290,12 @@ func (it *Iterator) At() (int64, float64) {
 // ts/val reset to zero state before re-appending) but the slot itself is - re-Append
 // never needs to grow past ref's current slotCap, since the retained range is a subset
 // of what already fit there.
+//
+// Bumps generation: unlike ordinary Append (which only ever grows bitOff, or moves to
+// a new slotOff via growSlot), this rewrites ref's bytes from scratch AT THE SAME
+// slotOff, and the resulting byte count can shrink or even coincidentally match what
+// was there before - durability.go's Flush needs an unambiguous "this was rewritten"
+// signal that doesn't depend on comparing sizes (see generation's own doc comment).
 func (s *SeriesStore) Truncate(ref uint32, mint int64) int {
 	it := s.Iterator(ref)
 	var tss []int64
@@ -310,6 +314,7 @@ func (s *SeriesStore) Truncate(ref uint32, mint int64) int {
 	// bits from the previous, longer encoding. Must clear before resetting bitOff.
 	base, cap := s.slotOff[ref], s.slotCap[ref]
 	clear(s.arena[base : base+cap])
+	s.generation[ref]++
 
 	s.bitOff[ref] = 0
 	s.nSamples[ref] = 0
