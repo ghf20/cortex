@@ -79,6 +79,17 @@ type SeriesStore struct {
 	arena    []byte
 	freeList map[uint32][]uint32 // size class (bytes) -> free byte offsets of that size
 
+	// disableReuse, when true, makes alloc() never hand out a freed region - every
+	// alloc() is a fresh append past the current end of arena, so arena only ever
+	// grows monotonically and never has a byte in it rewritten by a DIFFERENT
+	// series after being durably flushed. See durability.go: this is what makes
+	// "arena as WAL" tractable - growSlot's normal free-then-reuse pattern would
+	// otherwise let series B silently overwrite series A's already-flushed bytes,
+	// which a simple flushed-high-water-mark scheme can't detect. The real,
+	// measured cost of this tradeoff (arena growth without reuse) is in
+	// CHECKLIST.md's Phase 5 section, not assumed.
+	disableReuse bool
+
 	// Diagnostics: how often alloc reused a freed region, and the free list's net
 	// effect on arena growth for this run. AllocBytesRequested sums size across every
 	// alloc() call (hit or miss); len(arena) only grows on misses - so
@@ -107,18 +118,30 @@ func NewSeriesStore(expectedSeries int) *SeriesStore {
 	}
 }
 
+// NewDurableSeriesStore is NewSeriesStore with disableReuse set - see that field's
+// doc comment. Used by durability.go's Persist/Load path; not for ordinary (in-memory
+// only) use, which should keep the free list's real memory-density benefit.
+func NewDurableSeriesStore(expectedSeries int) *SeriesStore {
+	s := NewSeriesStore(expectedSeries)
+	s.disableReuse = true
+	return s
+}
+
 // alloc returns the byte offset of a zeroed region of exactly size bytes, reusing a
-// freed region of the same size class if one exists. Zeroing is not just cleanliness:
-// writeBits ORs new bits into arena, so a reused region with stale bits from its
-// previous occupant would silently corrupt the new series' encoding.
+// freed region of the same size class if one exists (unless disableReuse is set).
+// Zeroing is not just cleanliness: writeBits ORs new bits into arena, so a reused
+// region with stale bits from its previous occupant would silently corrupt the new
+// series' encoding.
 func (s *SeriesStore) alloc(size uint32) uint32 {
 	s.AllocBytesRequested += uint64(size)
-	if free := s.freeList[size]; len(free) > 0 {
-		off := free[len(free)-1]
-		s.freeList[size] = free[:len(free)-1]
-		clear(s.arena[off : off+size])
-		s.AllocHits++
-		return off
+	if !s.disableReuse {
+		if free := s.freeList[size]; len(free) > 0 {
+			off := free[len(free)-1]
+			s.freeList[size] = free[:len(free)-1]
+			clear(s.arena[off : off+size])
+			s.AllocHits++
+			return off
+		}
 	}
 	s.AllocMisses++
 	off := uint32(len(s.arena))
@@ -128,6 +151,9 @@ func (s *SeriesStore) alloc(size uint32) uint32 {
 
 // free returns a size-byte region at off to the free list for reuse.
 func (s *SeriesStore) free(off, size uint32) {
+	if s.disableReuse {
+		return // alloc() never consults freeList in this mode - nothing to track.
+	}
 	s.freeList[size] = append(s.freeList[size], off)
 }
 

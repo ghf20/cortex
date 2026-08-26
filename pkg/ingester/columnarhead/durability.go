@@ -1,0 +1,404 @@
+package columnarhead
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+// This file is the Phase 5 spike design doc §7 asks for before building a
+// conventional WAL: "the target-major columnar arena is already a better WAL than
+// the WAL... if it can serve as the durable record directly, an entire redundant
+// in-memory copy of every in-flight sample disappears." DurableHead tests that
+// hypothesis directly, rather than assuming it.
+//
+// Finding, checked before writing any of this rather than assumed: three of Head's
+// four core structures are ALREADY append-only in memory, with no in-place rewrite
+// of old bytes at all - liveInterner's blob/offset (Intern only ever appends),
+// TargetStore's refs (Create only ever appends), and SeriesStore's per-series
+// identity fields (targetID/nameID/localName/localRef/hasLocal, set once at Create,
+// never mutated again). Durability for those is close to free: flush the tail past
+// the last-known-durable length, fsync, done - no separate WAL record encoding
+// needed, the in-memory bytes ARE the durable bytes.
+//
+// The one genuine complication is SeriesStore's arena: growSlot moves a series to a
+// bigger region and FREES its old one for a *different* series' later alloc() to
+// reuse and overwrite - a plain "flush everything past the last high-water mark"
+// scheme cannot see that in-place overwrite of already-flushed bytes. Solved here by
+// disabling free-list reuse entirely for a durable store (NewDurableSeriesStore) -
+// arena becomes strictly append-only too, at a real, measured memory cost (see
+// CHECKLIST.md's Phase 5 section for the actual number, not an assumed one).
+//
+// Scope, stated plainly: floats only, matching Phase 2's own precedent - histograms,
+// exemplars, metadata, and start-timestamps are NOT persisted here. A crash loses
+// them even if this were wired into the real ingest path (which it isn't yet - this
+// proves the mechanism, it is not itself the finished Phase 5 feature).
+const (
+	fileSymbolsBlob    = "symbols_blob.bin"
+	fileSymbolsOffsets = "symbols_offsets.bin"
+	fileTargets        = "targets.bin"
+	fileArena          = "arena.bin"
+	fileSeriesMeta     = "series_meta.bin"
+)
+
+// seriesMetaRecordSize is one series' fixed-width persisted record: targetID(4) +
+// nameID(2) + localName(2) + localRef(2) + hasLocal(1) + bitOff(2) + nSamples(2) +
+// slotOff(4) + slotCap(4) + val.lastBits(8) + val.leading(1) + val.trailing(1) +
+// ts.lastTS(8) + ts.lastDelta(8). Unlike the identity fields (targetID etc.), bitOff/
+// nSamples/slotOff/slotCap/val/ts mutate on every Append - persisted via a full
+// rewrite of this (small, O(numSeries) not O(arena size)) table on every Flush,
+// rather than tracked incrementally like the arena; simpler, and cheap at any
+// realistic series count (500k series here is ~24 MB - see TestHeadAtScale for how
+// fast a live head of that size already builds).
+const seriesMetaRecordSize = 4 + 2 + 2 + 2 + 1 + 2 + 2 + 4 + 4 + 8 + 1 + 1 + 8 + 8
+
+func encodeSeriesMetaRecord(s *SeriesStore, ref uint32, buf []byte) {
+	binary.LittleEndian.PutUint32(buf[0:4], s.targetID[ref])
+	binary.LittleEndian.PutUint16(buf[4:6], s.nameID[ref])
+	binary.LittleEndian.PutUint16(buf[6:8], s.localName[ref])
+	binary.LittleEndian.PutUint16(buf[8:10], s.localRef[ref])
+	if s.hasLocal[ref] {
+		buf[10] = 1
+	} else {
+		buf[10] = 0
+	}
+	binary.LittleEndian.PutUint16(buf[11:13], s.bitOff[ref])
+	binary.LittleEndian.PutUint16(buf[13:15], s.nSamples[ref])
+	binary.LittleEndian.PutUint32(buf[15:19], s.slotOff[ref])
+	binary.LittleEndian.PutUint32(buf[19:23], s.slotCap[ref])
+	binary.LittleEndian.PutUint64(buf[23:31], s.val[ref].lastBits)
+	buf[31] = s.val[ref].leading
+	buf[32] = s.val[ref].trailing
+	binary.LittleEndian.PutUint64(buf[33:41], uint64(s.ts[ref].lastTS))
+	binary.LittleEndian.PutUint64(buf[41:49], uint64(s.ts[ref].lastDelta))
+}
+
+func decodeSeriesMetaRecord(buf []byte) (targetID uint32, nameID, localName, localRef uint16, hasLocal bool, bitOff, nSamples uint16, slotOff, slotCap uint32, val valueState, ts tsState) {
+	targetID = binary.LittleEndian.Uint32(buf[0:4])
+	nameID = binary.LittleEndian.Uint16(buf[4:6])
+	localName = binary.LittleEndian.Uint16(buf[6:8])
+	localRef = binary.LittleEndian.Uint16(buf[8:10])
+	hasLocal = buf[10] != 0
+	bitOff = binary.LittleEndian.Uint16(buf[11:13])
+	nSamples = binary.LittleEndian.Uint16(buf[13:15])
+	slotOff = binary.LittleEndian.Uint32(buf[15:19])
+	slotCap = binary.LittleEndian.Uint32(buf[19:23])
+	val.lastBits = binary.LittleEndian.Uint64(buf[23:31])
+	val.leading = buf[31]
+	val.trailing = buf[32]
+	ts.lastTS = int64(binary.LittleEndian.Uint64(buf[33:41]))
+	ts.lastDelta = int64(binary.LittleEndian.Uint64(buf[41:49]))
+	return
+}
+
+// DurableHead wraps a Head with on-disk persistence for its append-only structures.
+// Not wired into the real ingest path - a standalone harness for measuring whether
+// the underlying mechanism (see this file's package-level doc comment) is viable.
+type DurableHead struct {
+	*Head
+	dir string
+
+	blobFile, offsetFile, targetsFile, arenaFile, metaFile *os.File
+
+	// High-water marks: how much of each append-only structure is already durable.
+	// Units match what's being flushed - bytes for blob, element counts (multiplied
+	// by 4 on write) for offset/targets.
+	blobFlushed, offsetFlushed, targetsFlushed int
+
+	// Per-series arena durability tracking - NOT a single arena-wide high-water
+	// mark. A series' slot is allocated with spare capacity up front (e.g. 16
+	// bytes on the first sample), and later samples fill in MORE of that SAME
+	// already-allocated region without ever growing len(arena) - a single global
+	// high-water mark would miss those in-place fills entirely (found by
+	// TestDurableHeadFlushIsIncremental: a second Flush reported 0 new bytes
+	// despite 5 real new samples, because they all landed within capacity
+	// reserved - and counted as "flushed" - by the FIRST Flush). flushedBytes[ref]
+	// is how many bytes of ref's CURRENT slot are already durable;
+	// flushedSlotOff[ref] is which slotOff that count is relative to - a growSlot
+	// move changes slotOff, at which point the new slot's bytes are entirely new
+	// from the file's perspective (even though they're a copy of already-durable
+	// data) and must be reflushed from scratch at their new location.
+	flushedBytes, flushedSlotOff []uint32
+}
+
+// NewDurableHead is NewHead but backs SeriesStore with NewDurableSeriesStore -
+// required for Flush to be correct (see disableReuse's doc comment). Ordinary,
+// non-durable callers should keep using plain NewHead.
+func NewDurableHead(expectedSeries, expectedTargets, expectedSymbols int) *Head {
+	h := NewHead(expectedSeries, expectedTargets, expectedSymbols)
+	h.series = NewDurableSeriesStore(expectedSeries)
+	return h
+}
+
+// CreateDurableHead opens a brand-new DurableHead backed by files under dir (which
+// must not already contain a prior durable head - use LoadDurableHead to resume
+// one). Fails if any of the five files already exist, rather than silently
+// overwriting a prior head's data.
+func CreateDurableHead(dir string, expectedSeries, expectedTargets, expectedSymbols int) (*DurableHead, error) {
+	for _, name := range []string{fileSymbolsBlob, fileSymbolsOffsets, fileTargets, fileArena, fileSeriesMeta} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+			return nil, fmt.Errorf("columnarhead: %s already exists in %s - use LoadDurableHead", name, dir)
+		}
+	}
+	dh := &DurableHead{Head: NewDurableHead(expectedSeries, expectedTargets, expectedSymbols), dir: dir}
+	var err error
+	if dh.blobFile, err = os.OpenFile(filepath.Join(dir, fileSymbolsBlob), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
+		return nil, err
+	}
+	if dh.offsetFile, err = os.OpenFile(filepath.Join(dir, fileSymbolsOffsets), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
+		return nil, err
+	}
+	if dh.targetsFile, err = os.OpenFile(filepath.Join(dir, fileTargets), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
+		return nil, err
+	}
+	if dh.arenaFile, err = os.OpenFile(filepath.Join(dir, fileArena), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
+		return nil, err
+	}
+	if dh.metaFile, err = os.OpenFile(filepath.Join(dir, fileSeriesMeta), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
+		return nil, err
+	}
+	return dh, nil
+}
+
+// LoadDurableHead reconstructs a DurableHead from a directory previously written by
+// CreateDurableHead/Flush - the "restart after a crash" half of the spike. Only
+// data covered by a completed Flush is recovered; anything appended after the last
+// Flush is correctly absent, not an error - that IS the durability boundary being
+// tested.
+//
+// Reconstructs Head's derived indexes (targetIndex, seriesIndex, namePostings) by
+// replaying the loaded target/series records once, the same key construction
+// GetOrCreateSeries uses - these indexes are never themselves persisted, since
+// they're fully redundant with what's already in targets.bin/series_meta.bin.
+func LoadDurableHead(dir string) (*DurableHead, error) {
+	blob, err := os.ReadFile(filepath.Join(dir, fileSymbolsBlob))
+	if err != nil {
+		return nil, err
+	}
+	offsetBytes, err := os.ReadFile(filepath.Join(dir, fileSymbolsOffsets))
+	if err != nil {
+		return nil, err
+	}
+	if len(offsetBytes)%4 != 0 {
+		return nil, fmt.Errorf("columnarhead: %s size %d not a multiple of 4", fileSymbolsOffsets, len(offsetBytes))
+	}
+	targetBytes, err := os.ReadFile(filepath.Join(dir, fileTargets))
+	if err != nil {
+		return nil, err
+	}
+	if len(targetBytes)%4 != 0 {
+		return nil, fmt.Errorf("columnarhead: %s size %d not a multiple of 4", fileTargets, len(targetBytes))
+	}
+	arena, err := os.ReadFile(filepath.Join(dir, fileArena))
+	if err != nil {
+		return nil, err
+	}
+	metaBytes, err := os.ReadFile(filepath.Join(dir, fileSeriesMeta))
+	if err != nil {
+		return nil, err
+	}
+	if len(metaBytes)%seriesMetaRecordSize != 0 {
+		return nil, fmt.Errorf("columnarhead: %s size %d not a multiple of record size %d", fileSeriesMeta, len(metaBytes), seriesMetaRecordSize)
+	}
+	numSeries := len(metaBytes) / seriesMetaRecordSize
+	numTargets := len(targetBytes) / 4 / targetFields
+
+	li := newLiveInterner(len(offsetBytes)/4 - 1)
+	li.blob = blob
+	li.offset = li.offset[:0]
+	for i := 0; i+4 <= len(offsetBytes); i += 4 {
+		li.offset = append(li.offset, binary.LittleEndian.Uint32(offsetBytes[i:i+4]))
+	}
+	for id := 0; id < len(li.offset)-1; id++ {
+		li.index[li.String(uint32(id))] = uint32(id)
+	}
+
+	ts := NewTargetStore(numTargets)
+	for i := 0; i+4 <= len(targetBytes); i += 4 {
+		ts.refs = append(ts.refs, binary.LittleEndian.Uint32(targetBytes[i:i+4]))
+	}
+
+	ss := NewDurableSeriesStore(numSeries)
+	ss.arena = arena
+	for ref := 0; ref < numSeries; ref++ {
+		rec := metaBytes[ref*seriesMetaRecordSize : (ref+1)*seriesMetaRecordSize]
+		targetID, nameID, localName, localRef, hasLocal, bitOff, nSamples, slotOff, slotCap, val, tst := decodeSeriesMetaRecord(rec)
+		ss.targetID = append(ss.targetID, targetID)
+		ss.nameID = append(ss.nameID, nameID)
+		ss.localName = append(ss.localName, localName)
+		ss.localRef = append(ss.localRef, localRef)
+		ss.hasLocal = append(ss.hasLocal, hasLocal)
+		ss.bitOff = append(ss.bitOff, bitOff)
+		ss.nSamples = append(ss.nSamples, nSamples)
+		ss.slotOff = append(ss.slotOff, slotOff)
+		ss.slotCap = append(ss.slotCap, slotCap)
+		ss.val = append(ss.val, val)
+		ss.ts = append(ss.ts, tst)
+	}
+
+	h := &Head{
+		symbols:      li,
+		targets:      ts,
+		series:       ss,
+		targetIndex:  make(map[[targetFields]uint32]uint32, numTargets),
+		seriesIndex:  make(map[seriesKey]uint32, numSeries),
+		namePostings: make(map[uint16][]uint32),
+		metadata:     newSeriesMetadata(),
+		lastST:       make(map[uint32]int64),
+		exemplars:    newExemplarStorage(defaultExemplarCapacity),
+		histograms:   NewHistogramStore(),
+	}
+	for id := uint32(0); id < uint32(numTargets); id++ {
+		h.targetIndex[ts.Get(id)] = id
+	}
+	for ref := uint32(0); ref < uint32(numSeries); ref++ {
+		key := seriesKey{
+			targetID:  ss.TargetID(ref),
+			nameID:    ss.NameID(ref),
+			localName: ss.LocalName(ref),
+			localRef:  ss.LocalRef(ref),
+			hasLocal:  ss.HasLocal(ref),
+		}
+		h.seriesIndex[key] = ref
+		h.namePostings[key.nameID] = append(h.namePostings[key.nameID], ref)
+	}
+
+	flushedBytes := make([]uint32, numSeries)
+	flushedSlotOff := make([]uint32, numSeries)
+	for ref := 0; ref < numSeries; ref++ {
+		flushedBytes[ref] = (uint32(ss.bitOff[ref]) + 7) / 8
+		flushedSlotOff[ref] = ss.slotOff[ref]
+	}
+
+	dh := &DurableHead{
+		Head: h, dir: dir,
+		blobFlushed: len(blob), offsetFlushed: len(li.offset), targetsFlushed: numTargets * targetFields,
+		flushedBytes: flushedBytes, flushedSlotOff: flushedSlotOff,
+	}
+	if dh.blobFile, err = os.OpenFile(filepath.Join(dir, fileSymbolsBlob), os.O_RDWR, 0o644); err != nil {
+		return nil, err
+	}
+	if dh.offsetFile, err = os.OpenFile(filepath.Join(dir, fileSymbolsOffsets), os.O_RDWR, 0o644); err != nil {
+		return nil, err
+	}
+	if dh.targetsFile, err = os.OpenFile(filepath.Join(dir, fileTargets), os.O_RDWR, 0o644); err != nil {
+		return nil, err
+	}
+	if dh.arenaFile, err = os.OpenFile(filepath.Join(dir, fileArena), os.O_RDWR, 0o644); err != nil {
+		return nil, err
+	}
+	if dh.metaFile, err = os.OpenFile(filepath.Join(dir, fileSeriesMeta), os.O_RDWR, 0o644); err != nil {
+		return nil, err
+	}
+	return dh, nil
+}
+
+// FlushStats reports what a Flush call actually wrote, for measuring the real
+// "no redundant WAL copy" claim - new arena/blob/target bytes should track new
+// samples/symbols/targets, not total live head size.
+type FlushStats struct {
+	NewBlobBytes, NewTargetBytes, NewArenaBytes int
+	SeriesMetaBytes                             int // always a full rewrite - see seriesMetaRecordSize's doc comment
+}
+
+// Flush durably persists everything appended since the last Flush (or since
+// creation) and fsyncs it. Takes Head's own write lock for the duration - a
+// concurrent Append must not race a Flush reading the same slices.
+func (dh *DurableHead) Flush() (FlushStats, error) {
+	dh.mu.Lock()
+	defer dh.mu.Unlock()
+
+	var stats FlushStats
+
+	newBlob := dh.symbols.blob[dh.blobFlushed:]
+	if len(newBlob) > 0 {
+		if _, err := dh.blobFile.WriteAt(newBlob, int64(dh.blobFlushed)); err != nil {
+			return stats, fmt.Errorf("write %s: %w", fileSymbolsBlob, err)
+		}
+		stats.NewBlobBytes = len(newBlob)
+		dh.blobFlushed = len(dh.symbols.blob)
+	}
+
+	if newOffsets := dh.symbols.offset[dh.offsetFlushed:]; len(newOffsets) > 0 {
+		buf := make([]byte, len(newOffsets)*4)
+		for i, v := range newOffsets {
+			binary.LittleEndian.PutUint32(buf[i*4:], v)
+		}
+		if _, err := dh.offsetFile.WriteAt(buf, int64(dh.offsetFlushed*4)); err != nil {
+			return stats, fmt.Errorf("write %s: %w", fileSymbolsOffsets, err)
+		}
+		dh.offsetFlushed = len(dh.symbols.offset)
+	}
+
+	if newTargets := dh.targets.refs[dh.targetsFlushed:]; len(newTargets) > 0 {
+		buf := make([]byte, len(newTargets)*4)
+		for i, v := range newTargets {
+			binary.LittleEndian.PutUint32(buf[i*4:], v)
+		}
+		if _, err := dh.targetsFile.WriteAt(buf, int64(dh.targetsFlushed*4)); err != nil {
+			return stats, fmt.Errorf("write %s: %w", fileTargets, err)
+		}
+		stats.NewTargetBytes = len(buf)
+		dh.targetsFlushed = len(dh.targets.refs)
+	}
+
+	n := dh.series.NumSeries()
+	for len(dh.flushedBytes) < n {
+		dh.flushedBytes = append(dh.flushedBytes, 0)
+		dh.flushedSlotOff = append(dh.flushedSlotOff, 0)
+	}
+	for ref := 0; ref < n; ref++ {
+		usedBytes := (uint32(dh.series.bitOff[ref]) + 7) / 8
+		slotOff := dh.series.slotOff[ref]
+		already := dh.flushedBytes[ref]
+		if dh.flushedSlotOff[ref] != slotOff {
+			// growSlot moved this series since its last flush - the new slot's
+			// bytes are entirely new from the file's perspective, even though
+			// they're a copy of already-durable data at the old location.
+			already = 0
+		}
+		if usedBytes <= already {
+			continue
+		}
+		newBytes := dh.series.arena[slotOff+already : slotOff+usedBytes]
+		if _, err := dh.arenaFile.WriteAt(newBytes, int64(slotOff+already)); err != nil {
+			return stats, fmt.Errorf("write %s: %w", fileArena, err)
+		}
+		stats.NewArenaBytes += len(newBytes)
+		dh.flushedBytes[ref] = usedBytes
+		dh.flushedSlotOff[ref] = slotOff
+	}
+	metaBuf := make([]byte, n*seriesMetaRecordSize)
+	for ref := 0; ref < n; ref++ {
+		encodeSeriesMetaRecord(dh.series, uint32(ref), metaBuf[ref*seriesMetaRecordSize:(ref+1)*seriesMetaRecordSize])
+	}
+	if len(metaBuf) > 0 {
+		if _, err := dh.metaFile.WriteAt(metaBuf, 0); err != nil {
+			return stats, fmt.Errorf("write %s: %w", fileSeriesMeta, err)
+		}
+	}
+	stats.SeriesMetaBytes = len(metaBuf)
+
+	for _, f := range []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.arenaFile, dh.metaFile} {
+		if err := f.Sync(); err != nil {
+			return stats, fmt.Errorf("sync: %w", err)
+		}
+	}
+	return stats, nil
+}
+
+// Close closes every durable file handle without flushing - callers that want a
+// clean shutdown must Flush() first; Close alone simulates a crash (whatever
+// wasn't already flushed is lost), which is deliberately how the decisive test
+// uses it.
+func (dh *DurableHead) Close() error {
+	var err error
+	for _, f := range []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.arenaFile, dh.metaFile} {
+		if cerr := f.Close(); cerr != nil {
+			err = errors.Join(err, cerr)
+		}
+	}
+	return err
+}
