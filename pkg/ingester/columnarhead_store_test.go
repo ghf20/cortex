@@ -3,11 +3,13 @@ package ingester
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -226,6 +228,145 @@ func TestColumnarheadTSDBStoreCompactMergesBlocks(t *testing.T) {
 
 	got := queryAll(t, s, base-1, base+5*blockDuration)
 	require.Equal(t, want, got["up"])
+}
+
+// TestColumnarheadTSDBStoreQuerierConcurrentWithCompaction is the decisive
+// concurrency test an external review found missing (B1): real Querier/
+// ChunkQuerier calls running concurrently with real merge compaction
+// (Compact, which closes and os.RemoveAll's superseded block directories via
+// reloadAfterMergeLocked). Querier/ChunkQuerier's own doc comment explains why
+// this needs s.mtx.RLock() held across the WHOLE construction (block-list
+// snapshot AND every tsdb.NewBlockQuerier call), not just the snapshot -
+// releasing it early (as this code used to) leaves a window where a
+// concurrent merge can Close+delete a block tsdb.NewBlockQuerier is mid-way
+// through opening. Run under -race (a genuine data race would be caught
+// here) and asserts no query ever observes an error - the fix's whole point
+// is that the window is closed, not merely narrowed.
+func TestColumnarheadTSDBStoreQuerierConcurrentWithCompaction(t *testing.T) {
+	const blockDuration = 10 * 1000 // 10s blocks - small and fast, many fit in a short test run
+	dir := t.TempDir()
+	s, err := newColumnarheadTSDBStore(dir, 8, 4, 32, blockDuration, 10*blockDuration, nil, promslog.NewNopLogger(), nil)
+	require.NoError(t, err)
+	defer s.Close()
+
+	l := seriesLabels("up", "p")
+	base := int64(1700000000000)
+
+	// Seed a few blocks up front so Compact has real merge work to do from
+	// round 0 of the writer goroutine onward.
+	seedApp := s.Appender(context.Background())
+	for block := 0; block < 3; block++ {
+		blockStart := base + int64(block)*blockDuration
+		if _, err := seedApp.Append(0, l, blockStart, float64(block)); err != nil {
+			t.Fatalf("seed Append: %v", err)
+		}
+		if err := s.CompactHeadRange(context.Background(), blockStart, blockStart+blockDuration-1); err != nil {
+			t.Fatalf("seed CompactHeadRange: %v", err)
+		}
+	}
+
+	const writerRounds = 40
+	const numReaders = 8
+	mint, maxt := base-1, base+int64(3+writerRounds)*blockDuration
+
+	writerDone := make(chan error, 1)
+	go func() {
+		app := s.Appender(context.Background())
+		for round := 0; round < writerRounds; round++ {
+			blockStart := base + int64(3+round)*blockDuration
+			if _, err := app.Append(0, l, blockStart, float64(round)); err != nil {
+				writerDone <- fmt.Errorf("round %d Append: %w", round, err)
+				return
+			}
+			if err := s.CompactHeadRange(context.Background(), blockStart, blockStart+blockDuration-1); err != nil {
+				writerDone <- fmt.Errorf("round %d CompactHeadRange: %w", round, err)
+				return
+			}
+			if err := s.Compact(context.Background()); err != nil {
+				writerDone <- fmt.Errorf("round %d Compact: %w", round, err)
+				return
+			}
+		}
+		writerDone <- nil
+	}()
+
+	stop := make(chan struct{})
+	errs := make(chan error, numReaders)
+	var readerWG sync.WaitGroup
+	readerWG.Add(numReaders)
+	for i := 0; i < numReaders; i++ {
+		go func() {
+			defer readerWG.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if err := queryOnce(s, mint, maxt); err != nil {
+					errs <- err
+					return
+				}
+				if err := chunkQueryOnce(s, mint, maxt); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}()
+	}
+
+	writerErr := <-writerDone
+	close(stop)
+	readerWG.Wait()
+	close(errs)
+
+	if writerErr != nil {
+		t.Fatalf("writer goroutine: %v", writerErr)
+	}
+	for err := range errs {
+		t.Errorf("reader goroutine: %v", err)
+	}
+}
+
+// queryOnce/chunkQueryOnce are TestColumnarheadTSDBStoreQuerierConcurrentWithCompaction's
+// reader bodies, factored out because require/t.Fatalf are unsafe to call
+// from a non-test goroutine (testing.T's own documented contract) - errors
+// are returned instead and asserted on the main test goroutine after every
+// reader has joined.
+func queryOnce(s *columnarheadTSDBStore, mint, maxt int64) error {
+	q, err := s.Querier(mint, maxt)
+	if err != nil {
+		return fmt.Errorf("Querier: %w", err)
+	}
+	defer q.Close()
+	ss := q.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "up"))
+	for ss.Next() {
+		it := ss.At().Iterator(nil)
+		for it.Next() != chunkenc.ValNone {
+		}
+		if it.Err() != nil {
+			return fmt.Errorf("sample iterator: %w", it.Err())
+		}
+	}
+	return ss.Err()
+}
+
+func chunkQueryOnce(s *columnarheadTSDBStore, mint, maxt int64) error {
+	cq, err := s.ChunkQuerier(mint, maxt)
+	if err != nil {
+		return fmt.Errorf("ChunkQuerier: %w", err)
+	}
+	defer cq.Close()
+	css := cq.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "up"))
+	for css.Next() {
+		cit := css.At().Iterator(nil)
+		for cit.Next() {
+		}
+		if cit.Err() != nil {
+			return fmt.Errorf("chunk iterator: %w", cit.Err())
+		}
+	}
+	return css.Err()
 }
 
 // TestColumnarheadTSDBStorePrunesDeletableBlocks confirms blocksToDelete's

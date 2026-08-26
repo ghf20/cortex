@@ -191,6 +191,23 @@ func (s *columnarheadTSDBStore) Appender(ctx context.Context) storage.Appender {
 // isolation (see CHECKLIST.md's Phase 4 conclusion - Commit is a no-op, so
 // there's no in-flight transaction a concurrent Truncate could invalidate a
 // reader's view of).
+//
+// Holds s.mtx.RLock() across the ENTIRE construction - snapshotting s.blocks
+// AND opening every tsdb.NewBlockQuerier - matching real *tsdb.DB.Querier's
+// own db.mtx.RLock() scope exactly (vendor/.../tsdb/db.go), not just the
+// snapshot. A real, previously-missing gap found by external review (B1):
+// releasing the lock right after the snapshot (as this used to, via a since-
+// removed overlappingBlocks helper) leaves a window where a concurrent
+// reloadAfterMergeLocked/pruneBlocksLocked can Close + RemoveAll a
+// snapshotted block before NewBlockQuerier finishes opening it - real
+// *tsdb.Block.Close() blocks on its own pendingReaders, so this couldn't
+// corrupt data or crash (NewBlockQuerier would just see ErrClosing), but it
+// could produce a transient, avoidable query error under normal background
+// compaction. Held only for construction, not the query's full lifetime
+// (unlike Head.Querier's own s.head-level locking) - matches upstream's own
+// scope exactly, and s.blocks is never mutated by a reader, only replaced
+// wholesale by a writer holding the same mtx, so this is a plain snapshot,
+// not something that itself needs releasing early.
 func (s *columnarheadTSDBStore) Querier(mint, maxt int64) (_ storage.Querier, err error) {
 	headQuerier, err := s.head.Querier(mint, maxt)
 	if err != nil {
@@ -205,7 +222,12 @@ func (s *columnarheadTSDBStore) Querier(mint, maxt int64) (_ storage.Querier, er
 		}
 	}()
 
-	for _, b := range s.overlappingBlocks(mint, maxt) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	for _, b := range s.blocks {
+		if !b.OverlapsClosedInterval(mint, maxt) {
+			continue
+		}
 		q, err := tsdb.NewBlockQuerier(b, mint, maxt)
 		if err != nil {
 			return nil, fmt.Errorf("open querier for block %s: %w", b.Meta().ULID, err)
@@ -217,7 +239,8 @@ func (s *columnarheadTSDBStore) Querier(mint, maxt int64) (_ storage.Querier, er
 
 // ChunkQuerier is Querier's chunk-level counterpart - same merge pattern, same
 // mergeFn real *tsdb.DB.ChunkQuerier uses (storage.NewCompactingChunkSeriesMerger
-// over storage.ChainedSeriesMerge).
+// over storage.ChainedSeriesMerge), and the same full-construction s.mtx.RLock()
+// scope Querier's own doc comment explains (B1).
 func (s *columnarheadTSDBStore) ChunkQuerier(mint, maxt int64) (_ storage.ChunkQuerier, err error) {
 	headQuerier, err := s.head.ChunkQuerier(mint, maxt)
 	if err != nil {
@@ -232,7 +255,12 @@ func (s *columnarheadTSDBStore) ChunkQuerier(mint, maxt int64) (_ storage.ChunkQ
 		}
 	}()
 
-	for _, b := range s.overlappingBlocks(mint, maxt) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	for _, b := range s.blocks {
+		if !b.OverlapsClosedInterval(mint, maxt) {
+			continue
+		}
 		q, err := tsdb.NewBlockChunkQuerier(b, mint, maxt)
 		if err != nil {
 			return nil, fmt.Errorf("open chunk querier for block %s: %w", b.Meta().ULID, err)
@@ -240,18 +268,6 @@ func (s *columnarheadTSDBStore) ChunkQuerier(mint, maxt int64) (_ storage.ChunkQ
 		queriers = append(queriers, q)
 	}
 	return storage.NewMergeChunkQuerier(queriers, nil, storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge)), nil
-}
-
-func (s *columnarheadTSDBStore) overlappingBlocks(mint, maxt int64) []*tsdb.Block {
-	s.mtx.RLock()
-	defer s.mtx.RUnlock()
-	var out []*tsdb.Block
-	for _, b := range s.blocks {
-		if b.OverlapsClosedInterval(mint, maxt) {
-			out = append(out, b)
-		}
-	}
-	return out
 }
 
 func (s *columnarheadTSDBStore) ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier, error) {
