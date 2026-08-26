@@ -12,6 +12,7 @@ import (
 
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/exemplar"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/metadata"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
@@ -890,5 +891,140 @@ func TestDurableHeadPersistsExemplars(t *testing.T) {
 	}
 	if got[0].labels["trace_id"] != "abc123" || got[0].labels["span_id"] != "def456" || len(got[0].labels) != 2 {
 		t.Fatalf("Exemplars[0].labels = %v, want trace_id=abc123, span_id=def456", got[0].labels)
+	}
+}
+
+// TestDurableHeadPersistsHistograms is the decisive test for histogram
+// persistence: AppendHistogram via the real Appender, Flush, simulate a crash,
+// reload, and confirm the histogram survives via Head.HistogramIterator - the
+// real accessor, checked with the same histEqual helper histogram_test.go itself
+// uses, not a hand-rolled comparison.
+func TestDurableHeadPersistsHistograms(t *testing.T) {
+	dir := t.TempDir()
+	dh, err := CreateDurableHead(dir, 2, 1, 8)
+	if err != nil {
+		t.Fatalf("CreateDurableHead: %v", err)
+	}
+
+	l := labels.FromStrings(labels.MetricName, "request_duration_seconds", "cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j")
+	app := dh.Appender(context.Background())
+	hists := []*histogram.Histogram{
+		{
+			Schema: 0, ZeroThreshold: 0.001, ZeroCount: 2, Count: 10, Sum: 42.5,
+			PositiveSpans: []histogram.Span{{Offset: 0, Length: 2}}, PositiveBuckets: []int64{3, 1},
+		},
+		{
+			Schema: 0, ZeroThreshold: 0.001, ZeroCount: 3, Count: 15, Sum: 50.0,
+			PositiveSpans: []histogram.Span{{Offset: 0, Length: 2}}, PositiveBuckets: []int64{1, 1},
+		},
+	}
+	base := int64(1700000000000)
+	for i, h := range hists {
+		if _, err := app.AppendHistogram(0, l, base+int64(i)*15000, h, nil); err != nil {
+			t.Fatalf("AppendHistogram %d: %v", i, err)
+		}
+	}
+
+	stats, err := dh.Flush()
+	if err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if stats.HistogramBytes == 0 {
+		t.Fatal("Flush reported 0 histogram bytes after real AppendHistogram calls")
+	}
+
+	if err := dh.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reloaded, err := LoadDurableHead(dir)
+	if err != nil {
+		t.Fatalf("LoadDurableHead: %v", err)
+	}
+	defer reloaded.Close()
+
+	refs, ok := reloaded.SeriesRefsForName("request_duration_seconds")
+	if !ok || len(refs) != 1 {
+		t.Fatalf("series not found as expected: %v %v", refs, ok)
+	}
+	it := reloaded.HistogramIterator(refs[0])
+	for i, want := range hists {
+		if !it.Next() {
+			t.Fatalf("HistogramIterator.Next() = false at sample %d, want true", i)
+		}
+		gotTS, gotH := it.At()
+		if gotTS != base+int64(i)*15000 {
+			t.Fatalf("sample %d: ts = %d, want %d", i, gotTS, base+int64(i)*15000)
+		}
+		histEqual(t, gotH, want)
+	}
+	if it.Next() {
+		t.Fatal("HistogramIterator has more samples than expected after reload")
+	}
+}
+
+// TestDurableHeadHistogramTruncateThenFlush is the decisive check for the
+// histogram Truncate/Flush interaction: HistogramStore.Truncate DELETES and
+// recreates a series' *histoSeries (unlike SeriesStore.Truncate's in-place
+// rewrite), so a full-rewrite-per-Flush approach must correctly reflect that
+// recreation - not, say, keep serving a stale copy from before the delete.
+func TestDurableHeadHistogramTruncateThenFlush(t *testing.T) {
+	dir := t.TempDir()
+	dh, err := CreateDurableHead(dir, 2, 1, 8)
+	if err != nil {
+		t.Fatalf("CreateDurableHead: %v", err)
+	}
+
+	l := labels.FromStrings(labels.MetricName, "request_duration_seconds", "cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j")
+	app := dh.Appender(context.Background())
+	base := int64(1700000000000)
+	all := []*histogram.Histogram{
+		{Schema: 0, Count: 1, Sum: 1, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{1}},
+		{Schema: 0, Count: 2, Sum: 2, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{1}},
+		{Schema: 0, Count: 3, Sum: 3, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{1}},
+	}
+	for i, h := range all {
+		if _, err := app.AppendHistogram(0, l, base+int64(i)*15000, h, nil); err != nil {
+			t.Fatalf("AppendHistogram %d: %v", i, err)
+		}
+	}
+	if _, err := dh.Flush(); err != nil {
+		t.Fatalf("first Flush: %v", err)
+	}
+
+	dh.Truncate(base + 1*15000) // drops the first sample only
+	want := all[1:]
+	wantTS := []int64{base + 15000, base + 30000}
+
+	if _, err := dh.Flush(); err != nil {
+		t.Fatalf("post-truncate Flush: %v", err)
+	}
+	if err := dh.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reloaded, err := LoadDurableHead(dir)
+	if err != nil {
+		t.Fatalf("LoadDurableHead: %v", err)
+	}
+	defer reloaded.Close()
+
+	refs, ok := reloaded.SeriesRefsForName("request_duration_seconds")
+	if !ok || len(refs) != 1 {
+		t.Fatalf("series not found as expected: %v %v", refs, ok)
+	}
+	it := reloaded.HistogramIterator(refs[0])
+	for i, wantH := range want {
+		if !it.Next() {
+			t.Fatalf("HistogramIterator.Next() = false at sample %d, want true", i)
+		}
+		gotTS, gotH := it.At()
+		if gotTS != wantTS[i] {
+			t.Fatalf("sample %d: ts = %d, want %d", i, gotTS, wantTS[i])
+		}
+		histEqual(t, gotH, wantH)
+	}
+	if it.Next() {
+		t.Fatal("HistogramIterator has more samples than expected after reload - truncation wasn't reflected")
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/metadata"
 )
 
@@ -47,11 +48,13 @@ import (
 // reproduces real data corruption after reload. Free-list reuse is therefore always
 // enabled - NewHead/NewSeriesStore are used directly, no separate durable variant.
 //
-// Scope, stated plainly: metadata and exemplars are persisted (see
-// encodeMetadataMap/encodeExemplarStorage), but histograms and start-timestamps
-// are NOT - a crash loses them even if this were wired into the real ingest path
-// (which it isn't yet - this proves the mechanism, it is not itself the finished
-// Phase 5 feature).
+// Scope, stated plainly: metadata, exemplars, and histograms are all persisted now
+// (see encodeMetadataMap/encodeExemplarStorage/encodeHistogramStore) - only
+// start-timestamps are NOT. A crash loses them even if this were wired into the
+// real ingest path (which it isn't yet - this proves the mechanism, it is not
+// itself the finished Phase 5 feature). Histogram persistence is a full rewrite
+// per Flush, not incremental like the float path - see encodeHistogramStore's own
+// doc comment for why that's a deliberate, stated scope choice here.
 const (
 	fileSymbolsBlob    = "symbols_blob.bin"
 	fileSymbolsOffsets = "symbols_offsets.bin"
@@ -60,6 +63,7 @@ const (
 	fileSeriesMeta     = "series_meta.bin"
 	fileMetadata       = "metadata.bin"
 	fileExemplars      = "exemplars.bin"
+	fileHistograms     = "histograms.bin"
 )
 
 // seriesMetaRecordSize is one series' fixed-width persisted record: targetID(4) +
@@ -291,6 +295,246 @@ func decodeExemplarStorage(buf []byte) (*exemplarStorage, error) {
 	return es, nil
 }
 
+// encodeHistogramStore serializes every current histogram series as a
+// variable-length record: ref(4), schema(4), zeroThreshold(8), bitOff(4),
+// nSamples(4), ts.lastTS(8), ts.lastDelta(8), sum.lastBits(8)+leading(1)+
+// trailing(1), lastZeroCount(8), lastCount(8), posSpans (count(4) + each
+// Offset(4)+Length(4)), negSpans (same shape), lastPosBuckets (count(4) + each
+// int64(8)), lastNegBuckets (same shape), then the series' USED arena prefix
+// (byteLen(4) + that many bytes - not the full backing capacity, matching
+// Compact's tight-packing instinct for the float path).
+//
+// Full rewrite on every Flush, a real, stated tradeoff unlike the float path's
+// incremental per-series tracking: HistogramStore's per-series arenas are
+// independent (no shared pool, no free-list reuse - growHisto just appends), so
+// the SeriesStore-style slotOff/generation bookkeeping doesn't apply the same
+// way, and Truncate's delete-then-recreate (see HistogramStore.Truncate) means a
+// ref's identity itself can change, not just its size - correctly handled for
+// free by a full rewrite (whatever's currently in the map is what gets written,
+// full stop) at the cost of O(total histogram data) per flush instead of
+// O(new data). Native histograms are already this project's largest
+// unfinished item (see CHECKLIST.md's Phase 3) and HistogramStore itself is
+// already a stable-layout-only prototype, not the finished feature - matching
+// that scope here rather than building a second incremental-tracking scheme
+// this early is a deliberate choice, not an oversight.
+func encodeHistogramStore(hst *HistogramStore) []byte {
+	var buf []byte
+	putU32 := func(v uint32) {
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], v)
+		buf = append(buf, b[:]...)
+	}
+	putU64 := func(v uint64) {
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], v)
+		buf = append(buf, b[:]...)
+	}
+	putI64 := func(v int64) { putU64(uint64(v)) }
+
+	for ref, s := range hst.series {
+		putU32(ref)
+		putU32(uint32(s.schema))
+		putU64(math.Float64bits(s.zeroThreshold))
+		putU32(s.bitOff)
+		putU32(s.nSamples)
+		putI64(s.ts.lastTS)
+		putI64(s.ts.lastDelta)
+		putU64(s.sum.lastBits)
+		buf = append(buf, s.sum.leading, s.sum.trailing)
+		putU64(s.lastZeroCount)
+		putU64(s.lastCount)
+
+		putU32(uint32(len(s.posSpans)))
+		for _, sp := range s.posSpans {
+			putU32(uint32(sp.Offset))
+			putU32(sp.Length)
+		}
+		putU32(uint32(len(s.negSpans)))
+		for _, sp := range s.negSpans {
+			putU32(uint32(sp.Offset))
+			putU32(sp.Length)
+		}
+		putU32(uint32(len(s.lastPosBuckets)))
+		for _, v := range s.lastPosBuckets {
+			putI64(v)
+		}
+		putU32(uint32(len(s.lastNegBuckets)))
+		for _, v := range s.lastNegBuckets {
+			putI64(v)
+		}
+
+		usedBytes := (s.bitOff + 7) / 8
+		putU32(usedBytes)
+		buf = append(buf, s.arena[:usedBytes]...)
+	}
+	return buf
+}
+
+// decodeHistogramStore is encodeHistogramStore's inverse.
+func decodeHistogramStore(buf []byte) (*HistogramStore, error) {
+	hst := NewHistogramStore()
+	off := 0
+	need := func(n int) error {
+		if off+n > len(buf) {
+			return fmt.Errorf("truncated histogram store at offset %d (need %d more bytes)", off, n)
+		}
+		return nil
+	}
+	getU32 := func() (uint32, error) {
+		if err := need(4); err != nil {
+			return 0, err
+		}
+		v := binary.LittleEndian.Uint32(buf[off : off+4])
+		off += 4
+		return v, nil
+	}
+	getU64 := func() (uint64, error) {
+		if err := need(8); err != nil {
+			return 0, err
+		}
+		v := binary.LittleEndian.Uint64(buf[off : off+8])
+		off += 8
+		return v, nil
+	}
+	getI64 := func() (int64, error) {
+		v, err := getU64()
+		return int64(v), err
+	}
+
+	for off < len(buf) {
+		ref, err := getU32()
+		if err != nil {
+			return nil, err
+		}
+		schema, err := getU32()
+		if err != nil {
+			return nil, err
+		}
+		zeroThresholdBits, err := getU64()
+		if err != nil {
+			return nil, err
+		}
+		bitOff, err := getU32()
+		if err != nil {
+			return nil, err
+		}
+		nSamples, err := getU32()
+		if err != nil {
+			return nil, err
+		}
+		lastTS, err := getI64()
+		if err != nil {
+			return nil, err
+		}
+		lastDelta, err := getI64()
+		if err != nil {
+			return nil, err
+		}
+		sumBits, err := getU64()
+		if err != nil {
+			return nil, err
+		}
+		if err := need(2); err != nil {
+			return nil, err
+		}
+		leading, trailing := buf[off], buf[off+1]
+		off += 2
+		lastZeroCount, err := getU64()
+		if err != nil {
+			return nil, err
+		}
+		lastCount, err := getU64()
+		if err != nil {
+			return nil, err
+		}
+
+		getSpans := func() ([]histogram.Span, error) {
+			n, err := getU32()
+			if err != nil {
+				return nil, err
+			}
+			if n == 0 {
+				return nil, nil
+			}
+			spans := make([]histogram.Span, n)
+			for i := range spans {
+				o, err := getU32()
+				if err != nil {
+					return nil, err
+				}
+				l, err := getU32()
+				if err != nil {
+					return nil, err
+				}
+				spans[i] = histogram.Span{Offset: int32(o), Length: l}
+			}
+			return spans, nil
+		}
+		posSpans, err := getSpans()
+		if err != nil {
+			return nil, err
+		}
+		negSpans, err := getSpans()
+		if err != nil {
+			return nil, err
+		}
+
+		getInt64s := func() ([]int64, error) {
+			n, err := getU32()
+			if err != nil {
+				return nil, err
+			}
+			if n == 0 {
+				return nil, nil
+			}
+			out := make([]int64, n)
+			for i := range out {
+				v, err := getI64()
+				if err != nil {
+					return nil, err
+				}
+				out[i] = v
+			}
+			return out, nil
+		}
+		lastPosBuckets, err := getInt64s()
+		if err != nil {
+			return nil, err
+		}
+		lastNegBuckets, err := getInt64s()
+		if err != nil {
+			return nil, err
+		}
+
+		arenaLen, err := getU32()
+		if err != nil {
+			return nil, err
+		}
+		if err := need(int(arenaLen)); err != nil {
+			return nil, err
+		}
+		arena := append([]byte(nil), buf[off:off+int(arenaLen)]...)
+		off += int(arenaLen)
+
+		hst.series[ref] = &histoSeries{
+			schema:         int32(schema),
+			zeroThreshold:  math.Float64frombits(zeroThresholdBits),
+			posSpans:       posSpans,
+			negSpans:       negSpans,
+			arena:          arena,
+			bitOff:         bitOff,
+			ts:             tsState{lastTS: lastTS, lastDelta: lastDelta},
+			sum:            valueState{lastBits: sumBits, leading: leading, trailing: trailing},
+			lastZeroCount:  lastZeroCount,
+			lastCount:      lastCount,
+			lastPosBuckets: lastPosBuckets,
+			lastNegBuckets: lastNegBuckets,
+			nSamples:       nSamples,
+		}
+	}
+	return hst, nil
+}
+
 // DurableHead wraps a Head with on-disk persistence for its append-only structures.
 // Not wired into the real ingest path - a standalone harness for measuring whether
 // the underlying mechanism (see this file's package-level doc comment) is viable.
@@ -298,7 +542,7 @@ type DurableHead struct {
 	*Head
 	dir string
 
-	blobFile, offsetFile, targetsFile, arenaFile, metaFile, metadataFile, exemplarsFile *os.File
+	blobFile, offsetFile, targetsFile, arenaFile, metaFile, metadataFile, exemplarsFile, histogramsFile *os.File
 
 	// High-water marks: how much of each append-only structure is already durable.
 	// Units match what's being flushed - bytes for blob, element counts (multiplied
@@ -340,7 +584,7 @@ type DurableHead struct {
 // one). Fails if any of the five files already exist, rather than silently
 // overwriting a prior head's data.
 func CreateDurableHead(dir string, expectedSeries, expectedTargets, expectedSymbols int) (*DurableHead, error) {
-	for _, name := range []string{fileSymbolsBlob, fileSymbolsOffsets, fileTargets, fileArena, fileSeriesMeta, fileMetadata, fileExemplars} {
+	for _, name := range []string{fileSymbolsBlob, fileSymbolsOffsets, fileTargets, fileArena, fileSeriesMeta, fileMetadata, fileExemplars, fileHistograms} {
 		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
 			return nil, fmt.Errorf("columnarhead: %s already exists in %s - use LoadDurableHead", name, dir)
 		}
@@ -366,6 +610,9 @@ func CreateDurableHead(dir string, expectedSeries, expectedTargets, expectedSymb
 		return nil, err
 	}
 	if dh.exemplarsFile, err = os.OpenFile(filepath.Join(dir, fileExemplars), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
+		return nil, err
+	}
+	if dh.histogramsFile, err = os.OpenFile(filepath.Join(dir, fileHistograms), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
 		return nil, err
 	}
 	return dh, nil
@@ -427,6 +674,14 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 	if err != nil {
 		return nil, fmt.Errorf("columnarhead: decode %s: %w", fileExemplars, err)
 	}
+	histogramsBytes, err := os.ReadFile(filepath.Join(dir, fileHistograms))
+	if err != nil {
+		return nil, err
+	}
+	histograms, err := decodeHistogramStore(histogramsBytes)
+	if err != nil {
+		return nil, fmt.Errorf("columnarhead: decode %s: %w", fileHistograms, err)
+	}
 	numSeries := len(metaBytes) / seriesMetaRecordSize
 	numTargets := len(targetBytes) / 4 / targetFields
 
@@ -474,7 +729,7 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 		metadata:     &seriesMetadata{byRef: metadataByRef},
 		lastST:       make(map[uint32]int64),
 		exemplars:    exemplars,
-		histograms:   NewHistogramStore(),
+		histograms:   histograms,
 	}
 	for id := uint32(0); id < uint32(numTargets); id++ {
 		h.targetIndex[ts.Get(id)] = id
@@ -529,6 +784,9 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 	if dh.exemplarsFile, err = os.OpenFile(filepath.Join(dir, fileExemplars), os.O_RDWR, 0o644); err != nil {
 		return nil, err
 	}
+	if dh.histogramsFile, err = os.OpenFile(filepath.Join(dir, fileHistograms), os.O_RDWR, 0o644); err != nil {
+		return nil, err
+	}
 	return dh, nil
 }
 
@@ -540,6 +798,7 @@ type FlushStats struct {
 	SeriesMetaBytes                             int // always a full rewrite - see seriesMetaRecordSize's doc comment
 	MetadataBytes                               int // always a full rewrite - see encodeMetadataMap's doc comment
 	ExemplarBytes                               int // always a full rewrite - see encodeExemplarStorage's doc comment
+	HistogramBytes                              int // always a full rewrite - see encodeHistogramStore's doc comment
 }
 
 // Flush durably persists everything appended since the last Flush (or since
@@ -660,7 +919,21 @@ func (dh *DurableHead) Flush() (FlushStats, error) {
 	}
 	stats.ExemplarBytes = len(exemplarsBuf)
 
-	for _, f := range []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.arenaFile, dh.metaFile, dh.metadataFile, dh.exemplarsFile} {
+	// Full rewrite, same as metadata/exemplars - see encodeHistogramStore's doc
+	// comment for why (Truncate's delete-then-recreate means a ref's identity can
+	// change, not just its size, which a full rewrite handles for free).
+	histogramsBuf := encodeHistogramStore(dh.histograms)
+	if len(histogramsBuf) > 0 {
+		if _, err := dh.histogramsFile.WriteAt(histogramsBuf, 0); err != nil {
+			return stats, fmt.Errorf("write %s: %w", fileHistograms, err)
+		}
+	}
+	if err := dh.histogramsFile.Truncate(int64(len(histogramsBuf))); err != nil {
+		return stats, fmt.Errorf("truncate %s: %w", fileHistograms, err)
+	}
+	stats.HistogramBytes = len(histogramsBuf)
+
+	for _, f := range []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.arenaFile, dh.metaFile, dh.metadataFile, dh.exemplarsFile, dh.histogramsFile} {
 		if err := f.Sync(); err != nil {
 			return stats, fmt.Errorf("sync: %w", err)
 		}
@@ -786,7 +1059,7 @@ func (dh *DurableHead) Close() error {
 		dh.stopAutoFlush = nil
 	}
 	var err error
-	for _, f := range []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.arenaFile, dh.metaFile, dh.metadataFile, dh.exemplarsFile} {
+	for _, f := range []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.arenaFile, dh.metaFile, dh.metadataFile, dh.exemplarsFile, dh.histogramsFile} {
 		if cerr := f.Close(); cerr != nil {
 			err = errors.Join(err, cerr)
 		}
