@@ -3,6 +3,7 @@ package columnarhead
 import (
 	"errors"
 	"math"
+	"sync"
 
 	"github.com/prometheus/prometheus/model/exemplar"
 	"github.com/prometheus/prometheus/model/histogram"
@@ -38,7 +39,28 @@ var ErrTooManySymbols = errors.New("columnarhead: nameID/localRef would overflow
 // includes live Go map overhead on top of the tight series/target records, not the
 // compact MPHF projection quoted elsewhere in CHECKLIST.md for the post-compaction
 // case. See TestHeadAtScale for the honest, measured total.
+//
+// Concurrency: mu guards every field below. It is deliberately ONE lock for the whole
+// Head, not real Prometheus's per-series striped locks - this package's arena/maps are
+// shared, process-wide structures (SeriesStore.growSlot can reallocate the ENTIRE
+// arena backing every series, not just one), so anything finer would need a real
+// redesign, not just a bigger lock table. The tradeoff is real and stated plainly, not
+// hidden: a single long-running query (which holds a read lock for its whole
+// lifetime - see Querier/ChunkQuerier below) blocks every append for its duration,
+// unlike real Prometheus's much more concurrent model.
+//
+// Most of Head's own methods (Append, AppendHistogram, GetOrCreateSeries,
+// SeriesLabels, Iterator, NumSeries, etc.) do NOT lock internally - they assume the
+// caller already holds mu, appropriately for a read or a write. The actual safe entry
+// points for concurrent use are Appender() (each storage.Appender call takes the write
+// lock for its own duration), Querier()/ChunkQuerier() (take the read lock at
+// construction, released by Close() - the entire query's lifetime, not just Select()),
+// and Truncate() (takes the write lock for its own call). Calling Head's other methods
+// directly, concurrently with any of these, is not safe - fine for single-threaded
+// test code, not for real concurrent ingest/query traffic.
 type Head struct {
+	mu sync.RWMutex
+
 	symbols *liveInterner
 	targets *TargetStore
 	series  *SeriesStore
@@ -378,7 +400,13 @@ func (h *Head) SeriesRefsForName(metricName string) ([]uint32, bool) {
 // O(1)-per-series index/postings/full-scan cost of series nobody will ever query
 // again - full removal of wholly-empty series from those structures is a further,
 // not-yet-built step.
+//
+// Takes the write lock for its whole call - a real entry point for concurrent use
+// (see Head's doc comment), since a real compaction goroutine calling this runs
+// concurrently with live append/query traffic.
 func (h *Head) Truncate(mint int64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	n := uint32(h.series.NumSeries())
 	for ref := uint32(0); ref < n; ref++ {
 		h.series.Truncate(ref, mint)

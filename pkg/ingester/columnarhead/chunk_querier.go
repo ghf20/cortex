@@ -28,17 +28,29 @@ import (
 // (real Prometheus histogram chunks have counter-reset/recoding semantics this
 // package's own HistogramStore doesn't implement - see its doc comment).
 func (h *Head) ChunkQuerier(mint, maxt int64) (storage.ChunkQuerier, error) {
+	h.mu.RLock()
 	return &headChunkQuerier{h: h, mint: mint, maxt: maxt}, nil
 }
 
 type headChunkQuerier struct {
 	h          *Head
 	mint, maxt int64
+	closed     bool
 }
 
 var _ storage.ChunkQuerier = (*headChunkQuerier)(nil)
 
-func (q *headChunkQuerier) Close() error { return nil }
+// Close releases the read lock taken by Head.ChunkQuerier - see headQuerier.Close's
+// doc comment; the same reasoning (whole-query-lifetime lock, idempotence
+// requirement) applies here identically.
+func (q *headChunkQuerier) Close() error {
+	if q.closed {
+		return nil
+	}
+	q.closed = true
+	q.h.mu.RUnlock()
+	return nil
+}
 
 func (q *headChunkQuerier) LabelValues(ctx context.Context, name string, hints *storage.LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
 	return (&headQuerier{h: q.h, mint: q.mint, maxt: q.maxt}).LabelValues(ctx, name, hints, matchers...)

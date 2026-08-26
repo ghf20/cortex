@@ -11,25 +11,46 @@ import (
 	"github.com/prometheus/prometheus/util/annotations"
 )
 
-// Querier returns a storage.Querier over h's current state - a live, unlocked
-// snapshot of whatever series exist at call time (Head has no locking anywhere yet;
-// a real concurrent-safe implementation is separate, later work). mint/maxt bound
-// every returned series' iterator to that inclusive range - a series with matcher
-// hits but zero samples inside [mint, maxt] is still returned (matching real
-// Prometheus's own lazy behavior: the caller's iterator just yields nothing), only
-// the samples themselves are filtered, not series membership.
+// Querier returns a storage.Querier over h's current state. mint/maxt bound every
+// returned series' iterator to that inclusive range - a series with matcher hits but
+// zero samples inside [mint, maxt] is still returned (matching real Prometheus's own
+// lazy behavior: the caller's iterator just yields nothing), only the samples
+// themselves are filtered, not series membership.
+//
+// Takes h's read lock for the ENTIRE query lifetime, released by Close() - not just
+// for Select() itself. This is necessary, not overcautious: Select's returned
+// SeriesSet/Series/Iterator all lazily read h's arena/maps well after Select returns,
+// and SeriesStore.growSlot can reallocate that arena's backing array out from under a
+// concurrent reader if a write were allowed to proceed mid-query. Callers MUST call
+// Close() (storage.Querier's own documented contract) - forgetting to is a real,
+// listed risk here specifically: an un-closed querier is not just a resource leak,
+// it wedges every future write against this Head forever. See Head's doc comment for
+// why this is one coarse lock rather than something finer-grained.
 func (h *Head) Querier(mint, maxt int64) (storage.Querier, error) {
+	h.mu.RLock()
 	return &headQuerier{h: h, mint: mint, maxt: maxt}, nil
 }
 
 type headQuerier struct {
 	h          *Head
 	mint, maxt int64
+	closed     bool
 }
 
 var _ storage.Querier = (*headQuerier)(nil)
 
-func (q *headQuerier) Close() error { return nil }
+// Close releases the read lock taken by Head.Querier. Idempotent, matching
+// storage.Querier's documented contract ("safe to be called multiple times") - a
+// second RUnlock on an already-released sync.RWMutex would panic, so this guards
+// against exactly that.
+func (q *headQuerier) Close() error {
+	if q.closed {
+		return nil
+	}
+	q.closed = true
+	q.h.mu.RUnlock()
+	return nil
+}
 
 // Select implements design doc §3.4's architecture: if matchers include an exact
 // (MatchEqual) selector on __name__, look up its postings (Head.SeriesRefsForName)
