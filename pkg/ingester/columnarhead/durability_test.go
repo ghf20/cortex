@@ -192,7 +192,11 @@ func TestDurableHeadFlushIsIncremental(t *testing.T) {
 // behave identically to an ordinary one's, including real free-list reuse.
 func TestDurableHeadUsesNormalSeriesStore(t *testing.T) {
 	dir := t.TempDir()
-	dh, err := CreateDurableHead(dir, 4, 1, 8)
+	// Single shard: reuse is confined to within a shard (see seriesShard's doc
+	// comment in head.go), so both series below must land in the same shard's
+	// arena for this test's premise (second series reuses the first's freed
+	// slot) to hold at all.
+	dh, err := CreateDurableHeadWithShards(dir, 4, 1, 8, 1)
 	if err != nil {
 		t.Fatalf("CreateDurableHead: %v", err)
 	}
@@ -212,7 +216,8 @@ func TestDurableHeadUsesNormalSeriesStore(t *testing.T) {
 	if _, err := app.Append(0, l2, base, 1); err != nil {
 		t.Fatalf("Append(second series): %v", err)
 	}
-	if dh.series.AllocHits == 0 {
+	shard, _ := dh.shardFor(0)
+	if shard.series.AllocHits == 0 {
 		t.Fatal("AllocHits = 0 - durable head's SeriesStore isn't reusing freed regions like an ordinary one would")
 	}
 }
@@ -302,7 +307,9 @@ func TestDurableHeadTruncateThenFlush(t *testing.T) {
 // covers the sharper case of an already-flushed series moving into a reused slot.)
 func TestDurableHeadSurvivesCrossSeriesReuse(t *testing.T) {
 	dir := t.TempDir()
-	dh, err := CreateDurableHead(dir, 4, 1, 8)
+	// Single shard: see TestDurableHeadUsesNormalSeriesStore's comment - A and B
+	// must share a shard's arena for B to reuse A's freed slot at all.
+	dh, err := CreateDurableHeadWithShards(dir, 4, 1, 8, 1)
 	if err != nil {
 		t.Fatalf("CreateDurableHead: %v", err)
 	}
@@ -329,8 +336,9 @@ func TestDurableHeadSurvivesCrossSeriesReuse(t *testing.T) {
 	if !ok || len(refA) != 1 {
 		t.Fatalf("series_a not found as expected: %v %v", refA, ok)
 	}
-	if dh.series.slotCap[refA[0]] <= initialSlotBytes {
-		t.Fatalf("series A slotCap = %d, expected growth past %d - test didn't force a real growSlot", dh.series.slotCap[refA[0]], initialSlotBytes)
+	shardA, localA := dh.shardFor(refA[0])
+	if shardA.series.slotCap[localA] <= initialSlotBytes {
+		t.Fatalf("series A slotCap = %d, expected growth past %d - test didn't force a real growSlot", shardA.series.slotCap[localA], initialSlotBytes)
 	}
 	if _, err := dh.Flush(); err != nil {
 		t.Fatalf("Flush after A's growth: %v", err)
@@ -347,10 +355,11 @@ func TestDurableHeadSurvivesCrossSeriesReuse(t *testing.T) {
 		t.Fatalf("series_b not found as expected: %v %v", refB, ok)
 	}
 
-	if dh.series.AllocHits == 0 {
+	shardB, localB := dh.shardFor(refB[0])
+	if shardB.series.AllocHits == 0 {
 		t.Fatal("AllocHits = 0 - B never actually reused A's freed region, this test proves nothing")
 	}
-	t.Logf("confirmed real reuse: B's slotOff=%d, A's current (grown) slotOff=%d, AllocHits=%d", dh.series.slotOff[refB[0]], dh.series.slotOff[refA[0]], dh.series.AllocHits)
+	t.Logf("confirmed real reuse: B's slotOff=%d, A's current (grown) slotOff=%d, AllocHits=%d", shardB.series.slotOff[localB], shardA.series.slotOff[localA], shardB.series.AllocHits)
 
 	if _, err := dh.Flush(); err != nil {
 		t.Fatalf("Flush after B: %v", err)
@@ -400,7 +409,9 @@ func TestDurableHeadSurvivesCrossSeriesReuse(t *testing.T) {
 // before the move, which is exactly what the mismatch check must catch.
 func TestDurableHeadSurvivesChainedReuse(t *testing.T) {
 	dir := t.TempDir()
-	dh, err := CreateDurableHead(dir, 4, 1, 8)
+	// Single shard: A, B, and C must all share one shard's arena for the chained
+	// reuse (A's slot -> B -> C) this test forces to be possible at all.
+	dh, err := CreateDurableHeadWithShards(dir, 4, 1, 8, 1)
 	if err != nil {
 		t.Fatalf("CreateDurableHead: %v", err)
 	}
@@ -442,9 +453,10 @@ func TestDurableHeadSurvivesChainedReuse(t *testing.T) {
 	if !ok || len(refB) != 1 {
 		t.Fatalf("series_b not found: %v %v", refB, ok)
 	}
-	bSlotBeforeGrowth := dh.series.slotOff[refB[0]]
-	if dh.series.slotCap[refB[0]] != initialSlotBytes {
-		t.Fatalf("series B already grown past its initial slot before the check below - test setup assumption broken (slotCap=%d)", dh.series.slotCap[refB[0]])
+	shardB, localB := dh.shardFor(refB[0])
+	bSlotBeforeGrowth := shardB.series.slotOff[localB]
+	if shardB.series.slotCap[localB] != initialSlotBytes {
+		t.Fatalf("series B already grown past its initial slot before the check below - test setup assumption broken (slotCap=%d)", shardB.series.slotCap[localB])
 	}
 
 	// ...then B itself grows past ITS slot, moving away and freeing that same
@@ -459,7 +471,7 @@ func TestDurableHeadSurvivesChainedReuse(t *testing.T) {
 		}
 		wantB = append(wantB, sample{ts, v})
 	}
-	if dh.series.slotOff[refB[0]] == bSlotBeforeGrowth {
+	if shardB.series.slotOff[localB] == bSlotBeforeGrowth {
 		t.Fatal("series B never actually moved - test didn't force the growth it needs")
 	}
 	if _, err := dh.Flush(); err != nil {
@@ -476,8 +488,9 @@ func TestDurableHeadSurvivesChainedReuse(t *testing.T) {
 	if !ok || len(refC) != 1 {
 		t.Fatalf("series_c not found: %v %v", refC, ok)
 	}
-	if dh.series.slotOff[refC[0]] != bSlotBeforeGrowth {
-		t.Fatalf("series C's slotOff = %d, want %d (B's vacated slot) - chained reuse wasn't forced as intended", dh.series.slotOff[refC[0]], bSlotBeforeGrowth)
+	shardC, localC := dh.shardFor(refC[0])
+	if shardC.series.slotOff[localC] != bSlotBeforeGrowth {
+		t.Fatalf("series C's slotOff = %d, want %d (B's vacated slot) - chained reuse wasn't forced as intended", shardC.series.slotOff[localC], bSlotBeforeGrowth)
 	}
 	t.Logf("confirmed chained reuse: A's original slot -> B -> C, all at offset %d", bSlotBeforeGrowth)
 
@@ -706,7 +719,9 @@ func TestDurableHeadCompactShrinksFile(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	arenaPath := dir + "/" + fileArena
+	// The lone series ("up") always lands in shard 0 (ref 0 -> shard 0 regardless
+	// of shard count), so shard 0's arena file is the one that should shrink.
+	arenaPath := dir + "/" + shardFileName(fileArena, 0)
 	sizeBefore := fileSize(t, arenaPath)
 
 	// Drop the first 90% of samples - a realistic post-compaction truncation.

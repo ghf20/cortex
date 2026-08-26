@@ -240,7 +240,8 @@ func TestCompactHeadThenTruncateClosesTheLoop(t *testing.T) {
 
 	h.Truncate(blockMaxt + 1)
 
-	if got := decodeAll(t, h.series, ref); len(got) != 0 {
+	shard, localIdx := h.shardFor(ref)
+	if got := decodeAll(t, shard.series, localIdx); len(got) != 0 {
 		t.Fatalf("live head still has %d samples after Truncate, want 0", len(got))
 	}
 

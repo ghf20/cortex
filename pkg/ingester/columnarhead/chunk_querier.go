@@ -28,7 +28,10 @@ import (
 // (real Prometheus histogram chunks have counter-reset/recoding semantics this
 // package's own HistogramStore doesn't implement - see its doc comment).
 func (h *Head) ChunkQuerier(mint, maxt int64) (storage.ChunkQuerier, error) {
-	h.mu.RLock()
+	h.indexMu.RLock()
+	for _, shard := range h.shards {
+		shard.mu.RLock()
+	}
 	return &headChunkQuerier{h: h, mint: mint, maxt: maxt}, nil
 }
 
@@ -40,15 +43,18 @@ type headChunkQuerier struct {
 
 var _ storage.ChunkQuerier = (*headChunkQuerier)(nil)
 
-// Close releases the read lock taken by Head.ChunkQuerier - see headQuerier.Close's
-// doc comment; the same reasoning (whole-query-lifetime lock, idempotence
-// requirement) applies here identically.
+// Close releases every lock taken by Head.ChunkQuerier - see headQuerier.Close's doc
+// comment; the same reasoning (whole-query-lifetime locks, idempotence requirement,
+// fixed ascending/descending shard order) applies here identically.
 func (q *headChunkQuerier) Close() error {
 	if q.closed {
 		return nil
 	}
 	q.closed = true
-	q.h.mu.RUnlock()
+	for _, shard := range q.h.shards {
+		shard.mu.RUnlock()
+	}
+	q.h.indexMu.RUnlock()
 	return nil
 }
 
@@ -116,7 +122,7 @@ func (s *headChunkSeries) Labels() labels.Labels {
 }
 
 func (s *headChunkSeries) Iterator(_ chunks.Iterator) chunks.Iterator {
-	if s.h.histograms.Has(s.ref) {
+	if s.h.HasHistogram(s.ref) {
 		return &emptyChunksIterator{} // histogram chunks: stated gap, see type doc comment
 	}
 	return newSingleChunkIterator(s.h, s.ref, s.mint, s.maxt)
@@ -143,7 +149,7 @@ type singleChunkIterator struct {
 
 func newSingleChunkIterator(h *Head, ref uint32, mint, maxt int64) *singleChunkIterator {
 	var src floatSource = h.Iterator(ref)
-	if ooo := h.ooo.samples(ref); len(ooo) > 0 {
+	if ooo := h.OOOSamples(ref); len(ooo) > 0 {
 		src = newMergedIterator(src, ooo)
 	}
 	it := &floatSampleIterator{it: src, mint: mint, maxt: maxt}

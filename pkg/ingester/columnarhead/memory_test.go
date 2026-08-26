@@ -1,6 +1,7 @@
 package columnarhead
 
 import (
+	"fmt"
 	"runtime"
 	"testing"
 )
@@ -150,6 +151,106 @@ func TestMemoryPerSeries_Staggered(t *testing.T) {
 	t.Logf("heap: %.1f MB (%.1f B/series), total arena %.2f B/series, alloc hits=%d misses=%d "+
 		"(%.1f%% hit rate), %.2f B/series of fresh arena growth avoided by reuse",
 		float64(heapBytes)/1e6, bPerSeries, totalArenaBPerSeries, s.AllocHits, s.AllocMisses, hitRate, avoidedBPerSeries)
+}
+
+// TestShardedFreeListDensityCost measures, not assumes, the real per-series arena
+// cost of Phase A's locking design: splitting one shared free list into N
+// independent per-shard free lists (see seriesShard's doc comment in head.go for
+// why sharding requires this - reuse is confined to within a shard purely as a
+// byte-addressing fact). A freed region in one shard can never satisfy an alloc()
+// in another, so for the identical workload, more shards can only ever reduce the
+// free list's effective hit rate, never improve it - this reports the real delta
+// across shard counts instead of assuming a number, per CHECKLIST.md's locked-down
+// design ("start modest, measure contention/density rather than guess").
+//
+// Uses the same staggered create/append shape as TestMemoryPerSeries_Staggered -
+// TestMemoryPerSeries's create-everything-then-append-in-lockstep shape never gives
+// any free list (sharded or not) a chance to matter, so it wouldn't show a real
+// delta here even if one exists. Goes through the real Head/GetOrCreateSeries/
+// Append API (not raw SeriesStore.Create) since the sharded density cost is a
+// property of Head's ref-to-shard distribution, not of SeriesStore in isolation.
+func TestShardedFreeListDensityCost(t *testing.T) {
+	if testing.Short() {
+		t.Skip("100k-series heap measurement; skipped in -short")
+	}
+	for _, numShards := range []int{1, 8, defaultNumShards} {
+		t.Run(fmt.Sprintf("shards=%d", numShards), func(t *testing.T) {
+			measureShardedStaggered(t, numShards)
+		})
+	}
+}
+
+func measureShardedStaggered(t *testing.T, numShards int) {
+	const (
+		totalSeries  = 100_000
+		waves        = 20
+		perWave      = totalSeries / waves
+		seriesPerTgt = 200
+		roundsAfter  = 8
+	)
+
+	h := NewHeadWithShards(totalSeries, totalSeries/seriesPerTgt, totalSeries+100, numShards)
+	tgtFor := func(i int) TargetLabels {
+		return TargetLabels{Cluster: "c", Namespace: "n", Pod: fmt.Sprintf("p%d", i/seriesPerTgt), Container: "co", Node: "no", Job: "j"}
+	}
+
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	var refs []uint32
+	ts := int64(1700000000000)
+	for wave := 0; wave < waves; wave++ {
+		for w := 0; w < perWave; w++ {
+			i := wave*perWave + w
+			// (targetID, nameID) alone must be unique per series - i%400 cycles
+			// through 400 distinct metric name strings, and since seriesPerTgt
+			// (200) divides evenly into that cycle, every series within one
+			// target's 200-series block gets a distinct metric name, guaranteeing
+			// a genuinely new series every call (this test needs 100k DISTINCT
+			// series, not incidental dedup hits) without needing a local label -
+			// which would need 100k distinct symbol strings and overflow
+			// SeriesStore's uint16 localRef field (see ErrTooManySymbols).
+			ref, err := h.GetOrCreateSeries(tgtFor(i), fmt.Sprintf("metric_%d", i%400), "", "")
+			if err != nil {
+				t.Fatalf("wave %d, series %d: GetOrCreateSeries: %v", wave, w, err)
+			}
+			refs = append(refs, ref)
+		}
+		for i, ref := range refs {
+			if err := h.Append(ref, ts, valueFor(i, wave)); err != nil {
+				t.Fatalf("wave %d, series %d: Append: %v", wave, i, err)
+			}
+		}
+		ts += 15000
+	}
+	for r := 0; r < roundsAfter; r++ {
+		for i, ref := range refs {
+			if err := h.Append(ref, ts, valueFor(i, waves+r)); err != nil {
+				t.Fatalf("post-wave round %d, series %d: Append: %v", r, i, err)
+			}
+		}
+		ts += 15000
+	}
+
+	runtime.GC()
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	runtime.KeepAlive(h)
+	runtime.KeepAlive(refs)
+
+	var totalArenaBytes, allocHits, allocMisses uint64
+	for _, shard := range h.shards {
+		totalArenaBytes += uint64(len(shard.series.arena))
+		allocHits += shard.series.AllocHits
+		allocMisses += shard.series.AllocMisses
+	}
+	heapBytes := after.HeapAlloc - before.HeapAlloc
+	hitRate := float64(allocHits) / float64(allocHits+allocMisses) * 100
+	t.Logf("shards=%d: heap %.1f MB (%.1f B/series), total arena %.2f B/series, "+
+		"alloc hits=%d misses=%d (%.1f%% hit rate)",
+		numShards, float64(heapBytes)/1e6, float64(heapBytes)/totalSeries,
+		float64(totalArenaBytes)/totalSeries, allocHits, allocMisses, hitRate)
 }
 
 func valueFor(i, round int) float64 {

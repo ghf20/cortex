@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math"
 	"sync"
+	"sync/atomic"
 
 	"github.com/prometheus/prometheus/model/exemplar"
 	"github.com/prometheus/prometheus/model/histogram"
@@ -18,6 +19,15 @@ import (
 // natural next step if/when this gets wired into real per-tenant config.
 const defaultExemplarCapacity = 10_000
 
+// defaultNumShards is NewHead's shard count for SeriesStore/HistogramStore/oooStore
+// (see seriesShard's doc comment). Deliberately NOT copying real Prometheus's
+// stripeSeries sizing (DefaultStripeSize = 1<<14) - that's a bucket-array size for a
+// scheme where each "stripe" is just a mutex guarding a map; each of OUR shards is a
+// full SeriesStore with real (if small) fixed cost - a map, a mutex, parallel slices.
+// Started modest per CHECKLIST.md's locked-down locking design, to be tuned against
+// real contention measurements rather than copied from a different problem's number.
+const defaultNumShards = 32
+
 // ErrTooManySymbols is returned by GetOrCreateSeries if a metric name or local label
 // value would be the 65,537th distinct one interned - SeriesStore's nameID/localRef
 // fields are uint16 (see series.go's comment on why targetID is uint32 but these
@@ -26,12 +36,41 @@ const defaultExemplarCapacity = 10_000
 // beats silently truncating an id and corrupting an unrelated series' lookup.
 var ErrTooManySymbols = errors.New("columnarhead: nameID/localRef would overflow uint16")
 
-// Head ties a live symbol interner, a target slab, and a series store into an actual
-// ingest path: given raw label strings for a sample, resolve or create its target and
-// series, then append. This is the first thing in this package that looks like
-// something storage.Appender.Append could call - it is NOT wired into Cortex's
-// tsdbStore interface (pkg/ingester's Phase 1 work) yet; that integration is separate,
-// later work.
+// seriesShard is one partition of the head's per-series storage - see
+// CHECKLIST.md's Phase 4 locking design for the full reasoning behind this specific
+// split, summarized here: SeriesStore's shared arena is the one structure with a
+// free-list-reuse + shared-backing-array hazard (growSlot's append() can reallocate
+// the whole backing array, memmoving every existing byte - a race with ANY concurrent
+// reader, and a freed region can be reused by a DIFFERENT series while a stale reader
+// of the original owner is still mid-decode). Physically separating SeriesStore into
+// N independent shards (own arena, own free list, not a global pool split N ways)
+// confines reuse to within a shard purely as a byte-addressing fact - a freed region
+// in shard K's arena can only ever be reused by a series that also lives in shard K.
+// That collapses the stale-reader-vs-reuse hazard into a single-shard problem, which
+// shard K's own lock already solves: a reader holding shard K's lock excludes any
+// writer (growSlot/alloc/free) in shard K for the read's duration - the same safety
+// proof as the old single coarse lock, just narrowed to shard scope. No epoch
+// counters, reference counting, or reclamation scheme needed for this to be correct.
+//
+// HistogramStore and oooStore are bundled into the same shard (same lock, same local
+// index) purely for simplicity - HistogramStore already has no cross-series reuse
+// hazard of its own (independent per-series arenas, growHisto just appends; found
+// while building histogram persistence), so it didn't need partitioning to be safe,
+// but sharing SeriesStore's shard boundary keeps one lock covering a series'
+// complete state rather than inventing a second, different partitioning scheme.
+type seriesShard struct {
+	mu         sync.RWMutex
+	series     *SeriesStore
+	histograms *HistogramStore
+	ooo        *oooStore
+}
+
+// Head ties a live symbol interner, a target slab, and sharded per-series storage
+// into an actual ingest path: given raw label strings for a sample, resolve or
+// create its target and series, then append. This is the first thing in this
+// package that looks like something storage.Appender.Append could call - it is NOT
+// wired into Cortex's tsdbStore interface (pkg/ingester's Phase 1 work) yet; that
+// integration is separate, later work.
 //
 // Live lookup goes through plain Go maps (targetIndex, seriesIndex, and liveInterner's
 // internal index), not the static MPHF/SymbolTable built earlier in this package - see
@@ -41,30 +80,41 @@ var ErrTooManySymbols = errors.New("columnarhead: nameID/localRef would overflow
 // compact MPHF projection quoted elsewhere in CHECKLIST.md for the post-compaction
 // case. See TestHeadAtScale for the honest, measured total.
 //
-// Concurrency: mu guards every field below. It is deliberately ONE lock for the whole
-// Head, not real Prometheus's per-series striped locks - this package's arena/maps are
-// shared, process-wide structures (SeriesStore.growSlot can reallocate the ENTIRE
-// arena backing every series, not just one), so anything finer would need a real
-// redesign, not just a bigger lock table. The tradeoff is real and stated plainly, not
-// hidden: a single long-running query (which holds a read lock for its whole
-// lifetime - see Querier/ChunkQuerier below) blocks every append for its duration,
-// unlike real Prometheus's much more concurrent model.
+// Concurrency, per CHECKLIST.md's locked-down locking design (Phase A - writer/writer
+// parallelism across shards, NOT yet reader/writer concurrency):
+//   - indexMu guards symbols/targets/targetIndex/seriesIndex/namePostings/nextRef/
+//     metadata/lastST/exemplars - structures that are either inherently global
+//     (symbol interning needs centrally-coordinated id uniqueness to avoid two
+//     goroutines minting different ids for the same string) or small/infrequent
+//     enough that partitioning them wouldn't help. ALWAYS acquired before any
+//     shard's lock, never after, throughout this package - the one global lock
+//     ordering rule that makes multi-lock acquisition (Querier, Truncate) safe
+//     without a more general deadlock-avoidance scheme.
+//   - shards[ref%len(shards)] (local index ref/len(shards)) guards one partition's
+//     SeriesStore/HistogramStore/oooStore - see seriesShard's doc comment.
+//   - minTime/maxTime/oooTimeWindow are lock-free (atomic.Int64) - every append
+//     touches minTime/maxTime regardless of shard, so a mutex here would
+//     reintroduce a global bottleneck defeating the point of sharding.
 //
-// Most of Head's own methods (Append, AppendHistogram, GetOrCreateSeries,
-// SeriesLabels, Iterator, NumSeries, etc.) do NOT lock internally - they assume the
-// caller already holds mu, appropriately for a read or a write. The actual safe entry
-// points for concurrent use are Appender() (each storage.Appender call takes the write
-// lock for its own duration), Querier()/ChunkQuerier() (take the read lock at
-// construction, released by Close() - the entire query's lifetime, not just Select()),
-// and Truncate() (takes the write lock for its own call). Calling Head's other methods
-// directly, concurrently with any of these, is not safe - fine for single-threaded
-// test code, not for real concurrent ingest/query traffic.
+// Most of Head's own per-series READ methods (SeriesLabels, SeriesLabelValue,
+// Iterator, HistogramIterator, SeriesRefsForName) do NOT lock internally - they
+// assume the caller already holds indexMu and every shard's lock, appropriately.
+// The actual safe entry points for concurrent use are Appender() (each
+// storage.Appender call resolves and locks exactly what it touches, no more),
+// Querier()/ChunkQuerier() (take indexMu's read lock plus every shard's read lock,
+// in that fixed order, at construction - released by Close(), the entire query's
+// lifetime, not just Select() - this is why Phase A doesn't yet unlock reader/writer
+// concurrency: a query still blocks every shard's writers for its duration, same as
+// today, just narrowed from "every write" to "every write across every shard" which
+// is identical since a query can touch any shard), and Truncate() (takes every
+// shard's write lock in the same fixed order). Calling Head's read methods directly,
+// concurrently with any of these, is not safe - fine for single-threaded test code,
+// not for real concurrent ingest/query traffic.
 type Head struct {
-	mu sync.RWMutex
+	indexMu sync.RWMutex
 
 	symbols *liveInterner
 	targets *TargetStore
-	series  *SeriesStore
 
 	targetIndex map[[targetFields]uint32]uint32
 	seriesIndex map[seriesKey]uint32
@@ -79,27 +129,35 @@ type Head struct {
 	// structure a rebuild-at-compaction path would produce.
 	namePostings map[uint16][]uint32
 
-	metadata   *seriesMetadata
-	lastST     map[uint32]int64 // series ref -> most recent start-timestamp recorded via SetSTZeroSample
-	exemplars  *exemplarStorage
-	histograms *HistogramStore
+	// nextRef is the next global series ref to assign - series refs are dense,
+	// sequential, and permanent (0, 1, 2, ...), matching the pre-sharding design
+	// exactly; only WHICH shard stores a given ref's data changed. NumSeries()
+	// returns this directly rather than summing every shard's own count.
+	nextRef uint32
 
-	// ooo, oooTimeWindow: out-of-order float sample support (see ooo.go). A
-	// sample older than the in-order stream's own last timestamp is rejected
-	// with storage.ErrOutOfOrderSample/ErrDuplicateSampleForTimestamp unless it
-	// falls within oooTimeWindow of maxTime, in which case it lands in ooo
-	// instead - matching real Prometheus's own default-disabled (oooTimeWindow
-	// == 0) semantics until SetOOOTimeWindow is called with something positive.
-	ooo           *oooStore
-	oooTimeWindow int64
+	metadata  *seriesMetadata
+	lastST    map[uint32]int64 // series ref -> most recent start-timestamp recorded via SetSTZeroSample
+	exemplars *exemplarStorage
+
+	shards []*seriesShard
+
+	// oooTimeWindow: out-of-order float sample support (see ooo.go). A sample older
+	// than the in-order stream's own last timestamp is rejected with
+	// storage.ErrOutOfOrderSample/ErrDuplicateSampleForTimestamp unless it falls
+	// within oooTimeWindow of maxTime, in which case it lands in the relevant
+	// shard's oooStore instead - matching real Prometheus's own default-disabled
+	// (oooTimeWindow == 0) semantics until SetOOOTimeWindow is called with
+	// something positive. atomic, not indexMu-guarded: read on every single
+	// append regardless of shard, so a mutex here would be a new bottleneck.
+	oooTimeWindow atomic.Int64
 
 	// minTime, maxTime track the earliest and latest timestamp ever accepted
 	// (in-order or OOO) across the whole head - maintained incrementally in
-	// Append/AppendHistogram, not computed by a scan, matching real
-	// tsdb.Head's own MinTime/MaxTime. Sentinel values (math.MaxInt64/
-	// math.MinInt64) before any sample exists, mirroring real Prometheus's own
-	// convention for an empty head.
-	minTime, maxTime int64
+	// Append/AppendHistogram/SetSTZeroSample via lock-free CAS, not computed by a
+	// scan, matching real tsdb.Head's own MinTime/MaxTime. Sentinel values
+	// (math.MaxInt64/math.MinInt64) before any sample exists, mirroring real
+	// Prometheus's own convention for an empty head.
+	minTime, maxTime atomic.Int64
 }
 
 // TargetLabels is the fixed 6-label shared block every series belongs to (§3.1).
@@ -118,43 +176,91 @@ type seriesKey struct {
 	hasLocal bool
 }
 
-// NewHead returns an empty Head with capacity preallocated for the expected scale.
+// NewHead returns an empty Head with capacity preallocated for the expected scale,
+// using defaultNumShards shards. See NewHeadWithShards to control the shard count
+// directly (e.g. for tests that want to force cross-shard scenarios deterministically).
 func NewHead(expectedSeries, expectedTargets, expectedSymbols int) *Head {
-	return &Head{
+	return NewHeadWithShards(expectedSeries, expectedTargets, expectedSymbols, defaultNumShards)
+}
+
+// NewHeadWithShards is NewHead with an explicit shard count - see defaultNumShards'
+// doc comment for why this isn't sized like real Prometheus's stripeSeries.
+func NewHeadWithShards(expectedSeries, expectedTargets, expectedSymbols, numShards int) *Head {
+	if numShards < 1 {
+		numShards = 1
+	}
+	perShard := (expectedSeries + numShards - 1) / numShards
+	shards := make([]*seriesShard, numShards)
+	for i := range shards {
+		shards[i] = &seriesShard{
+			series:     NewSeriesStore(perShard),
+			histograms: NewHistogramStore(),
+			ooo:        newOOOStore(),
+		}
+	}
+	h := &Head{
 		symbols:      newLiveInterner(expectedSymbols),
 		targets:      NewTargetStore(expectedTargets),
-		series:       NewSeriesStore(expectedSeries),
 		targetIndex:  make(map[[targetFields]uint32]uint32, expectedTargets),
 		seriesIndex:  make(map[seriesKey]uint32, expectedSeries),
 		namePostings: make(map[uint16][]uint32),
 		metadata:     newSeriesMetadata(),
 		lastST:       make(map[uint32]int64),
 		exemplars:    newExemplarStorage(defaultExemplarCapacity),
-		histograms:   NewHistogramStore(),
-		ooo:          newOOOStore(),
-		minTime:      math.MaxInt64,
-		maxTime:      math.MinInt64,
+		shards:       shards,
 	}
+	h.minTime.Store(math.MaxInt64)
+	h.maxTime.Store(math.MinInt64)
+	return h
+}
+
+// shardFor returns the shard owning ref, and ref's local index within it - a series'
+// global ref maps to shards[ref % len(shards)], at local index ref / len(shards).
+// Lock-free: shards itself is fixed-size for the Head's whole life, only its
+// CONTENTS need the returned shard's own lock, which every caller of shardFor is
+// responsible for acquiring appropriately (read or write) before touching them.
+func (h *Head) shardFor(ref uint32) (*seriesShard, uint32) {
+	n := uint32(len(h.shards))
+	return h.shards[ref%n], ref / n
 }
 
 // SetOOOTimeWindow configures how far behind the head's current max timestamp
-// an out-of-order float sample may land and still be accepted (into the OOO
-// buffer, see ooo.go) rather than rejected outright. 0 (NewHead's default)
-// matches real Prometheus's own default-disabled behavior: any sample older
-// than the in-order stream's last timestamp is rejected with
+// an out-of-order float sample may land and still be accepted (into the relevant
+// shard's OOO buffer, see ooo.go) rather than rejected outright. 0 (NewHead's
+// default) matches real Prometheus's own default-disabled behavior: any sample
+// older than the in-order stream's last timestamp is rejected with
 // storage.ErrOutOfOrderSample, not buffered. This is the mechanism
 // tsdbStore.ApplyConfig would call into once real ingester wiring exists (see
 // CHECKLIST.md) - exposed as its own method now so it's independently testable
 // without that wiring.
 func (h *Head) SetOOOTimeWindow(w int64) {
-	h.oooTimeWindow = w
+	h.oooTimeWindow.Store(w)
 }
 
 // MinTime, MaxTime return the earliest/latest timestamp accepted by the head so
 // far (in-order or OOO), or (math.MaxInt64, math.MinInt64) if no sample has
 // ever been accepted - matching real tsdb.Head's own empty-head convention.
-func (h *Head) MinTime() int64 { return h.minTime }
-func (h *Head) MaxTime() int64 { return h.maxTime }
+func (h *Head) MinTime() int64 { return h.minTime.Load() }
+func (h *Head) MaxTime() int64 { return h.maxTime.Load() }
+
+// updateMinMaxTime folds ts into the head-wide MinTime/MaxTime via lock-free CAS
+// loops, called by every path that accepts a sample (float in-order/OOO, histogram,
+// ST-zero) so those two accessors reflect the whole head regardless of sample type
+// or which shard it landed in.
+func (h *Head) updateMinMaxTime(ts int64) {
+	for {
+		cur := h.minTime.Load()
+		if ts >= cur || h.minTime.CompareAndSwap(cur, ts) {
+			break
+		}
+	}
+	for {
+		cur := h.maxTime.Load()
+		if ts <= cur || h.maxTime.CompareAndSwap(cur, ts) {
+			break
+		}
+	}
+}
 
 // GetOrCreateSeries resolves target+metricName+(localName,localLabel) to a series
 // ref, creating the target, symbols, and series record as needed - repeated calls
@@ -168,7 +274,14 @@ func (h *Head) MaxTime() int64 { return h.maxTime }
 // name to reconstruct a faithful label set (see Head.SeriesLabels) - a real gap found
 // and fixed while building the Querier, since nothing needed to reconstruct full
 // labels before then.
+//
+// Self-locking (see Head's doc comment): takes indexMu for the whole call (symbol/
+// target interning and series dedup all need it regardless), plus the target shard's
+// lock briefly, only when actually creating a new series.
 func (h *Head) GetOrCreateSeries(target TargetLabels, metricName, localName, localLabel string) (uint32, error) {
+	h.indexMu.Lock()
+	defer h.indexMu.Unlock()
+
 	tRefs := [targetFields]uint32{
 		h.symbols.Intern(target.Cluster),
 		h.symbols.Intern(target.Namespace),
@@ -205,15 +318,44 @@ func (h *Head) GetOrCreateSeries(target TargetLabels, metricName, localName, loc
 	if ref, ok := h.seriesIndex[key]; ok {
 		return ref, nil
 	}
-	ref := h.series.Create(targetID, nameID, localNameID, localRef, hasLocal)
+
+	ref := h.nextRef
+	shard, localIdx := h.shardFor(ref)
+	shard.mu.Lock()
+	got := shard.series.Create(targetID, nameID, localNameID, localRef, hasLocal)
+	shard.mu.Unlock()
+	if got != localIdx {
+		// Would mean the global ref counter and a shard's own local numbering
+		// diverged - only possible if something bypassed GetOrCreateSeries to
+		// create a series directly, a programming error, not a runtime condition.
+		panic("columnarhead: shard local index diverged from global ref accounting")
+	}
+
+	h.nextRef++
 	h.seriesIndex[key] = ref
 	h.namePostings[nameID] = append(h.namePostings[nameID], ref)
 	return ref, nil
 }
 
+// LookupSeriesRef returns the series ref for (target, metricName, localName,
+// localLabel) if it's already known, without creating anything - the self-locking
+// counterpart to lookupTarget+lookupSeries for callers (storage.GetRef,
+// AppendExemplar/UpdateMetadata's label-resolution fallback) that aren't already
+// holding indexMu themselves.
+func (h *Head) LookupSeriesRef(target TargetLabels, metricName, localName, localLabel string) (uint32, bool) {
+	h.indexMu.RLock()
+	defer h.indexMu.RUnlock()
+	tRefs, ok := h.lookupTarget(target)
+	if !ok {
+		return 0, false
+	}
+	return h.lookupSeries(tRefs, metricName, localName, localLabel)
+}
+
 // lookupTarget returns target's symbol-ref tuple and whether it's already known,
 // without creating anything - the read-only counterpart to GetOrCreateSeries's target
-// resolution, for storage.GetRef.
+// resolution. Not self-locking - callers must already hold indexMu (LookupSeriesRef
+// does; GetOrCreateSeries does).
 func (h *Head) lookupTarget(target TargetLabels) ([targetFields]uint32, bool) {
 	var tRefs [targetFields]uint32
 	for i, s := range [targetFields]string{
@@ -232,7 +374,8 @@ func (h *Head) lookupTarget(target TargetLabels) ([targetFields]uint32, bool) {
 }
 
 // lookupSeries returns the series ref for (tRefs, metricName, localName, localLabel)
-// and whether it's already known, without creating anything.
+// and whether it's already known, without creating anything. Not self-locking - see
+// lookupTarget.
 func (h *Head) lookupSeries(tRefs [targetFields]uint32, metricName, localName, localLabel string) (uint32, bool) {
 	targetID, ok := h.targetIndex[tRefs]
 	if !ok {
@@ -261,37 +404,32 @@ func (h *Head) lookupSeries(tRefs [targetFields]uint32, metricName, localName, l
 // in-order, out-of-order-but-acceptable, an allowed exact duplicate, or must be
 // rejected - see appendable's doc comment for the exact rules, which mirror
 // real Prometheus's own (see CHECKLIST.md's OOO scoping pass for the citations).
+//
+// Self-locking: takes ref's shard's write lock for the call - the one lock this
+// touches, since ref is already resolved (no indexMu needed).
 func (h *Head) Append(ref uint32, ts int64, v float64) error {
-	action, err := h.appendable(ref, ts, v)
+	shard, localIdx := h.shardFor(ref)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	action, err := h.appendable(shard, localIdx, ts, v)
 	switch action {
 	case appendReject:
 		return err
 	case appendSkip:
 		return nil
 	case appendOOO:
-		h.ooo.insert(ref, ts, v)
+		shard.ooo.insert(localIdx, ts, v)
 	default: // appendInOrder
-		if err := h.series.Append(ref, ts, v); err != nil {
+		if err := shard.series.Append(localIdx, ts, v); err != nil {
 			return err
 		}
 	}
 	h.updateMinMaxTime(ts)
-	if h.oooTimeWindow > 0 {
-		h.ooo.trim(ref, h.maxTime-h.oooTimeWindow)
+	if window := h.oooTimeWindow.Load(); window > 0 {
+		shard.ooo.trim(localIdx, h.maxTime.Load()-window)
 	}
 	return nil
-}
-
-// updateMinMaxTime folds ts into the head-wide MinTime/MaxTime, called by every
-// path that accepts a sample (float in-order/OOO, histogram, ST-zero) so those
-// two accessors reflect the whole head regardless of sample type.
-func (h *Head) updateMinMaxTime(ts int64) {
-	if ts < h.minTime {
-		h.minTime = ts
-	}
-	if ts > h.maxTime {
-		h.maxTime = ts
-	}
 }
 
 type appendAction int
@@ -303,8 +441,8 @@ const (
 	appendReject // err is set to the real storage sentinel the caller should see
 )
 
-// appendable decides how (ts, v) relates to ref's existing in-order float
-// stream, matching real Prometheus's own memSeries.appendable semantics
+// appendable decides how (ts, v) relates to (shard, localIdx)'s existing in-order
+// float stream, matching real Prometheus's own memSeries.appendable semantics
 // (vendor/.../tsdb/head_append.go) rather than inventing new ones:
 //   - no samples yet: always in-order.
 //   - ts strictly after the last in-order timestamp: in-order.
@@ -324,8 +462,10 @@ const (
 // the same single comparison), not exceeding it. An OOO sample landing on the
 // same timestamp as some non-latest in-order sample isn't specially detected
 // here, mirroring that real Prometheus doesn't detect it either.
-func (h *Head) appendable(ref uint32, ts int64, v float64) (appendAction, error) {
-	lastTS, lastBits, ok := h.series.LastSample(ref)
+//
+// Not self-locking - the caller (Append) already holds shard's lock.
+func (h *Head) appendable(shard *seriesShard, localIdx uint32, ts int64, v float64) (appendAction, error) {
+	lastTS, lastBits, ok := shard.series.LastSample(localIdx)
 	if !ok {
 		return appendInOrder, nil
 	}
@@ -338,10 +478,12 @@ func (h *Head) appendable(ref uint32, ts int64, v float64) (appendAction, error)
 		}
 		return appendReject, storage.NewDuplicateFloatErr(ts, math.Float64frombits(lastBits), v)
 	}
-	if h.oooTimeWindow > 0 && ts >= h.maxTime-h.oooTimeWindow {
+	maxTime := h.maxTime.Load()
+	window := h.oooTimeWindow.Load()
+	if window > 0 && ts >= maxTime-window {
 		return appendOOO, nil
 	}
-	if h.oooTimeWindow > 0 {
+	if window > 0 {
 		return appendReject, storage.ErrTooOldSample
 	}
 	return appendReject, storage.ErrOutOfOrderSample
@@ -350,18 +492,23 @@ func (h *Head) appendable(ref uint32, ts int64, v float64) (appendAction, error)
 // SeriesLabels reconstructs ref's full label set: the six target labels, __name__,
 // and the one optional extra label, in the shape splitLabels originally accepted -
 // the read-side inverse of GetOrCreateSeries's write-side resolution.
+//
+// Not self-locking - callers must already hold indexMu (for symbols/targets) and
+// ref's shard's lock (for series identity fields); Querier/ChunkQuerier hold both
+// for their whole lifetime.
 func (h *Head) SeriesLabels(ref uint32) labels.Labels {
-	tRefs := h.targets.Get(h.series.TargetID(ref))
+	shard, localIdx := h.shardFor(ref)
+	tRefs := h.targets.Get(shard.series.TargetID(localIdx))
 	b := labels.NewScratchBuilder(8)
-	b.Add(labels.MetricName, h.symbols.String(uint32(h.series.NameID(ref))))
+	b.Add(labels.MetricName, h.symbols.String(uint32(shard.series.NameID(localIdx))))
 	b.Add(labelCluster, h.symbols.String(tRefs[0]))
 	b.Add(labelNamespace, h.symbols.String(tRefs[1]))
 	b.Add(labelPod, h.symbols.String(tRefs[2]))
 	b.Add(labelContainer, h.symbols.String(tRefs[3]))
 	b.Add(labelNode, h.symbols.String(tRefs[4]))
 	b.Add(labelJob, h.symbols.String(tRefs[5]))
-	if h.series.HasLocal(ref) {
-		b.Add(h.symbols.String(uint32(h.series.LocalName(ref))), h.symbols.String(uint32(h.series.LocalRef(ref))))
+	if shard.series.HasLocal(localIdx) {
+		b.Add(h.symbols.String(uint32(shard.series.LocalName(localIdx))), h.symbols.String(uint32(shard.series.LocalRef(localIdx))))
 	}
 	b.Sort()
 	return b.Labels()
@@ -374,16 +521,19 @@ func (h *Head) SeriesLabels(ref uint32) labels.Labels {
 // paying full-reconstruction cost for every candidate, most of which won't even pass
 // - profiling showed SeriesLabels' builder+sort dominating a full scan's cost
 // (measured: >50% of CPU time - see CHECKLIST.md), which this directly targets.
+//
+// Not self-locking - see SeriesLabels.
 func (h *Head) SeriesLabelValue(ref uint32, name string) string {
+	shard, localIdx := h.shardFor(ref)
 	switch name {
 	case labels.MetricName:
-		return h.symbols.String(uint32(h.series.NameID(ref)))
+		return h.symbols.String(uint32(shard.series.NameID(localIdx)))
 	case labelCluster, labelNamespace, labelPod, labelContainer, labelNode, labelJob:
-		tRefs := h.targets.Get(h.series.TargetID(ref))
+		tRefs := h.targets.Get(shard.series.TargetID(localIdx))
 		return h.symbols.String(tRefs[targetLabelIndex(name)])
 	default:
-		if h.series.HasLocal(ref) && h.symbols.String(uint32(h.series.LocalName(ref))) == name {
-			return h.symbols.String(uint32(h.series.LocalRef(ref)))
+		if shard.series.HasLocal(localIdx) && h.symbols.String(uint32(shard.series.LocalName(localIdx))) == name {
+			return h.symbols.String(uint32(shard.series.LocalRef(localIdx)))
 		}
 		return ""
 	}
@@ -419,17 +569,25 @@ func targetLabelIndex(name string) int {
 var ErrSeriesNotFound = errors.New("columnarhead: series not found")
 
 // SetMetadata records m for the series at ref. Returns ErrSeriesNotFound if ref is out
-// of range for this Head.
+// of range for this Head. Self-locking (indexMu - metadata isn't sharded, see Head's
+// doc comment on why).
 func (h *Head) SetMetadata(ref uint32, m metadata.Metadata) error {
-	if ref >= uint32(h.series.NumSeries()) {
+	h.indexMu.Lock()
+	defer h.indexMu.Unlock()
+	if ref >= h.nextRef {
 		return ErrSeriesNotFound
 	}
 	h.metadata.set(ref, m)
 	return nil
 }
 
-// Metadata returns the metadata recorded for ref, if any.
+// Metadata returns the metadata recorded for ref, if any. Self-locking (indexMu) -
+// unlike the sharded per-series read methods, metadata isn't sharded, and this isn't
+// currently called from within an active Querier's already-held locks, so it's safe
+// (and simpler) for this one to lock itself rather than rely on a caller.
 func (h *Head) Metadata(ref uint32) (metadata.Metadata, bool) {
+	h.indexMu.RLock()
+	defer h.indexMu.RUnlock()
 	return h.metadata.get(ref)
 }
 
@@ -448,17 +606,29 @@ var ErrSTZeroSampleTooOld = errors.New("columnarhead: start-timestamp is not new
 // before the corresponding real sample's Append at timestamp t - see
 // ErrSTZeroSampleCollision/ErrSTZeroSampleTooOld for the two rejection cases
 // storage.StartTimestampAppender's contract documents.
+//
+// Self-locking: indexMu briefly (lastST isn't sharded - a small, low-frequency map),
+// then ref's shard's write lock for the actual encode.
 func (h *Head) SetSTZeroSample(ref uint32, t, st int64) error {
+	h.indexMu.Lock()
 	if st >= t {
+		h.indexMu.Unlock()
 		return ErrSTZeroSampleCollision
 	}
 	if last, ok := h.lastST[ref]; ok && st <= last {
+		h.indexMu.Unlock()
 		return ErrSTZeroSampleTooOld
 	}
-	if err := h.series.Append(ref, st, 0); err != nil {
+	h.lastST[ref] = st
+	h.indexMu.Unlock()
+
+	shard, localIdx := h.shardFor(ref)
+	shard.mu.Lock()
+	err := shard.series.Append(localIdx, st, 0)
+	shard.mu.Unlock()
+	if err != nil {
 		return err
 	}
-	h.lastST[ref] = st
 	h.updateMinMaxTime(st)
 	return nil
 }
@@ -467,41 +637,74 @@ func (h *Head) SetSTZeroSample(ref uint32, t, st int64) error {
 // NumSeries() the way SetMetadata/Append do: an out-of-range ref just means the
 // stored exemplar can never be retrieved by a real series, not a corruption risk
 // (exemplarStorage indexes by ref value only, never dereferences it into SeriesStore).
+// Self-locking (indexMu - exemplars aren't sharded, see Head's doc comment on why).
 func (h *Head) AppendExemplar(ref uint32, e exemplar.Exemplar) {
+	h.indexMu.Lock()
+	defer h.indexMu.Unlock()
 	h.exemplars.append(ref, e)
 }
 
 // Exemplars returns every currently retained exemplar for ref, oldest first.
+// Self-locking (indexMu) - see Metadata's doc comment for the same reasoning.
 func (h *Head) Exemplars(ref uint32) []exemplarEntry {
+	h.indexMu.RLock()
+	defer h.indexMu.RUnlock()
 	return h.exemplars.forSeries(ref)
 }
 
 // AppendHistogram encodes one histogram sample for the series at ref. See
 // HistogramStore's doc comment for what this does and does not support (stable
-// schema/zero-threshold/span layout only, no custom buckets).
+// schema/zero-threshold/span layout only, no custom buckets). Self-locking: ref's
+// shard's write lock for the call.
 func (h *Head) AppendHistogram(ref uint32, ts int64, hg *histogram.Histogram) error {
-	if err := h.histograms.Append(ref, ts, hg); err != nil {
+	shard, localIdx := h.shardFor(ref)
+	shard.mu.Lock()
+	err := shard.histograms.Append(localIdx, ts, hg)
+	shard.mu.Unlock()
+	if err != nil {
 		return err
 	}
 	h.updateMinMaxTime(ts)
 	return nil
 }
 
-// HistogramIterator returns an iterator over ref's encoded histogram samples.
+// HistogramIterator returns an iterator over ref's encoded histogram samples. Not
+// self-locking - see SeriesLabels.
 func (h *Head) HistogramIterator(ref uint32) *HistogramIterator {
-	return h.histograms.Iterator(ref)
+	shard, localIdx := h.shardFor(ref)
+	return shard.histograms.Iterator(localIdx)
 }
 
-// Iterator returns an iterator over ref's encoded samples.
+// Iterator returns an iterator over ref's encoded samples. Not self-locking - see
+// SeriesLabels.
 func (h *Head) Iterator(ref uint32) *Iterator {
-	return h.series.Iterator(ref)
+	shard, localIdx := h.shardFor(ref)
+	return shard.series.Iterator(localIdx)
+}
+
+// HasHistogram reports whether ref ever received a histogram sample - the read
+// path's series-type check (querier.go/chunk_querier.go, deciding between a float
+// and histogram iterator). Not self-locking - see SeriesLabels.
+func (h *Head) HasHistogram(ref uint32) bool {
+	shard, localIdx := h.shardFor(ref)
+	return shard.histograms.Has(localIdx)
+}
+
+// OOOSamples returns ref's current out-of-order float sample buffer, oldest first -
+// nil if ref has none (see ooo.go's oooStore.samples). Not self-locking - see
+// SeriesLabels.
+func (h *Head) OOOSamples(ref uint32) []oooSample {
+	shard, localIdx := h.shardFor(ref)
+	return shard.ooo.samples(localIdx)
 }
 
 // SeriesRefsForName returns every series ref with __name__ == metricName, and
 // whether metricName is known at all - the read path for design doc §3.4's
 // __name__-postings shortcut (see Querier.Select). A read-only lookup: unlike
 // GetOrCreateSeries, an unknown metricName is never interned as a side effect of
-// asking whether it exists (same reasoning as lookupTarget/lookupSeries).
+// asking whether it exists (same reasoning as lookupTarget/lookupSeries). Not
+// self-locking - callers must already hold indexMu (Querier/ChunkQuerier do, for
+// their whole lifetime).
 func (h *Head) SeriesRefsForName(metricName string) ([]uint32, bool) {
 	nameID32, ok := h.symbols.Lookup(metricName)
 	if !ok || nameID32 > math.MaxUint16 {
@@ -531,20 +734,32 @@ func (h *Head) SeriesRefsForName(metricName string) ([]uint32, bool) {
 // again - full removal of wholly-empty series from those structures is a further,
 // not-yet-built step.
 //
-// Takes the write lock for its whole call - a real entry point for concurrent use
-// (see Head's doc comment), since a real compaction goroutine calling this runs
-// concurrently with live append/query traffic.
+// Self-locking: takes every shard's write lock in ascending order (the same fixed
+// order Querier/ChunkQuerier use, so this can never deadlock against a concurrent
+// query) - a real entry point for concurrent use, since a real compaction goroutine
+// calling this runs concurrently with live append/query traffic. Does NOT take
+// indexMu - Truncate only touches shard-local series data, never symbols/targets/
+// dedup indexes.
 func (h *Head) Truncate(mint int64) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	n := uint32(h.series.NumSeries())
-	for ref := uint32(0); ref < n; ref++ {
-		h.series.Truncate(ref, mint)
-		h.histograms.Truncate(ref, mint)
+	for _, shard := range h.shards {
+		shard.mu.Lock()
+		n := uint32(shard.series.NumSeries())
+		for ref := uint32(0); ref < n; ref++ {
+			shard.series.Truncate(ref, mint)
+			shard.histograms.Truncate(ref, mint)
+		}
+		shard.mu.Unlock()
 	}
 }
 
 // NumSeries, NumTargets, NumSymbols report the head's current cardinality.
-func (h *Head) NumSeries() int  { return h.series.NumSeries() }
+// NumSeries self-locks indexMu briefly (nextRef lives there); NumTargets/NumSymbols
+// are NOT self-locking - callers must already hold indexMu (matches how these were
+// already used before sharding).
+func (h *Head) NumSeries() int {
+	h.indexMu.RLock()
+	defer h.indexMu.RUnlock()
+	return int(h.nextRef)
+}
 func (h *Head) NumTargets() int { return h.targets.NumTargets() }
 func (h *Head) NumSymbols() int { return h.symbols.NumSymbols() }

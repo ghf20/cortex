@@ -6,16 +6,81 @@ import (
 	"math"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 )
+
+// TestHeadShardWritesAreIndependent is the decisive test for Phase A's actual
+// point (see CHECKLIST.md's locked-down locking design): two series in DIFFERENT
+// shards must be appendable concurrently without blocking each other, even while
+// one shard is under a live write lock. TestHeadConcurrentAppendQueryTruncateCompact
+// already proves the sharded design doesn't crash or corrupt data under real
+// contention; this test proves the more specific claim the sharding was built for -
+// that a slow/blocked writer on one shard does NOT stall a writer on another - by
+// holding one shard's lock directly and confirming a different shard's Append still
+// completes immediately, while the SAME shard's Append (the control case) does not.
+func TestHeadShardWritesAreIndependent(t *testing.T) {
+	h := NewHeadWithShards(4, 1, 8, 2) // exactly 2 shards, so placement is deterministic
+	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
+	refA, err := h.GetOrCreateSeries(tgt, "series_a", "", "") // ref 0 -> shard 0
+	if err != nil {
+		t.Fatalf("GetOrCreateSeries(A): %v", err)
+	}
+	refB, err := h.GetOrCreateSeries(tgt, "series_b", "", "") // ref 1 -> shard 1
+	if err != nil {
+		t.Fatalf("GetOrCreateSeries(B): %v", err)
+	}
+	shardA, _ := h.shardFor(refA)
+	shardB, _ := h.shardFor(refB)
+	if shardA == shardB {
+		t.Fatal("test setup broken: series A and B landed in the same shard - shardFor's round-robin assignment changed")
+	}
+
+	shardA.mu.Lock()
+
+	// A different shard's Append must complete immediately - it must not be
+	// blocked by shard A's held lock.
+	doneB := make(chan error, 1)
+	go func() { doneB <- h.Append(refB, 1700000000000, 1) }()
+	select {
+	case err := <-doneB:
+		if err != nil {
+			t.Fatalf("Append to series B (different shard): %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Append to series B blocked on shard A's held lock - shards are not actually independent")
+	}
+
+	// Control case: Append to series A itself (the SAME, still-locked shard) must
+	// NOT complete while the lock is held - otherwise this test would only be
+	// proving shardFor's arithmetic, not that the lock actually excludes anyone.
+	doneA := make(chan error, 1)
+	go func() { doneA <- h.Append(refA, 1700000000000, 1) }()
+	select {
+	case <-doneA:
+		t.Fatal("Append to series A completed while shard A's lock was held - the lock isn't excluding concurrent writers")
+	case <-time.After(100 * time.Millisecond):
+		// Expected: still blocked.
+	}
+
+	shardA.mu.Unlock()
+	if err := <-doneA; err != nil {
+		t.Fatalf("Append to series A (after unlock): %v", err)
+	}
+}
 
 // TestHeadConcurrentAppendQueryTruncateCompact is the decisive check for Head's
 // locking: real concurrent traffic through every entry point Head's doc comment
 // claims is safe (Appender, Querier, Truncate, and CompactHead, which is built on
 // Querier) running simultaneously under -race, for long enough to actually exercise
 // contention, not just a token handful of goroutines that happen not to overlap.
+// With defaultNumShards=32 and numSeries=16, each series' writer goroutine lands in
+// its own distinct shard here, so this incidentally already exercises real
+// cross-shard writer traffic - see TestHeadShardWritesAreIndependent for the
+// narrower, decisive proof that shards are genuinely independent, not just "didn't
+// crash under load."
 //
 // Each series has exactly one writer goroutine, so despite arbitrary interleaving
 // with readers/Truncate/CompactHead, that series' own final state is fully

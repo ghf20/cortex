@@ -52,12 +52,13 @@ const (
 // (WAL buffering, commit/rollback, OOO checks, tombstones, duplicate detection,
 // exemplars, per-tenant limits) - stated plainly here rather than left implicit.
 //
-// Concurrency: each headAppender method below takes h's lock for its own call (see
-// Head's doc comment) - safe to call concurrently with other Appenders and with
-// Querier/ChunkQuerier, unlike calling Head's underlying methods (GetOrCreateSeries,
-// Append, etc.) directly. There is no cross-call transaction to protect (Commit is a
-// no-op, every Append is independently atomic already), so per-call locking is
-// sufficient - nothing here needs to hold the lock across multiple calls.
+// Concurrency: headAppender itself holds no lock - every method below calls straight
+// through to a self-locking Head method (GetOrCreateSeries, Append, LookupSeriesRef,
+// etc; see Head's doc comment on the shardFor/indexMu locking split), so it's safe to
+// call concurrently with other Appenders and with Querier/ChunkQuerier. There is no
+// cross-call transaction to protect (Commit is a no-op, every Append is independently
+// atomic already), so per-call locking inside Head is sufficient - nothing here needs
+// to hold a lock across multiple calls.
 func (h *Head) Appender(_ context.Context) storage.Appender {
 	return &headAppender{h: h}
 }
@@ -137,8 +138,6 @@ func splitLabels(l labels.Labels) (target TargetLabels, metricName, localName, l
 // offset by 1 (toExternalRef/toInternalRef) specifically to keep 0 reserved; Head and
 // SeriesStore's own internal uint32 refs stay 0-based and untouched everywhere else.
 func (a *headAppender) Append(ref storage.SeriesRef, l labels.Labels, t int64, v float64) (storage.SeriesRef, error) {
-	a.h.mu.Lock()
-	defer a.h.mu.Unlock()
 	if ref != 0 {
 		if internalRef, ok := toInternalRef(ref, a.h.NumSeries()); ok {
 			if err := a.h.Append(internalRef, t, v); err != nil {
@@ -170,13 +169,7 @@ func (a *headAppender) GetRef(lset labels.Labels, _ uint64) (storage.SeriesRef, 
 	if err != nil {
 		return 0, labels.EmptyLabels()
 	}
-	a.h.mu.RLock()
-	defer a.h.mu.RUnlock()
-	tRefs, ok := a.h.lookupTarget(target)
-	if !ok {
-		return 0, labels.EmptyLabels()
-	}
-	ref, ok := a.h.lookupSeries(tRefs, metricName, localName, localLabel)
+	ref, ok := a.h.LookupSeriesRef(target, metricName, localName, localLabel)
 	if !ok {
 		return 0, labels.EmptyLabels()
 	}
@@ -219,8 +212,6 @@ func (a *headAppender) Rollback() error { return nil }
 // ErrSeriesNotFound rather than silently creating a phantom series with no target/
 // metric labels behind it - same posture as UpdateMetadata.
 func (a *headAppender) AppendExemplar(ref storage.SeriesRef, l labels.Labels, e exemplar.Exemplar) (storage.SeriesRef, error) {
-	a.h.mu.Lock()
-	defer a.h.mu.Unlock()
 	if ref != 0 {
 		if internalRef, ok := toInternalRef(ref, a.h.NumSeries()); ok {
 			a.h.AppendExemplar(internalRef, e)
@@ -231,11 +222,7 @@ func (a *headAppender) AppendExemplar(ref storage.SeriesRef, l labels.Labels, e 
 	if err != nil {
 		return 0, err
 	}
-	tRefs, ok := a.h.lookupTarget(target)
-	if !ok {
-		return 0, ErrSeriesNotFound
-	}
-	internalRef, ok := a.h.lookupSeries(tRefs, metricName, localName, localLabel)
+	internalRef, ok := a.h.LookupSeriesRef(target, metricName, localName, localLabel)
 	if !ok {
 		return 0, ErrSeriesNotFound
 	}
@@ -252,8 +239,6 @@ func (a *headAppender) AppendHistogram(ref storage.SeriesRef, l labels.Labels, t
 	if h == nil {
 		return 0, ErrFloatHistogramUnsupported
 	}
-	a.h.mu.Lock()
-	defer a.h.mu.Unlock()
 	if ref != 0 {
 		if internalRef, ok := toInternalRef(ref, a.h.NumSeries()); ok {
 			if err := a.h.AppendHistogram(internalRef, t, h); err != nil {
@@ -294,8 +279,6 @@ func (a *headAppender) AppendHistogramSTZeroSample(storage.SeriesRef, labels.Lab
 // resolution on a stale/zero ref) before falling back to the read-only lookup path
 // GetRef also uses.
 func (a *headAppender) UpdateMetadata(ref storage.SeriesRef, l labels.Labels, m metadata.Metadata) (storage.SeriesRef, error) {
-	a.h.mu.Lock()
-	defer a.h.mu.Unlock()
 	if ref != 0 {
 		if internalRef, ok := toInternalRef(ref, a.h.NumSeries()); ok {
 			if err := a.h.SetMetadata(internalRef, m); err != nil {
@@ -308,11 +291,7 @@ func (a *headAppender) UpdateMetadata(ref storage.SeriesRef, l labels.Labels, m 
 	if err != nil {
 		return 0, err
 	}
-	tRefs, ok := a.h.lookupTarget(target)
-	if !ok {
-		return 0, ErrSeriesNotFound
-	}
-	internalRef, ok := a.h.lookupSeries(tRefs, metricName, localName, localLabel)
+	internalRef, ok := a.h.LookupSeriesRef(target, metricName, localName, localLabel)
 	if !ok {
 		return 0, ErrSeriesNotFound
 	}
@@ -327,8 +306,6 @@ func (a *headAppender) UpdateMetadata(ref storage.SeriesRef, l labels.Labels, m 
 // before the corresponding real sample) and records a synthetic zero sample at st.
 // Uses the same ref fast path as Append.
 func (a *headAppender) AppendSTZeroSample(ref storage.SeriesRef, l labels.Labels, t, st int64) (storage.SeriesRef, error) {
-	a.h.mu.Lock()
-	defer a.h.mu.Unlock()
 	if ref != 0 {
 		if internalRef, ok := toInternalRef(ref, a.h.NumSeries()); ok {
 			if err := a.h.SetSTZeroSample(internalRef, t, st); err != nil {

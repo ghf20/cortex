@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -48,6 +49,16 @@ import (
 // reproduces real data corruption after reload. Free-list reuse is therefore always
 // enabled - NewHead/NewSeriesStore are used directly, no separate durable variant.
 //
+// Sharded persistence (per CHECKLIST.md's Phase A locking design): each of Head's
+// shards owns a physically independent SeriesStore arena and HistogramStore (see
+// seriesShard's doc comment in head.go for why), so per-series flush tracking and
+// the arena/series-meta/histogram files it drives must ALSO be per-shard - one
+// shard's slotOff/generation numbering means nothing to another shard's arena. The
+// symbol table, target slab, metadata, and exemplars stay singular files: they live
+// under indexMu, not partitioned (see Head's doc comment on why). fileShardCount
+// records how many per-shard file sets exist, written once at creation, so
+// LoadDurableHead knows how many to open without guessing or probing the directory.
+//
 // Scope, stated plainly: metadata, exemplars, and histograms are all persisted now
 // (see encodeMetadataMap/encodeExemplarStorage/encodeHistogramStore) - only
 // start-timestamps are NOT. A crash loses them even if this were wired into the
@@ -59,23 +70,33 @@ const (
 	fileSymbolsBlob    = "symbols_blob.bin"
 	fileSymbolsOffsets = "symbols_offsets.bin"
 	fileTargets        = "targets.bin"
-	fileArena          = "arena.bin"
-	fileSeriesMeta     = "series_meta.bin"
+	fileArena          = "arena.bin"       // per-shard: see shardFileName
+	fileSeriesMeta     = "series_meta.bin" // per-shard: see shardFileName
 	fileMetadata       = "metadata.bin"
 	fileExemplars      = "exemplars.bin"
-	fileHistograms     = "histograms.bin"
+	fileHistograms     = "histograms.bin" // per-shard: see shardFileName
 	fileHeadTimes      = "headtimes.bin"
+	fileShardCount     = "shardcount.bin"
 )
+
+// shardFileName returns base's per-shard variant, e.g. shardFileName(fileArena, 3)
+// == "arena_3.bin" - used for the three structures that are now sharded (arena,
+// series_meta, histograms), one file set per shard rather than one file total.
+func shardFileName(base string, shard int) string {
+	ext := filepath.Ext(base)
+	name := strings.TrimSuffix(base, ext)
+	return fmt.Sprintf("%s_%d%s", name, shard, ext)
+}
 
 // seriesMetaRecordSize is one series' fixed-width persisted record: targetID(4) +
 // nameID(2) + localName(2) + localRef(2) + hasLocal(1) + bitOff(2) + nSamples(2) +
 // slotOff(4) + slotCap(4) + val.lastBits(8) + val.leading(1) + val.trailing(1) +
 // ts.lastTS(8) + ts.lastDelta(8). Unlike the identity fields (targetID etc.), bitOff/
 // nSamples/slotOff/slotCap/val/ts mutate on every Append - persisted via a full
-// rewrite of this (small, O(numSeries) not O(arena size)) table on every Flush,
-// rather than tracked incrementally like the arena; simpler, and cheap at any
-// realistic series count (500k series here is ~24 MB - see TestHeadAtScale for how
-// fast a live head of that size already builds).
+// rewrite of this (small, O(shard's series count) not O(shard arena size)) table on
+// every Flush, rather than tracked incrementally like the arena; simpler, and cheap
+// at any realistic series count (500k series here is ~24 MB total across all shards
+// - see TestHeadAtScale for how fast a live head of that size already builds).
 const seriesMetaRecordSize = 4 + 2 + 2 + 2 + 1 + 2 + 2 + 4 + 4 + 8 + 1 + 1 + 8 + 8
 
 func encodeSeriesMetaRecord(s *SeriesStore, ref uint32, buf []byte) {
@@ -122,7 +143,8 @@ func decodeSeriesMetaRecord(buf []byte) (targetID uint32, nameID, localName, loc
 // SeriesStore's fixed-width records, metadata.Metadata's fields are strings, so
 // there's no fixed record size to exploit. Small and bounded (at most one entry per
 // series) either way, so a full rewrite on every Flush is the same acceptable
-// tradeoff series_meta.bin already makes, not a new one.
+// tradeoff series_meta.bin already makes, not a new one. Not sharded - metadata
+// lives under indexMu, keyed by the same global ref used everywhere else.
 func encodeMetadataMap(byRef map[uint32]metadata.Metadata) []byte {
 	var buf []byte
 	putStr := func(s string) {
@@ -189,6 +211,8 @@ func decodeMetadataMap(buf []byte) (map[uint32]metadata.Metadata, error) {
 // seriesRef(4) + ts(8) + value(8, float64 bits) + labelCount(2) + each label as
 // nameLen(2)+name+valueLen(2)+value. Same full-rewrite-per-Flush tradeoff as
 // metadata.bin - bounded by exemplar capacity (10,000 by default), not head size.
+// Not sharded - exemplars live under indexMu, keyed by the same global ref used
+// everywhere else.
 func encodeExemplarStorage(es *exemplarStorage) []byte {
 	var buf []byte
 	putU32 := func(v uint32) {
@@ -296,9 +320,9 @@ func decodeExemplarStorage(buf []byte) (*exemplarStorage, error) {
 	return es, nil
 }
 
-// encodeHistogramStore serializes every current histogram series as a
-// variable-length record: ref(4), schema(4), zeroThreshold(8), bitOff(4),
-// nSamples(4), ts.lastTS(8), ts.lastDelta(8), sum.lastBits(8)+leading(1)+
+// encodeHistogramStore serializes one shard's current histogram series as a
+// variable-length record: ref(4, LOCAL to this shard) , schema(4), zeroThreshold(8),
+// bitOff(4), nSamples(4), ts.lastTS(8), ts.lastDelta(8), sum.lastBits(8)+leading(1)+
 // trailing(1), lastZeroCount(8), lastCount(8), posSpans (count(4) + each
 // Offset(4)+Length(4)), negSpans (same shape), lastPosBuckets (count(4) + each
 // int64(8)), lastNegBuckets (same shape), then the series' USED arena prefix
@@ -371,7 +395,8 @@ func encodeHistogramStore(hst *HistogramStore) []byte {
 	return buf
 }
 
-// decodeHistogramStore is encodeHistogramStore's inverse.
+// decodeHistogramStore is encodeHistogramStore's inverse - refs decoded from buf
+// are LOCAL to whichever shard buf came from, same as encodeHistogramStore's input.
 func decodeHistogramStore(buf []byte) (*HistogramStore, error) {
 	hst := NewHistogramStore()
 	off := 0
@@ -539,7 +564,8 @@ func decodeHistogramStore(buf []byte) (*HistogramStore, error) {
 // encodeHeadTimes/decodeHeadTimes persist Head.minTime/maxTime as a tiny
 // fixed-size (16-byte) record, full-rewrite-per-Flush like the rest of this
 // file's non-append-only state - small and constant-size, so there's no
-// incremental-tracking question to even ask here.
+// incremental-tracking question to even ask here. Not sharded - minTime/maxTime
+// are head-wide (atomic, not indexMu- or shard-guarded - see Head's doc comment).
 func encodeHeadTimes(minTime, maxTime int64) []byte {
 	buf := make([]byte, 16)
 	binary.LittleEndian.PutUint64(buf[0:8], uint64(minTime))
@@ -564,6 +590,22 @@ func decodeHeadTimes(buf []byte) (minTime, maxTime int64, err error) {
 	return minTime, maxTime, nil
 }
 
+// durableShard is one shard's persistence bookkeeping - the sharded counterpart to
+// DurableHead's own flushedBytes/flushedSlotOff/flushedGeneration (this package's
+// pre-sharding version kept those directly on DurableHead; now each shard has an
+// independent arena/series-meta/histogram file set and independent per-series flush
+// state, since one shard's slotOff/generation numbering is meaningless in another
+// shard's arena - see seriesShard's doc comment in head.go).
+type durableShard struct {
+	arenaFile, metaFile, histogramsFile *os.File
+
+	// Per-series arena durability tracking within THIS shard - see DurableHead's
+	// pre-sharding doc comment (still accurate, just now per-shard instead of
+	// head-wide) for why this can't be a single high-water mark and what
+	// flushedGeneration catches that a byte-count/slotOff comparison alone can't.
+	flushedBytes, flushedSlotOff, flushedGeneration []uint32
+}
+
 // DurableHead wraps a Head with on-disk persistence for its append-only structures.
 // Not wired into the real ingest path - a standalone harness for measuring whether
 // the underlying mechanism (see this file's package-level doc comment) is viable.
@@ -571,35 +613,17 @@ type DurableHead struct {
 	*Head
 	dir string
 
-	blobFile, offsetFile, targetsFile, arenaFile, metaFile, metadataFile, exemplarsFile, histogramsFile, headTimesFile *os.File
+	blobFile, offsetFile, targetsFile, metadataFile, exemplarsFile, headTimesFile *os.File
 
 	// High-water marks: how much of each append-only structure is already durable.
 	// Units match what's being flushed - bytes for blob, element counts (multiplied
-	// by 4 on write) for offset/targets.
+	// by 4 on write) for offset/targets. Not sharded - see blobFile etc.'s doc
+	// comment on why symbols/targets stay singular.
 	blobFlushed, offsetFlushed, targetsFlushed int
 
-	// Per-series arena durability tracking - NOT a single arena-wide high-water
-	// mark. A series' slot is allocated with spare capacity up front (e.g. 16
-	// bytes on the first sample), and later samples fill in MORE of that SAME
-	// already-allocated region without ever growing len(arena) - a single global
-	// high-water mark would miss those in-place fills entirely (found by
-	// TestDurableHeadFlushIsIncremental: a second Flush reported 0 new bytes
-	// despite 5 real new samples, because they all landed within capacity
-	// reserved - and counted as "flushed" - by the FIRST Flush). flushedBytes[ref]
-	// is how many bytes of ref's CURRENT slot are already durable;
-	// flushedSlotOff[ref] is which slotOff that count is relative to - a growSlot
-	// move changes slotOff, at which point the new slot's bytes are entirely new
-	// from the file's perspective (even though they're a copy of already-durable
-	// data) and must be reflushed from scratch at their new location.
-	//
-	// flushedGeneration[ref] catches a second, distinct case a byte-count/slotOff
-	// comparison alone cannot: SeriesStore.Truncate rewrites a series' bytes from
-	// scratch AT THE SAME slotOff, and the resulting byte count can shrink or even
-	// coincidentally match what was there before - found the same way as the
-	// first case, by writing a test for exactly this interaction (Truncate then
-	// Flush) rather than assuming it worked once the incremental-flush fix above
-	// was in place.
-	flushedBytes, flushedSlotOff, flushedGeneration []uint32
+	// shards holds one durableShard per Head.shards entry, same index - see
+	// durableShard's doc comment.
+	shards []*durableShard
 
 	// stopAutoFlush is set by StartAutoFlush and cleared by stopping it - Close
 	// calls it automatically (see Close's doc comment) so a caller that forgets
@@ -608,17 +632,39 @@ type DurableHead struct {
 	stopAutoFlush func()
 }
 
+// singularFiles lists the files CreateDurableHead/LoadDurableHead handle once per
+// head, not once per shard (symbols/targets/metadata/exemplars/headtimes/shard
+// count) - factored out so the existence-check loop and the open loop can't drift
+// out of sync with each other.
+var singularFiles = []string{fileSymbolsBlob, fileSymbolsOffsets, fileTargets, fileMetadata, fileExemplars, fileHeadTimes, fileShardCount}
+
 // CreateDurableHead opens a brand-new DurableHead backed by files under dir (which
 // must not already contain a prior durable head - use LoadDurableHead to resume
-// one). Fails if any of the five files already exist, rather than silently
-// overwriting a prior head's data.
+// one), using defaultNumShards shards. See CreateDurableHeadWithShards to control
+// the shard count directly. Fails if any expected file already exists, rather than
+// silently overwriting a prior head's data.
 func CreateDurableHead(dir string, expectedSeries, expectedTargets, expectedSymbols int) (*DurableHead, error) {
-	for _, name := range []string{fileSymbolsBlob, fileSymbolsOffsets, fileTargets, fileArena, fileSeriesMeta, fileMetadata, fileExemplars, fileHistograms, fileHeadTimes} {
+	return CreateDurableHeadWithShards(dir, expectedSeries, expectedTargets, expectedSymbols, defaultNumShards)
+}
+
+// CreateDurableHeadWithShards is CreateDurableHead with an explicit shard count -
+// see NewHeadWithShards' doc comment for why a caller (typically a test forcing
+// deterministic cross-shard or same-shard scenarios) might want this directly.
+func CreateDurableHeadWithShards(dir string, expectedSeries, expectedTargets, expectedSymbols, numShards int) (*DurableHead, error) {
+	if numShards < 1 {
+		numShards = 1
+	}
+	expected := append([]string(nil), singularFiles...)
+	for i := 0; i < numShards; i++ {
+		expected = append(expected, shardFileName(fileArena, i), shardFileName(fileSeriesMeta, i), shardFileName(fileHistograms, i))
+	}
+	for _, name := range expected {
 		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
 			return nil, fmt.Errorf("columnarhead: %s already exists in %s - use LoadDurableHead", name, dir)
 		}
 	}
-	dh := &DurableHead{Head: NewHead(expectedSeries, expectedTargets, expectedSymbols), dir: dir}
+
+	dh := &DurableHead{Head: NewHeadWithShards(expectedSeries, expectedTargets, expectedSymbols, numShards), dir: dir}
 	var err error
 	if dh.blobFile, err = os.OpenFile(filepath.Join(dir, fileSymbolsBlob), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
 		return nil, err
@@ -629,23 +675,39 @@ func CreateDurableHead(dir string, expectedSeries, expectedTargets, expectedSymb
 	if dh.targetsFile, err = os.OpenFile(filepath.Join(dir, fileTargets), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
 		return nil, err
 	}
-	if dh.arenaFile, err = os.OpenFile(filepath.Join(dir, fileArena), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
-		return nil, err
-	}
-	if dh.metaFile, err = os.OpenFile(filepath.Join(dir, fileSeriesMeta), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
-		return nil, err
-	}
 	if dh.metadataFile, err = os.OpenFile(filepath.Join(dir, fileMetadata), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
 		return nil, err
 	}
 	if dh.exemplarsFile, err = os.OpenFile(filepath.Join(dir, fileExemplars), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
 		return nil, err
 	}
-	if dh.histogramsFile, err = os.OpenFile(filepath.Join(dir, fileHistograms), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
-		return nil, err
-	}
 	if dh.headTimesFile, err = os.OpenFile(filepath.Join(dir, fileHeadTimes), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
 		return nil, err
+	}
+
+	// numShards is fixed for this head's whole life (LoadDurableHead has no other
+	// way to know how many per-shard file sets to open), so it's written once here
+	// rather than derived from len(dh.Head.shards) - the write IS the source of
+	// truth on reload, not a redundant cache of it.
+	scBuf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(scBuf, uint32(numShards))
+	if err := os.WriteFile(filepath.Join(dir, fileShardCount), scBuf, 0o644); err != nil {
+		return nil, err
+	}
+
+	dh.shards = make([]*durableShard, numShards)
+	for i := 0; i < numShards; i++ {
+		ds := &durableShard{}
+		if ds.arenaFile, err = os.OpenFile(filepath.Join(dir, shardFileName(fileArena, i)), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
+			return nil, err
+		}
+		if ds.metaFile, err = os.OpenFile(filepath.Join(dir, shardFileName(fileSeriesMeta, i)), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
+			return nil, err
+		}
+		if ds.histogramsFile, err = os.OpenFile(filepath.Join(dir, shardFileName(fileHistograms, i)), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
+			return nil, err
+		}
+		dh.shards[i] = ds
 	}
 	return dh, nil
 }
@@ -659,7 +721,11 @@ func CreateDurableHead(dir string, expectedSeries, expectedTargets, expectedSymb
 // Reconstructs Head's derived indexes (targetIndex, seriesIndex, namePostings) by
 // replaying the loaded target/series records once, the same key construction
 // GetOrCreateSeries uses - these indexes are never themselves persisted, since
-// they're fully redundant with what's already in targets.bin/series_meta.bin.
+// they're fully redundant with what's already in targets.bin/series_meta_*.bin.
+// nextRef is recovered as the sum of every shard's local series count: refs are
+// assigned round-robin (shard = ref % numShards, localIdx = ref / numShards) by
+// GetOrCreateSeries, so that sum is always consistent with the round-robin
+// structure by construction - no separate nextRef needs to be persisted.
 func LoadDurableHead(dir string) (*DurableHead, error) {
 	blob, err := os.ReadFile(filepath.Join(dir, fileSymbolsBlob))
 	if err != nil {
@@ -679,17 +745,6 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 	if len(targetBytes)%4 != 0 {
 		return nil, fmt.Errorf("columnarhead: %s size %d not a multiple of 4", fileTargets, len(targetBytes))
 	}
-	arena, err := os.ReadFile(filepath.Join(dir, fileArena))
-	if err != nil {
-		return nil, err
-	}
-	metaBytes, err := os.ReadFile(filepath.Join(dir, fileSeriesMeta))
-	if err != nil {
-		return nil, err
-	}
-	if len(metaBytes)%seriesMetaRecordSize != 0 {
-		return nil, fmt.Errorf("columnarhead: %s size %d not a multiple of record size %d", fileSeriesMeta, len(metaBytes), seriesMetaRecordSize)
-	}
 	metadataBytes, err := os.ReadFile(filepath.Join(dir, fileMetadata))
 	if err != nil {
 		return nil, err
@@ -706,19 +761,26 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 	if err != nil {
 		return nil, fmt.Errorf("columnarhead: decode %s: %w", fileExemplars, err)
 	}
-	histogramsBytes, err := os.ReadFile(filepath.Join(dir, fileHistograms))
-	if err != nil {
-		return nil, err
-	}
-	histograms, err := decodeHistogramStore(histogramsBytes)
-	if err != nil {
-		return nil, fmt.Errorf("columnarhead: decode %s: %w", fileHistograms, err)
-	}
 	headTimesBytes, err := os.ReadFile(filepath.Join(dir, fileHeadTimes))
 	if err != nil {
 		return nil, err
 	}
-	numSeries := len(metaBytes) / seriesMetaRecordSize
+	minTime, maxTime, err := decodeHeadTimes(headTimesBytes)
+	if err != nil {
+		return nil, fmt.Errorf("columnarhead: decode %s: %w", fileHeadTimes, err)
+	}
+	shardCountBytes, err := os.ReadFile(filepath.Join(dir, fileShardCount))
+	if err != nil {
+		return nil, err
+	}
+	if len(shardCountBytes) != 4 {
+		return nil, fmt.Errorf("columnarhead: %s size %d, want 4", fileShardCount, len(shardCountBytes))
+	}
+	numShards := int(binary.LittleEndian.Uint32(shardCountBytes))
+	if numShards < 1 {
+		return nil, fmt.Errorf("columnarhead: %s says %d shards, want at least 1", fileShardCount, numShards)
+	}
+
 	numTargets := len(targetBytes) / 4 / targetFields
 
 	// len(offsetBytes)/4 - 1 is the real expected symbol count, but a never-
@@ -746,83 +808,129 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 		ts.refs = append(ts.refs, binary.LittleEndian.Uint32(targetBytes[i:i+4]))
 	}
 
-	ss := NewSeriesStore(numSeries)
-	ss.arena = arena
-	for ref := 0; ref < numSeries; ref++ {
-		rec := metaBytes[ref*seriesMetaRecordSize : (ref+1)*seriesMetaRecordSize]
-		targetID, nameID, localName, localRef, hasLocal, bitOff, nSamples, slotOff, slotCap, val, tst := decodeSeriesMetaRecord(rec)
-		ss.targetID = append(ss.targetID, targetID)
-		ss.nameID = append(ss.nameID, nameID)
-		ss.localName = append(ss.localName, localName)
-		ss.localRef = append(ss.localRef, localRef)
-		ss.hasLocal = append(ss.hasLocal, hasLocal)
-		ss.bitOff = append(ss.bitOff, bitOff)
-		ss.nSamples = append(ss.nSamples, nSamples)
-		ss.generation = append(ss.generation, 0) // not persisted - see generation's doc comment; 0 is a safe baseline since flushedGeneration below starts at 0 too
-		ss.slotOff = append(ss.slotOff, slotOff)
-		ss.slotCap = append(ss.slotCap, slotCap)
-		ss.val = append(ss.val, val)
-		ss.ts = append(ss.ts, tst)
-	}
+	shards := make([]*seriesShard, numShards)
+	dhShards := make([]*durableShard, numShards)
+	totalSeries := 0
+	for i := 0; i < numShards; i++ {
+		arena, err := os.ReadFile(filepath.Join(dir, shardFileName(fileArena, i)))
+		if err != nil {
+			return nil, err
+		}
+		metaBytes, err := os.ReadFile(filepath.Join(dir, shardFileName(fileSeriesMeta, i)))
+		if err != nil {
+			return nil, err
+		}
+		if len(metaBytes)%seriesMetaRecordSize != 0 {
+			return nil, fmt.Errorf("columnarhead: %s size %d not a multiple of record size %d", shardFileName(fileSeriesMeta, i), len(metaBytes), seriesMetaRecordSize)
+		}
+		histogramsBytes, err := os.ReadFile(filepath.Join(dir, shardFileName(fileHistograms, i)))
+		if err != nil {
+			return nil, err
+		}
+		histograms, err := decodeHistogramStore(histogramsBytes)
+		if err != nil {
+			return nil, fmt.Errorf("columnarhead: decode %s: %w", shardFileName(fileHistograms, i), err)
+		}
 
-	minTime, maxTime, err := decodeHeadTimes(headTimesBytes)
-	if err != nil {
-		return nil, fmt.Errorf("columnarhead: decode %s: %w", fileHeadTimes, err)
+		localN := len(metaBytes) / seriesMetaRecordSize
+		ss := NewSeriesStore(localN)
+		ss.arena = arena
+		var maxEnd uint32
+		for localRef := 0; localRef < localN; localRef++ {
+			rec := metaBytes[localRef*seriesMetaRecordSize : (localRef+1)*seriesMetaRecordSize]
+			targetID, nameID, localName, localRef2, hasLocal, bitOff, nSamples, slotOff, slotCap, val, tst := decodeSeriesMetaRecord(rec)
+			ss.targetID = append(ss.targetID, targetID)
+			ss.nameID = append(ss.nameID, nameID)
+			ss.localName = append(ss.localName, localName)
+			ss.localRef = append(ss.localRef, localRef2)
+			ss.hasLocal = append(ss.hasLocal, hasLocal)
+			ss.bitOff = append(ss.bitOff, bitOff)
+			ss.nSamples = append(ss.nSamples, nSamples)
+			ss.generation = append(ss.generation, 0) // not persisted - see generation's doc comment; 0 is a safe baseline since flushedGeneration below starts at 0 too
+			ss.slotOff = append(ss.slotOff, slotOff)
+			ss.slotCap = append(ss.slotCap, slotCap)
+			ss.val = append(ss.val, val)
+			ss.ts = append(ss.ts, tst)
+			if end := slotOff + slotCap; end > maxEnd {
+				maxEnd = end
+			}
+		}
+		// Flush only ever persists a series' USED bytes (ceil(bitOff/8)), not its
+		// full reserved slotCap - a series with unused headroom in its slot (the
+		// common case: slots grow geometrically, see initialSlotBytes/growSlot)
+		// therefore has fewer bytes on disk than its slotCap promises. A live
+		// (never-reloaded) head never hits this: alloc() always reserves the full
+		// slotCap's worth of real bytes up front. Reloaded from disk, though, a
+		// later Append into that same, already-reserved-but-unflushed headroom
+		// would index past len(ss.arena) and panic (found via
+		// TestDurableHeadSurvivesSimulatedCrash's post-reload append - not a
+		// sharding-specific bug, just far more likely to surface once sharding put
+		// few series in one arena, since the affected series is often the LAST
+		// and only one physically extending to the arena's end). Zero-pad up to
+		// the highest slotOff+slotCap any series in this shard reserved, matching
+		// alloc()'s own zero-fill of fresh/reused regions.
+		if uint32(len(ss.arena)) < maxEnd {
+			ss.arena = append(ss.arena, make([]byte, maxEnd-uint32(len(ss.arena)))...)
+		}
+		shards[i] = &seriesShard{series: ss, histograms: histograms, ooo: newOOOStore()}
+
+		flushedBytes := make([]uint32, localN)
+		flushedSlotOff := make([]uint32, localN)
+		for localRef := 0; localRef < localN; localRef++ {
+			flushedBytes[localRef] = (uint32(ss.bitOff[localRef]) + 7) / 8
+			flushedSlotOff[localRef] = ss.slotOff[localRef]
+		}
+		// flushedGeneration starts at all-zero, matching ss.generation's own reset
+		// to 0 on reload above - both start from the same baseline, so the
+		// comparison in Flush is correct from the first post-reload Flush onward.
+		dhShards[i] = &durableShard{flushedBytes: flushedBytes, flushedSlotOff: flushedSlotOff, flushedGeneration: make([]uint32, localN)}
+		totalSeries += localN
 	}
 
 	h := &Head{
 		symbols:      li,
 		targets:      ts,
-		series:       ss,
 		targetIndex:  make(map[[targetFields]uint32]uint32, numTargets),
-		seriesIndex:  make(map[seriesKey]uint32, numSeries),
+		seriesIndex:  make(map[seriesKey]uint32, totalSeries),
 		namePostings: make(map[uint16][]uint32),
 		metadata:     &seriesMetadata{byRef: metadataByRef},
 		lastST:       make(map[uint32]int64),
 		exemplars:    exemplars,
-		histograms:   histograms,
 		// ooo (the live OOO buffers) is NOT persisted - a real, stated gap: a
 		// crash loses samples still sitting in the OOO buffer, even ones that
-		// arrived well before the crash. Scoped this way deliberately, matching
-		// how histograms/metadata/exemplars each got their own persistence pass
+		// arrived well before the crash (each shard above already gets a fresh
+		// newOOOStore()). Scoped this way deliberately, matching how
+		// histograms/metadata/exemplars each got their own persistence pass
 		// rather than everything at once - not silently dropped, just not yet
 		// built. minTime/maxTime ARE persisted (headtimes.bin) since they're
 		// small, fixed-size, and cheap to get right immediately.
-		ooo:     newOOOStore(),
-		minTime: minTime,
-		maxTime: maxTime,
+		shards: shards,
 	}
+	h.nextRef = uint32(totalSeries)
+	h.minTime.Store(minTime)
+	h.maxTime.Store(maxTime)
+
 	for id := uint32(0); id < uint32(numTargets); id++ {
 		h.targetIndex[ts.Get(id)] = id
 	}
-	for ref := uint32(0); ref < uint32(numSeries); ref++ {
+	for ref := uint32(0); ref < h.nextRef; ref++ {
+		shard, localIdx := h.shardFor(ref)
+		ss := shard.series
 		key := seriesKey{
-			targetID:  ss.TargetID(ref),
-			nameID:    ss.NameID(ref),
-			localName: ss.LocalName(ref),
-			localRef:  ss.LocalRef(ref),
-			hasLocal:  ss.HasLocal(ref),
+			targetID:  ss.TargetID(localIdx),
+			nameID:    ss.NameID(localIdx),
+			localName: ss.LocalName(localIdx),
+			localRef:  ss.LocalRef(localIdx),
+			hasLocal:  ss.HasLocal(localIdx),
 		}
 		h.seriesIndex[key] = ref
 		h.namePostings[key.nameID] = append(h.namePostings[key.nameID], ref)
 	}
 
-	flushedBytes := make([]uint32, numSeries)
-	flushedSlotOff := make([]uint32, numSeries)
-	for ref := 0; ref < numSeries; ref++ {
-		flushedBytes[ref] = (uint32(ss.bitOff[ref]) + 7) / 8
-		flushedSlotOff[ref] = ss.slotOff[ref]
-	}
-	// flushedGeneration starts at all-zero, matching ss.generation's own reset to
-	// 0 on reload (see the reconstruction loop above) - both start from the same
-	// baseline, so the comparison in Flush is correct from the first post-reload
-	// Flush onward.
-	flushedGeneration := make([]uint32, numSeries)
-
 	dh := &DurableHead{
 		Head: h, dir: dir,
 		blobFlushed: len(blob), offsetFlushed: len(li.offset), targetsFlushed: numTargets * targetFields,
-		flushedBytes: flushedBytes, flushedSlotOff: flushedSlotOff, flushedGeneration: flushedGeneration,
+		shards: dhShards,
 	}
 	if dh.blobFile, err = os.OpenFile(filepath.Join(dir, fileSymbolsBlob), os.O_RDWR, 0o644); err != nil {
 		return nil, err
@@ -833,44 +941,58 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 	if dh.targetsFile, err = os.OpenFile(filepath.Join(dir, fileTargets), os.O_RDWR, 0o644); err != nil {
 		return nil, err
 	}
-	if dh.arenaFile, err = os.OpenFile(filepath.Join(dir, fileArena), os.O_RDWR, 0o644); err != nil {
-		return nil, err
-	}
-	if dh.metaFile, err = os.OpenFile(filepath.Join(dir, fileSeriesMeta), os.O_RDWR, 0o644); err != nil {
-		return nil, err
-	}
 	if dh.metadataFile, err = os.OpenFile(filepath.Join(dir, fileMetadata), os.O_RDWR, 0o644); err != nil {
 		return nil, err
 	}
 	if dh.exemplarsFile, err = os.OpenFile(filepath.Join(dir, fileExemplars), os.O_RDWR, 0o644); err != nil {
 		return nil, err
 	}
-	if dh.histogramsFile, err = os.OpenFile(filepath.Join(dir, fileHistograms), os.O_RDWR, 0o644); err != nil {
-		return nil, err
-	}
 	if dh.headTimesFile, err = os.OpenFile(filepath.Join(dir, fileHeadTimes), os.O_RDWR, 0o644); err != nil {
 		return nil, err
+	}
+	for i := 0; i < numShards; i++ {
+		if dhShards[i].arenaFile, err = os.OpenFile(filepath.Join(dir, shardFileName(fileArena, i)), os.O_RDWR, 0o644); err != nil {
+			return nil, err
+		}
+		if dhShards[i].metaFile, err = os.OpenFile(filepath.Join(dir, shardFileName(fileSeriesMeta, i)), os.O_RDWR, 0o644); err != nil {
+			return nil, err
+		}
+		if dhShards[i].histogramsFile, err = os.OpenFile(filepath.Join(dir, shardFileName(fileHistograms, i)), os.O_RDWR, 0o644); err != nil {
+			return nil, err
+		}
 	}
 	return dh, nil
 }
 
 // FlushStats reports what a Flush call actually wrote, for measuring the real
 // "no redundant WAL copy" claim - new arena/blob/target bytes should track new
-// samples/symbols/targets, not total live head size.
+// samples/symbols/targets, not total live head size. Arena/series-meta/histogram
+// figures are summed across every shard.
 type FlushStats struct {
 	NewBlobBytes, NewTargetBytes, NewArenaBytes int
-	SeriesMetaBytes                             int // always a full rewrite - see seriesMetaRecordSize's doc comment
+	SeriesMetaBytes                             int // always a full rewrite per shard - see seriesMetaRecordSize's doc comment
 	MetadataBytes                               int // always a full rewrite - see encodeMetadataMap's doc comment
 	ExemplarBytes                               int // always a full rewrite - see encodeExemplarStorage's doc comment
-	HistogramBytes                              int // always a full rewrite - see encodeHistogramStore's doc comment
+	HistogramBytes                              int // always a full rewrite per shard - see encodeHistogramStore's doc comment
 }
 
 // Flush durably persists everything appended since the last Flush (or since
-// creation) and fsyncs it. Takes Head's own write lock for the duration - a
-// concurrent Append must not race a Flush reading the same slices.
+// creation) and fsyncs it. Takes indexMu's write lock plus every shard's write
+// lock, in the same fixed ascending order Querier/Truncate use (see Head's doc
+// comment) - a concurrent Append must not race a Flush reading the same slices,
+// and the fixed order means Flush can never deadlock against a concurrent query
+// or Truncate.
 func (dh *DurableHead) Flush() (FlushStats, error) {
-	dh.mu.Lock()
-	defer dh.mu.Unlock()
+	dh.indexMu.Lock()
+	defer dh.indexMu.Unlock()
+	for _, shard := range dh.Head.shards {
+		shard.mu.Lock()
+	}
+	defer func() {
+		for _, shard := range dh.Head.shards {
+			shard.mu.Unlock()
+		}
+	}()
 
 	var stats FlushStats
 
@@ -906,57 +1028,76 @@ func (dh *DurableHead) Flush() (FlushStats, error) {
 		dh.targetsFlushed = len(dh.targets.refs)
 	}
 
-	n := dh.series.NumSeries()
-	for len(dh.flushedBytes) < n {
-		dh.flushedBytes = append(dh.flushedBytes, 0)
-		dh.flushedSlotOff = append(dh.flushedSlotOff, 0)
-		dh.flushedGeneration = append(dh.flushedGeneration, 0)
-	}
-	for ref := 0; ref < n; ref++ {
-		usedBytes := (uint32(dh.series.bitOff[ref]) + 7) / 8
-		slotOff := dh.series.slotOff[ref]
-		generation := dh.series.generation[ref]
-		already := dh.flushedBytes[ref]
-		if dh.flushedSlotOff[ref] != slotOff || dh.flushedGeneration[ref] != generation {
-			// Either growSlot moved this series since its last flush (the new
-			// slot's bytes are entirely new from the file's perspective, even
-			// though they're a copy of already-durable data at the old location),
-			// or Truncate rewrote it from scratch at the SAME slotOff (generation
-			// bumped) - a byte-count comparison alone cannot detect the second
-			// case, since truncation can shrink the count or even coincidentally
-			// leave it unchanged while the actual bytes underneath are entirely
-			// different. Either way, nothing at this slotOff is trustworthy
-			// as "already flushed" - reflush the whole current range.
-			already = 0
+	for i, shard := range dh.Head.shards {
+		ds := dh.shards[i]
+		ss := shard.series
+		n := ss.NumSeries()
+		for len(ds.flushedBytes) < n {
+			ds.flushedBytes = append(ds.flushedBytes, 0)
+			ds.flushedSlotOff = append(ds.flushedSlotOff, 0)
+			ds.flushedGeneration = append(ds.flushedGeneration, 0)
 		}
-		if usedBytes <= already {
-			continue
+		for localRef := 0; localRef < n; localRef++ {
+			usedBytes := (uint32(ss.bitOff[localRef]) + 7) / 8
+			slotOff := ss.slotOff[localRef]
+			generation := ss.generation[localRef]
+			already := ds.flushedBytes[localRef]
+			if ds.flushedSlotOff[localRef] != slotOff || ds.flushedGeneration[localRef] != generation {
+				// Either growSlot moved this series since its last flush (the new
+				// slot's bytes are entirely new from the file's perspective, even
+				// though they're a copy of already-durable data at the old location),
+				// or Truncate rewrote it from scratch at the SAME slotOff (generation
+				// bumped) - a byte-count comparison alone cannot detect the second
+				// case, since truncation can shrink the count or even coincidentally
+				// leave it unchanged while the actual bytes underneath are entirely
+				// different. Either way, nothing at this slotOff is trustworthy
+				// as "already flushed" - reflush the whole current range.
+				already = 0
+			}
+			if usedBytes <= already {
+				continue
+			}
+			newBytes := ss.arena[slotOff+already : slotOff+usedBytes]
+			if _, err := ds.arenaFile.WriteAt(newBytes, int64(slotOff+already)); err != nil {
+				return stats, fmt.Errorf("write %s: %w", shardFileName(fileArena, i), err)
+			}
+			stats.NewArenaBytes += len(newBytes)
+			ds.flushedBytes[localRef] = usedBytes
+			ds.flushedSlotOff[localRef] = slotOff
+			ds.flushedGeneration[localRef] = generation
 		}
-		newBytes := dh.series.arena[slotOff+already : slotOff+usedBytes]
-		if _, err := dh.arenaFile.WriteAt(newBytes, int64(slotOff+already)); err != nil {
-			return stats, fmt.Errorf("write %s: %w", fileArena, err)
+		metaBuf := make([]byte, n*seriesMetaRecordSize)
+		for localRef := 0; localRef < n; localRef++ {
+			encodeSeriesMetaRecord(ss, uint32(localRef), metaBuf[localRef*seriesMetaRecordSize:(localRef+1)*seriesMetaRecordSize])
 		}
-		stats.NewArenaBytes += len(newBytes)
-		dh.flushedBytes[ref] = usedBytes
-		dh.flushedSlotOff[ref] = slotOff
-		dh.flushedGeneration[ref] = generation
-	}
-	metaBuf := make([]byte, n*seriesMetaRecordSize)
-	for ref := 0; ref < n; ref++ {
-		encodeSeriesMetaRecord(dh.series, uint32(ref), metaBuf[ref*seriesMetaRecordSize:(ref+1)*seriesMetaRecordSize])
-	}
-	if len(metaBuf) > 0 {
-		if _, err := dh.metaFile.WriteAt(metaBuf, 0); err != nil {
-			return stats, fmt.Errorf("write %s: %w", fileSeriesMeta, err)
+		if len(metaBuf) > 0 {
+			if _, err := ds.metaFile.WriteAt(metaBuf, 0); err != nil {
+				return stats, fmt.Errorf("write %s: %w", shardFileName(fileSeriesMeta, i), err)
+			}
 		}
-	}
-	stats.SeriesMetaBytes = len(metaBuf)
+		stats.SeriesMetaBytes += len(metaBuf)
 
-	// Metadata's encoded size, unlike series_meta.bin's, is NOT guaranteed
+		// Full rewrite, same as metadata/exemplars - see encodeHistogramStore's
+		// doc comment for why (Truncate's delete-then-recreate means a ref's
+		// identity can change, not just its size, which a full rewrite handles
+		// for free).
+		histogramsBuf := encodeHistogramStore(shard.histograms)
+		if len(histogramsBuf) > 0 {
+			if _, err := ds.histogramsFile.WriteAt(histogramsBuf, 0); err != nil {
+				return stats, fmt.Errorf("write %s: %w", shardFileName(fileHistograms, i), err)
+			}
+		}
+		if err := ds.histogramsFile.Truncate(int64(len(histogramsBuf))); err != nil {
+			return stats, fmt.Errorf("truncate %s: %w", shardFileName(fileHistograms, i), err)
+		}
+		stats.HistogramBytes += len(histogramsBuf)
+	}
+
+	// Metadata's encoded size, unlike series_meta_*.bin's, is NOT guaranteed
 	// non-decreasing across flushes: entry count never shrinks (SetMetadata never
 	// deletes), but a value update for an EXISTING ref (a shorter Help string
 	// replacing a longer one) can shrink the total encoded size - so, unlike
-	// series_meta.bin, this needs an explicit Truncate after WriteAt or stale
+	// series_meta_*.bin, this needs an explicit Truncate after WriteAt or stale
 	// trailing bytes from a previous, longer encoding would linger in the file.
 	metadataBuf := encodeMetadataMap(dh.metadata.byRef)
 	if len(metadataBuf) > 0 {
@@ -983,26 +1124,16 @@ func (dh *DurableHead) Flush() (FlushStats, error) {
 	}
 	stats.ExemplarBytes = len(exemplarsBuf)
 
-	// Full rewrite, same as metadata/exemplars - see encodeHistogramStore's doc
-	// comment for why (Truncate's delete-then-recreate means a ref's identity can
-	// change, not just its size, which a full rewrite handles for free).
-	histogramsBuf := encodeHistogramStore(dh.histograms)
-	if len(histogramsBuf) > 0 {
-		if _, err := dh.histogramsFile.WriteAt(histogramsBuf, 0); err != nil {
-			return stats, fmt.Errorf("write %s: %w", fileHistograms, err)
-		}
-	}
-	if err := dh.histogramsFile.Truncate(int64(len(histogramsBuf))); err != nil {
-		return stats, fmt.Errorf("truncate %s: %w", fileHistograms, err)
-	}
-	stats.HistogramBytes = len(histogramsBuf)
-
-	headTimesBuf := encodeHeadTimes(dh.minTime, dh.maxTime)
+	headTimesBuf := encodeHeadTimes(dh.minTime.Load(), dh.maxTime.Load())
 	if _, err := dh.headTimesFile.WriteAt(headTimesBuf, 0); err != nil {
 		return stats, fmt.Errorf("write %s: %w", fileHeadTimes, err)
 	}
 
-	for _, f := range []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.arenaFile, dh.metaFile, dh.metadataFile, dh.exemplarsFile, dh.histogramsFile, dh.headTimesFile} {
+	files := []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.metadataFile, dh.exemplarsFile, dh.headTimesFile}
+	for _, ds := range dh.shards {
+		files = append(files, ds.arenaFile, ds.metaFile, ds.histogramsFile)
+	}
+	for _, f := range files {
 		if err := f.Sync(); err != nil {
 			return stats, fmt.Errorf("sync: %w", err)
 		}
@@ -1012,52 +1143,58 @@ func (dh *DurableHead) Flush() (FlushStats, error) {
 
 // Compact reclaims space left behind by Head.Truncate: unlike a conventional WAL
 // (multiple numbered segment files, old ones deleted after a checkpoint), this
-// design has one arena file that only ever grows via Flush - Truncate shrinks the
-// LIVE head, but nothing shrinks the DURABLE one to match, so disk usage grows
-// forever even though live memory doesn't. Compact closes that gap by rebuilding
-// the in-memory arena tightly (packing every series' current bytes back-to-back,
-// dropping truncated/abandoned space and slot headroom - the same technique
-// bench/05_compact_arena spiked in Phase 0, cited but not built here until now),
-// then reusing Flush unmodified to write the new, smaller layout, then truncating
-// the arena file down to match.
+// design has one arena file PER SHARD that only ever grows via Flush - Truncate
+// shrinks the LIVE head, but nothing shrinks the DURABLE one to match, so disk
+// usage grows forever even though live memory doesn't. Compact closes that gap by
+// rebuilding each shard's in-memory arena tightly (packing every one of that
+// shard's series' current bytes back-to-back, dropping truncated/abandoned space
+// and slot headroom - the same technique bench/05_compact_arena spiked in Phase 0,
+// cited but not built here until now), then reusing Flush unmodified to write the
+// new, smaller layout, then truncating each shard's arena file down to match.
 //
 // Reusing Flush for the actual write is deliberate, not a shortcut: after
 // rebuilding, every series' slotOff differs from what Flush last knew about, so
-// the existing slotOff-mismatch detection (see flushedSlotOff's doc comment)
+// the existing slotOff-mismatch detection (see durableShard's doc comment)
 // already forces a correct full reflush of every series' current bytes at their
 // new locations - no separate write path to keep in sync with Flush's.
 //
 // Real, stated cost: every series' slot becomes exactly as large as its current
 // content, with zero spare headroom - the very next Append to any series
 // immediately triggers a fresh growSlot, same tradeoff bench/05 already flagged
-// for full compaction generally. Takes Head's write lock for the rebuild step
-// only (Flush and the final truncate each take and release it again on their own),
-// so Compact blocks concurrent Appenders/Queriers similarly to a Flush of
-// comparable size, not for the whole Compact call end-to-end.
+// for full compaction generally. Locks one shard at a time for its own rebuild
+// step (not indexMu, not every shard at once - the rebuild only touches that
+// shard's own arena/slotOff/freeList), so Compact blocks concurrent
+// Appenders/Queriers similarly to a Flush of comparable size, not for the whole
+// Compact call end-to-end.
 func (dh *DurableHead) Compact() (FlushStats, error) {
-	dh.mu.Lock()
-	old := dh.series
-	newArena := make([]byte, 0, len(old.arena))
-	for ref := 0; ref < old.NumSeries(); ref++ {
-		usedBytes := (uint32(old.bitOff[ref]) + 7) / 8
-		newOff := uint32(len(newArena))
-		newArena = append(newArena, old.arena[old.slotOff[ref]:old.slotOff[ref]+usedBytes]...)
-		old.slotOff[ref] = newOff
-		old.slotCap[ref] = usedBytes
+	for _, shard := range dh.Head.shards {
+		shard.mu.Lock()
+		old := shard.series
+		newArena := make([]byte, 0, len(old.arena))
+		for localRef := 0; localRef < old.NumSeries(); localRef++ {
+			usedBytes := (uint32(old.bitOff[localRef]) + 7) / 8
+			newOff := uint32(len(newArena))
+			newArena = append(newArena, old.arena[old.slotOff[localRef]:old.slotOff[localRef]+usedBytes]...)
+			old.slotOff[localRef] = newOff
+			old.slotCap[localRef] = usedBytes
+		}
+		old.arena = newArena
+		old.freeList = make(map[uint32][]uint32)
+		shard.mu.Unlock()
 	}
-	old.arena = newArena
-	old.freeList = make(map[uint32][]uint32)
-	dh.mu.Unlock()
 
 	stats, err := dh.Flush()
 	if err != nil {
 		return stats, fmt.Errorf("compact: flush new layout: %w", err)
 	}
 
-	dh.mu.Lock()
-	defer dh.mu.Unlock()
-	if err := dh.arenaFile.Truncate(int64(len(dh.series.arena))); err != nil {
-		return stats, fmt.Errorf("compact: truncate arena file: %w", err)
+	for i, shard := range dh.Head.shards {
+		shard.mu.Lock()
+		arenaLen := len(shard.series.arena)
+		shard.mu.Unlock()
+		if err := dh.shards[i].arenaFile.Truncate(int64(arenaLen)); err != nil {
+			return stats, fmt.Errorf("compact: truncate arena file %s: %w", shardFileName(fileArena, i), err)
+		}
 	}
 	return stats, nil
 }
@@ -1073,14 +1210,13 @@ func (dh *DurableHead) Compact() (FlushStats, error) {
 // Close may end up calling it (e.g. an explicit Close followed by a deferred
 // stop()), and only the first call should actually close anything.
 //
-// Real flush timing is a genuine tradeoff, not a free choice: Flush takes Head's
-// write lock for its own duration (see Head's doc comment on why this is one
-// coarse lock, not per-series ones), so a longer interval means more new data
-// accumulates between flushes and each Flush call blocks concurrent
-// Appenders/Queriers for longer - a shorter interval trades that for more frequent
-// (individually cheaper) lock-holding and more fsync syscalls. See
-// TestFlushBlocksAppendersUnderLoad for real, measured numbers at a realistic
-// scale, not assumed ones.
+// Real flush timing is a genuine tradeoff, not a free choice: Flush takes indexMu
+// plus every shard's write lock for its own duration (see Head's doc comment on
+// the locking design), so a longer interval means more new data accumulates
+// between flushes and each Flush call blocks concurrent Appenders/Queriers for
+// longer - a shorter interval trades that for more frequent (individually
+// cheaper) lock-holding and more fsync syscalls. See TestFlushBlocksAppendersUnderLoad
+// for real, measured numbers at a realistic scale, not assumed ones.
 func (dh *DurableHead) StartAutoFlush(interval time.Duration, onFlush func(FlushStats, error)) (stop func()) {
 	if dh.stopAutoFlush != nil {
 		dh.stopAutoFlush()
@@ -1127,8 +1263,12 @@ func (dh *DurableHead) Close() error {
 		dh.stopAutoFlush()
 		dh.stopAutoFlush = nil
 	}
+	files := []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.metadataFile, dh.exemplarsFile, dh.headTimesFile}
+	for _, ds := range dh.shards {
+		files = append(files, ds.arenaFile, ds.metaFile, ds.histogramsFile)
+	}
 	var err error
-	for _, f := range []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.arenaFile, dh.metaFile, dh.metadataFile, dh.exemplarsFile, dh.histogramsFile, dh.headTimesFile} {
+	for _, f := range files {
 		if cerr := f.Close(); cerr != nil {
 			err = errors.Join(err, cerr)
 		}

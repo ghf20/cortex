@@ -17,17 +17,25 @@ import (
 // lazy behavior: the caller's iterator just yields nothing), only the samples
 // themselves are filtered, not series membership.
 //
-// Takes h's read lock for the ENTIRE query lifetime, released by Close() - not just
-// for Select() itself. This is necessary, not overcautious: Select's returned
-// SeriesSet/Series/Iterator all lazily read h's arena/maps well after Select returns,
-// and SeriesStore.growSlot can reallocate that arena's backing array out from under a
-// concurrent reader if a write were allowed to proceed mid-query. Callers MUST call
-// Close() (storage.Querier's own documented contract) - forgetting to is a real,
-// listed risk here specifically: an un-closed querier is not just a resource leak,
-// it wedges every future write against this Head forever. See Head's doc comment for
-// why this is one coarse lock rather than something finer-grained.
+// Takes h's indexMu read lock PLUS every shard's read lock, for the ENTIRE query
+// lifetime, released by Close() - not just for Select() itself. This is necessary,
+// not overcautious: Select's returned SeriesSet/Series/Iterator all lazily read h's
+// arena/maps well after Select returns, and SeriesStore.growSlot can reallocate that
+// arena's backing array out from under a concurrent reader if a write were allowed to
+// proceed mid-query. Callers MUST call Close() (storage.Querier's own documented
+// contract) - forgetting to is a real, listed risk here specifically: an un-closed
+// querier is not just a resource leak, it wedges every future write to EVERY shard
+// against this Head forever.
+//
+// All shard locks are acquired in ascending shard-index order, matching the fixed
+// order Truncate/Flush/Compact use (see Head's doc comment on the locking design in
+// CHECKLIST.md) - the same fixed order everywhere avoids a lock-ordering deadlock
+// between a Querier and a concurrent Truncate/Flush/Compact call.
 func (h *Head) Querier(mint, maxt int64) (storage.Querier, error) {
-	h.mu.RLock()
+	h.indexMu.RLock()
+	for _, shard := range h.shards {
+		shard.mu.RLock()
+	}
 	return &headQuerier{h: h, mint: mint, maxt: maxt}, nil
 }
 
@@ -39,7 +47,7 @@ type headQuerier struct {
 
 var _ storage.Querier = (*headQuerier)(nil)
 
-// Close releases the read lock taken by Head.Querier. Idempotent, matching
+// Close releases every lock taken by Head.Querier. Idempotent, matching
 // storage.Querier's documented contract ("safe to be called multiple times") - a
 // second RUnlock on an already-released sync.RWMutex would panic, so this guards
 // against exactly that.
@@ -48,7 +56,10 @@ func (q *headQuerier) Close() error {
 		return nil
 	}
 	q.closed = true
-	q.h.mu.RUnlock()
+	for _, shard := range q.h.shards {
+		shard.mu.RUnlock()
+	}
+	q.h.indexMu.RUnlock()
 	return nil
 }
 
@@ -224,11 +235,11 @@ func (s *headSeries) Labels() labels.Labels {
 // always allocates fresh, unlike real chunk iterators that support in-place reuse - a
 // real optimization opportunity, not attempted here.
 func (s *headSeries) Iterator(_ chunkenc.Iterator) chunkenc.Iterator {
-	if s.h.histograms.Has(s.ref) {
+	if s.h.HasHistogram(s.ref) {
 		return &histogramSampleIterator{it: s.h.HistogramIterator(s.ref), mint: s.mint, maxt: s.maxt}
 	}
 	var src floatSource = s.h.Iterator(s.ref)
-	if ooo := s.h.ooo.samples(s.ref); len(ooo) > 0 {
+	if ooo := s.h.OOOSamples(s.ref); len(ooo) > 0 {
 		src = newMergedIterator(src, ooo)
 	}
 	return &floatSampleIterator{it: src, mint: s.mint, maxt: s.maxt}
