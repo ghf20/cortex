@@ -183,6 +183,15 @@ type TSDBConfig struct {
 
 	// Posting Cache Configuration for TSDB
 	PostingsCache TSDBPostingsCacheConfig `yaml:"expanded_postings_cache" doc:"description=[EXPERIMENTAL] If enabled, ingesters will cache expanded postings when querying blocks. Caching can be configured separately for the head and compacted blocks."`
+
+	// UseColumnarHead selects the columnar head prototype (see
+	// pkg/ingester/columnarhead) in place of the real *tsdb.DB for newly opened
+	// per-tenant TSDBs. Prototype-stage, not for production use: no size-based
+	// block retention, no isolation, no shipper integration verified end-to-end
+	// yet. Existing TSDBs already on disk are unaffected either way - this only
+	// governs which backend a NEWLY created user TSDB directory uses; it is not
+	// a live migration path.
+	UseColumnarHead bool `yaml:"use_columnar_head"`
 }
 
 // RegisterFlags registers the TSDBConfig flags.
@@ -210,6 +219,7 @@ func (cfg *TSDBConfig) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&cfg.MaxExemplars, "blocks-storage.tsdb.max-exemplars", 0, "Deprecated (use the per-tenant max_exemplars limit instead) and will be removed in v1.24.0: the global fallback for the maximum number of exemplars stored in TSDB, used only when the per-tenant max_exemplars limit is 0. 0 or less means exemplars are disabled.")
 	f.BoolVar(&cfg.MemorySnapshotOnShutdown, "blocks-storage.tsdb.memory-snapshot-on-shutdown", false, "True to enable snapshotting of in-memory TSDB data on disk when shutting down.")
 	f.Int64Var(&cfg.OutOfOrderCapMax, "blocks-storage.tsdb.out-of-order-cap-max", tsdb.DefaultOutOfOrderCapMax, "[EXPERIMENTAL] Configures the maximum number of samples per chunk that can be out-of-order.")
+	f.BoolVar(&cfg.UseColumnarHead, "blocks-storage.tsdb.use-columnar-head", false, "[EXPERIMENTAL] Use the columnar head prototype instead of the real TSDB head for newly created per-tenant TSDBs. Prototype-stage: no size-based block retention, no isolation. Only affects newly opened TSDBs, not ones already on disk.")
 
 	cfg.PostingsCache.RegisterFlagsWithPrefix("blocks-storage.", f)
 }

@@ -1,6 +1,7 @@
 # Changelog
 
 ## master / unreleased
+* [FEATURE] Ingester: Add experimental `-blocks-storage.tsdb.use-columnar-head` flag to use a columnar, pointerless reimplementation of the TSDB head for newly created per-tenant TSDBs, instead of the real `*tsdb.DB`. Prototype-stage: no size-based block retention, no isolation. Only affects newly opened TSDBs, not ones already on disk. #TBD
 * [ENHANCEMENT] Query Frontend: Log `X-Grafana-User` header in query stats, slow query, and query request logs when Grafana's `send_user_header` is enabled. #7799
 * [FEATURE] Engine: Add `-querier.selector-batch-size` and `-ruler.selector-batch-size` flags to configure series batching in the Thanos promQL engine. 0 disables batching. #7763
 * [CHANGE] Remove deprecated CLI flags that have been no-ops for at least two minor releases. All of them were flag-only (no YAML config option) and already had no effect, so the only impact is that passing them now fails at startup. Remove them from your command lines before upgrading. #7790

@@ -5,13 +5,20 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/oklog/ulid/v2"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/promslog"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/stretchr/testify/require"
+	"github.com/weaveworks/common/user"
+
+	"github.com/cortexproject/cortex/pkg/ring"
+	"github.com/cortexproject/cortex/pkg/util/services"
+	"github.com/cortexproject/cortex/pkg/util/test"
 )
 
 func newTestColumnarheadStore(t *testing.T, dir string, blockDuration int64) *columnarheadTSDBStore {
@@ -296,4 +303,65 @@ func TestColumnarheadTSDBStorePostingsForMatchers(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("got %d postings, want 1", count)
 	}
+}
+
+// TestIngester_UseColumnarHead is the decisive end-to-end test for the
+// -blocks-storage.tsdb.use-columnar-head flag: a real *Ingester, constructed
+// through its normal createTSDB path with the flag set, must actually wire in a
+// *columnarheadTSDBStore (not silently fall back to the real *tsdb.DB), and real
+// Push/Querier traffic through it must round-trip correctly - the same bar
+// TestIngester_QueryStream holds the real backend to, just reached through
+// userTSDB.Querier directly rather than the gRPC streaming path.
+func TestIngester_UseColumnarHead(t *testing.T) {
+	cfg := defaultIngesterTestConfig(t)
+	cfg.BlocksStorageConfig.TSDB.UseColumnarHead = true
+
+	i, err := prepareIngesterWithBlocksStorage(t, cfg, prometheus.NewRegistry())
+	require.NoError(t, err)
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
+	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
+
+	test.Poll(t, 1*time.Second, ring.ACTIVE, func() any {
+		return i.lifecycler.GetState()
+	})
+
+	ctx := user.InjectOrgID(context.Background(), userID)
+	// All six fixed target labels set, not just __name__ - the shape
+	// columnarhead's appender.splitLabels/Head.SeriesLabels round-trip is
+	// actually built and tested for (see CHECKLIST.md's own note on the
+	// separate, pre-existing gap: SeriesLabels currently always emits these
+	// six labels even when empty, rather than omitting absent ones like real
+	// Prometheus label-set semantics require - not exercised by this test,
+	// which deliberately stays within the documented, tested shape).
+	lbls := seriesLabels("foo", "p")
+	req, _ := mockWriteRequest(t, lbls, 456, 123000)
+	_, err = i.Push(ctx, req)
+	require.NoError(t, err)
+
+	db, err := i.getTSDB(userID)
+	require.NoError(t, err)
+	require.NotNil(t, db)
+
+	// Confirm the columnar-head-backed store is actually the one wired in -
+	// not silently falling back to the real *tsdb.DB, which would make every
+	// other assertion here meaningless.
+	_, ok := db.db.(*columnarheadTSDBStore)
+	require.True(t, ok, "userTSDB.db is a %T, want *columnarheadTSDBStore", db.db)
+
+	require.Equal(t, uint64(1), db.NumSeries())
+
+	q, err := db.Querier(0, 200000)
+	require.NoError(t, err)
+	defer q.Close()
+
+	ss := q.Select(ctx, false, nil, labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "foo"))
+	require.True(t, ss.Next())
+	series := ss.At()
+	require.Equal(t, lbls, series.Labels())
+	it := series.Iterator(nil)
+	require.Equal(t, chunkenc.ValFloat, it.Next())
+	ts, v := it.At()
+	require.Equal(t, int64(123000), ts)
+	require.Equal(t, float64(456), v)
+	require.False(t, ss.Next())
 }

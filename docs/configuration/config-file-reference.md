@@ -3037,6 +3037,13 @@ tsdb:
     # CLI flag: -blocks-storage.expanded_postings_cache.head.lazy-matcher-complex-cost-ratio
     [lazy_matcher_complex_cost_ratio: <int> | default = 2]
 
+  # [EXPERIMENTAL] Use the columnar head prototype instead of the real TSDB head
+  # for newly created per-tenant TSDBs. Prototype-stage: no size-based block
+  # retention, no isolation. Only affects newly opened TSDBs, not ones already
+  # on disk.
+  # CLI flag: -blocks-storage.tsdb.use-columnar-head
+  [use_columnar_head: <boolean> | default = false]
+
 users_scanner:
   # Strategy to use to scan users. Supported values are: list, user_index.
   # CLI flag: -blocks-storage.users-scanner.strategy

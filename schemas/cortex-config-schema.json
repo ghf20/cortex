@@ -3627,6 +3627,12 @@
               "type": "number",
               "x-cli-flag": "blocks-storage.tsdb.stripe-size"
             },
+            "use_columnar_head": {
+              "default": false,
+              "description": "[EXPERIMENTAL] Use the columnar head prototype instead of the real TSDB head for newly created per-tenant TSDBs. Prototype-stage: no size-based block retention, no isolation. Only affects newly opened TSDBs, not ones already on disk.",
+              "type": "boolean",
+              "x-cli-flag": "blocks-storage.tsdb.use-columnar-head"
+            },
             "wal_compression_type": {
               "description": "TSDB WAL type. Supported values are: 'snappy', 'zstd' and '' (disable compression)",
               "type": "string",

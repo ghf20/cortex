@@ -752,12 +752,16 @@ func (u *userTSDB) blocksToDelete(blocks []*tsdb.Block) map[ulid.ULID]struct{} {
 	if u.db == nil {
 		return nil
 	}
-	// tsdb.DefaultBlocksToDelete is vendored and needs the concrete *tsdb.DB.
-	store, ok := u.db.(*nativeTSDBStore)
-	if !ok {
-		return nil
+	deletable := map[ulid.ULID]struct{}{}
+	// tsdb.DefaultBlocksToDelete's retention-duration/max-bytes policy is
+	// vendored and needs the concrete *tsdb.DB, so only the real backend gets
+	// it - a columnarhead-backed store has no size-based retention built yet
+	// (a real, stated gap, see columnarheadTSDBStore.ApplyConfig's own doc
+	// comment), not silently skipped. The age-based/shipped-block policy below
+	// is backend-agnostic and still applies to both.
+	if store, ok := u.db.(*nativeTSDBStore); ok {
+		deletable = tsdb.DefaultBlocksToDelete(store.db)(blocks)
 	}
-	deletable := tsdb.DefaultBlocksToDelete(store.db)(blocks)
 
 	now := time.Now().UnixMilli()
 	for _, b := range blocks {
@@ -3232,47 +3236,89 @@ func (i *Ingester) createTSDB(userID string) (*userTSDB, error) {
 		walCompressType = i.cfg.BlocksStorageConfig.TSDB.WALCompressionType
 	}
 
-	// Create a new user database
-	db, err := tsdb.Open(udir, logutil.GoKitLogToSlog(userLogger), tsdbPromReg, &tsdb.Options{
-		RetentionDuration:              i.cfg.BlocksStorageConfig.TSDB.Retention.Milliseconds(),
-		MinBlockDuration:               blockRanges[0],
-		MaxBlockDuration:               blockRanges[len(blockRanges)-1],
-		NoLockfile:                     true,
-		StripeSize:                     i.cfg.BlocksStorageConfig.TSDB.StripeSize,
-		HeadChunksWriteBufferSize:      i.cfg.BlocksStorageConfig.TSDB.HeadChunksWriteBufferSize,
-		WALCompression:                 walCompressType,
-		WALSegmentSize:                 i.cfg.BlocksStorageConfig.TSDB.WALSegmentSizeBytes,
-		SeriesLifecycleCallback:        userDB,
-		BlocksToDelete:                 userDB.blocksToDelete,
-		EnableExemplarStorage:          enableExemplars,
-		IsolationDisabled:              true,
-		MaxExemplars:                   maxExemplarsForUser,
-		HeadChunksWriteQueueSize:       i.cfg.BlocksStorageConfig.TSDB.HeadChunksWriteQueueSize,
-		EnableMemorySnapshotOnShutdown: i.cfg.BlocksStorageConfig.TSDB.MemorySnapshotOnShutdown,
-		OutOfOrderTimeWindow:           time.Duration(oooTimeWindow).Milliseconds(),
-		OutOfOrderCapMax:               i.cfg.BlocksStorageConfig.TSDB.OutOfOrderCapMax,
-		EnableOverlappingCompaction:    false, // Always let compactors handle overlapped blocks, e.g. OOO blocks.
-		BlockChunkQuerierFunc:          i.blockChunkQuerierFunc(userID),
-		BlockReloadInterval:            1 * time.Minute, // use default value
-	}, nil)
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to open TSDB: %s", udir)
-	}
-	db.DisableCompactions() // we will compact on our own schedule
-
-	// Run compaction before using this TSDB. If there is data in head that needs to be put into blocks,
-	// this will actually create the blocks. If there is no data (empty TSDB), this is a no-op, although
-	// local blocks compaction may still take place if configured.
-	level.Info(userLogger).Log("msg", "Running compaction after WAL replay")
-	err = db.Compact(context.TODO())
-	if err != nil {
-		if closeErr := db.Close(); closeErr != nil {
-			level.Warn(userLogger).Log("msg", "failed to close TSDB after compact failure", "err", closeErr)
+	// Create a new user database. Gated behind UseColumnarHead (Phase 7,
+	// CHECKLIST.md) since the columnar head is prototype-stage - a real,
+	// deliberate divergence path from the real *tsdb.DB one below, not a
+	// unified helper, so each backend's own construction stays easy to read
+	// (and to eventually delete, if the prototype is abandoned) on its own.
+	var userDBStore tsdbStore
+	if i.cfg.BlocksStorageConfig.TSDB.UseColumnarHead {
+		// expectedSeries/expectedTargets/expectedSymbols are only used the
+		// FIRST time a tenant's directory is created (columnarhead.
+		// CreateDurableHead) - a reload (columnarhead.LoadDurableHead) derives
+		// its own sizes from what's already on disk. Modest fixed
+		// preallocation hints, not a cardinality limit - growing past them
+		// costs extra allocation, not correctness.
+		const expectedSeries, expectedTargets, expectedSymbols = 1000, 100, 1000
+		store, err := newColumnarheadTSDBStore(
+			udir,
+			expectedSeries, expectedTargets, expectedSymbols,
+			blockRanges[0], blockRanges[len(blockRanges)-1],
+			userDB.blocksToDelete,
+			logutil.GoKitLogToSlog(userLogger),
+			tsdbPromReg,
+		)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to open columnar head TSDB: %s", udir)
 		}
-		return nil, errors.Wrapf(err, "failed to compact TSDB: %s", udir)
+		if err := store.ApplyConfig(&config.Config{StorageConfig: config.StorageConfig{TSDBConfig: &config.TSDBConfig{OutOfOrderTimeWindow: time.Duration(oooTimeWindow).Milliseconds()}}}); err != nil {
+			if closeErr := store.Close(); closeErr != nil {
+				level.Warn(userLogger).Log("msg", "failed to close columnar head TSDB after ApplyConfig failure", "err", closeErr)
+			}
+			return nil, errors.Wrapf(err, "failed to apply config to columnar head TSDB: %s", udir)
+		}
+
+		level.Info(userLogger).Log("msg", "Running compaction after columnar head reload")
+		if err := store.Compact(context.TODO()); err != nil {
+			if closeErr := store.Close(); closeErr != nil {
+				level.Warn(userLogger).Log("msg", "failed to close columnar head TSDB after compact failure", "err", closeErr)
+			}
+			return nil, errors.Wrapf(err, "failed to compact columnar head TSDB: %s", udir)
+		}
+		userDBStore = store
+	} else {
+		db, err := tsdb.Open(udir, logutil.GoKitLogToSlog(userLogger), tsdbPromReg, &tsdb.Options{
+			RetentionDuration:              i.cfg.BlocksStorageConfig.TSDB.Retention.Milliseconds(),
+			MinBlockDuration:               blockRanges[0],
+			MaxBlockDuration:               blockRanges[len(blockRanges)-1],
+			NoLockfile:                     true,
+			StripeSize:                     i.cfg.BlocksStorageConfig.TSDB.StripeSize,
+			HeadChunksWriteBufferSize:      i.cfg.BlocksStorageConfig.TSDB.HeadChunksWriteBufferSize,
+			WALCompression:                 walCompressType,
+			WALSegmentSize:                 i.cfg.BlocksStorageConfig.TSDB.WALSegmentSizeBytes,
+			SeriesLifecycleCallback:        userDB,
+			BlocksToDelete:                 userDB.blocksToDelete,
+			EnableExemplarStorage:          enableExemplars,
+			IsolationDisabled:              true,
+			MaxExemplars:                   maxExemplarsForUser,
+			HeadChunksWriteQueueSize:       i.cfg.BlocksStorageConfig.TSDB.HeadChunksWriteQueueSize,
+			EnableMemorySnapshotOnShutdown: i.cfg.BlocksStorageConfig.TSDB.MemorySnapshotOnShutdown,
+			OutOfOrderTimeWindow:           time.Duration(oooTimeWindow).Milliseconds(),
+			OutOfOrderCapMax:               i.cfg.BlocksStorageConfig.TSDB.OutOfOrderCapMax,
+			EnableOverlappingCompaction:    false, // Always let compactors handle overlapped blocks, e.g. OOO blocks.
+			BlockChunkQuerierFunc:          i.blockChunkQuerierFunc(userID),
+			BlockReloadInterval:            1 * time.Minute, // use default value
+		}, nil)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to open TSDB: %s", udir)
+		}
+		db.DisableCompactions() // we will compact on our own schedule
+
+		// Run compaction before using this TSDB. If there is data in head that needs to be put into blocks,
+		// this will actually create the blocks. If there is no data (empty TSDB), this is a no-op, although
+		// local blocks compaction may still take place if configured.
+		level.Info(userLogger).Log("msg", "Running compaction after WAL replay")
+		err = db.Compact(context.TODO())
+		if err != nil {
+			if closeErr := db.Close(); closeErr != nil {
+				level.Warn(userLogger).Log("msg", "failed to close TSDB after compact failure", "err", closeErr)
+			}
+			return nil, errors.Wrapf(err, "failed to compact TSDB: %s", udir)
+		}
+		userDBStore = newNativeTSDBStore(db)
 	}
 
-	userDB.db = newNativeTSDBStore(db)
+	userDB.db = userDBStore
 	// We set the limiter here because we don't want to limit
 	// series during WAL replay.
 	userDB.limiter = i.limiter
