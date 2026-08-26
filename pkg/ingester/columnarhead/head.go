@@ -1,6 +1,7 @@
 package columnarhead
 
 import (
+	"context"
 	"errors"
 	"math"
 	"sync"
@@ -11,6 +12,7 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/metadata"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb/index"
 )
 
 // defaultExemplarCapacity is a placeholder default for exemplarStorage's ring size,
@@ -712,6 +714,39 @@ func (h *Head) SeriesRefsForName(metricName string) ([]uint32, bool) {
 	}
 	refs, ok := h.namePostings[uint16(nameID32)]
 	return refs, ok
+}
+
+// PostingsForMatchers returns the postings list for series matching ms, time-
+// agnostic (not bounded to any [mint, maxt] range) - matching real
+// tsdb.IndexReader.Postings-family semantics, which have no time dimension of
+// their own. This is the narrow index-level query surface Cortex's
+// tsdbStore.PostingsForMatchers (pkg/ingester, Phase 7) needs for its label-set/
+// tracker cardinality counters, deliberately NOT a full tsdb.IndexReader (see that
+// interface's own doc comment in ingester.go for why: only 4 of its 11 methods are
+// ever actually used by real callers).
+//
+// Reuses Select's exact matcher-driven candidate-ref logic (querier.go's
+// candidateRefs/refMatchesAll - the same __name__-postings shortcut, same
+// per-candidate filtering) via a full-range Querier, rather than duplicating it -
+// just wraps the resulting refs as index.Postings instead of a storage.SeriesSet.
+// Self-locking: opens and closes its own Querier for the call, like AppendExemplar/
+// Metadata do for indexMu - not a longer-lived cursor.
+func (h *Head) PostingsForMatchers(_ context.Context, ms ...*labels.Matcher) (index.Postings, error) {
+	q, err := h.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		return nil, err
+	}
+	defer q.Close()
+	hq := q.(*headQuerier)
+
+	candidates, rest := hq.candidateRefs(ms)
+	refs := make([]storage.SeriesRef, 0, len(candidates))
+	for _, ref := range candidates {
+		if refMatchesAll(h, ref, rest) {
+			refs = append(refs, storage.SeriesRef(ref))
+		}
+	}
+	return index.NewListPostings(refs), nil
 }
 
 // Truncate drops every sample with ts < mint across every series, both float

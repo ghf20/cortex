@@ -96,6 +96,83 @@ func TestCompactHeadRoundTrip(t *testing.T) {
 	}
 }
 
+// TestCompactHeadIncludesOOOSamples is the decisive check behind CHECKLIST.md's
+// Phase 7 finding that CompactOOOHead can be a genuine no-op for a
+// columnarhead-backed tsdbStore, not a stub: unlike real Prometheus (which stores
+// OOO samples in a separate OOOHeadChunkReader needing its own compaction pass -
+// see tsdb.NewOOOCompactionHead), CompactHead already goes through Head.Querier,
+// and Querier's own headSeries.Iterator already merges a series' OOO buffer into
+// its in-order stream via mergedIterator (see ooo.go, querier.go) - so OOO samples
+// were ALREADY included in every compacted block this package has ever produced,
+// whether anyone verified it or not. This test verifies it directly: append
+// samples out of order (within the OOO window), compact, and confirm the real,
+// independently-read block contains everything in correct timestamp order.
+func TestCompactHeadIncludesOOOSamples(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	h.SetOOOTimeWindow(60_000)
+	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
+	ref, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	if err != nil {
+		t.Fatalf("GetOrCreateSeries: %v", err)
+	}
+
+	base := int64(1700000000000)
+	// Append in-order first (0, 30s), then an OOO sample landing at 15s - within
+	// the 60s window, so it's accepted into the OOO buffer, not rejected.
+	if err := h.Append(ref, base, 1); err != nil {
+		t.Fatalf("Append(0s): %v", err)
+	}
+	if err := h.Append(ref, base+30000, 3); err != nil {
+		t.Fatalf("Append(30s): %v", err)
+	}
+	if err := h.Append(ref, base+15000, 2); err != nil {
+		t.Fatalf("Append(15s, OOO): %v", err)
+	}
+	if got := h.OOOSamples(ref); len(got) != 1 {
+		t.Fatalf("test setup broken: OOOSamples(ref) = %v, want exactly 1 buffered OOO sample", got)
+	}
+	want := []sample{{base, 1}, {base + 15000, 2}, {base + 30000, 3}}
+
+	dir := t.TempDir()
+	blockDir, err := CompactHead(h, math.MinInt64, math.MaxInt64, dir, 2*60*60*1000, testLogger())
+	if err != nil {
+		t.Fatalf("CompactHead: %v", err)
+	}
+	if blockDir == "" {
+		t.Fatal("CompactHead returned an empty block dir for a head with real samples")
+	}
+
+	block, err := tsdb.OpenBlock(testLogger(), blockDir, chunkenc.NewPool(), nil)
+	if err != nil {
+		t.Fatalf("tsdb.OpenBlock: %v", err)
+	}
+	defer block.Close()
+
+	bq, err := tsdb.NewBlockQuerier(block, math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("tsdb.NewBlockQuerier: %v", err)
+	}
+	defer bq.Close()
+
+	ss := bq.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "up"))
+	if !ss.Next() {
+		t.Fatal("series not found in compacted block")
+	}
+	var got []sample
+	it := ss.At().Iterator(nil)
+	for it.Next() == chunkenc.ValFloat {
+		ts, v := it.At()
+		got = append(got, sample{ts, v})
+	}
+	if err := it.Err(); err != nil {
+		t.Fatalf("real chunkenc iterator error: %v", err)
+	}
+	if ss.Next() {
+		t.Fatal("matcher unexpectedly matched more than one series")
+	}
+	assertSamplesEqual(t, got, want)
+}
+
 // TestCompactHeadRespectsTimeRange checks that CompactHead's mint/maxt bounds are
 // genuinely applied, not silently ignored in favor of the head's full range: a
 // sample past maxt must not appear in the resulting block.
