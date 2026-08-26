@@ -1044,6 +1044,143 @@ func TestDurableHeadHistogramTruncateThenFlush(t *testing.T) {
 	}
 }
 
+// TestDurableHeadPersistsFloatHistograms closes a real, previously-latent gap in
+// encodeHistogramStore/decodeHistogramStore (found while reworking the format for
+// multi-segment layout support, CHECKLIST.md's Phase 3): the format never
+// serialized isFloat or any float-path field at all, so a FloatHistogram-typed
+// series decoded from a reload as int-typed (the zero value) with its
+// gorilla-XOR-encoded arena bytes misinterpreted as varbit-delta-encoded ones - no
+// existing durability test exercised a FloatHistogram series, so this went
+// uncaught since FloatHistogram support was first built. Mirrors
+// TestDurableHeadPersistsHistograms exactly, just with AppendHistogram's fh
+// argument instead of h.
+func TestDurableHeadPersistsFloatHistograms(t *testing.T) {
+	dir := t.TempDir()
+	dh, err := CreateDurableHead(dir, 2, 1, 8)
+	if err != nil {
+		t.Fatalf("CreateDurableHead: %v", err)
+	}
+
+	l := labels.FromStrings(labels.MetricName, "request_duration_seconds", "cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j")
+	app := dh.Appender(context.Background())
+	hists := []*histogram.FloatHistogram{
+		{
+			Schema: 0, ZeroThreshold: 0.001, ZeroCount: 2, Count: 10, Sum: 42.5,
+			PositiveSpans: []histogram.Span{{Offset: 0, Length: 2}}, PositiveBuckets: []float64{3, 4},
+		},
+		{
+			Schema: 0, ZeroThreshold: 0.001, ZeroCount: 3, Count: 15, Sum: 50.0,
+			PositiveSpans: []histogram.Span{{Offset: 0, Length: 2}}, PositiveBuckets: []float64{4, 5},
+		},
+	}
+	base := int64(1700000000000)
+	for i, h := range hists {
+		if _, err := app.AppendHistogram(0, l, base+int64(i)*15000, nil, h); err != nil {
+			t.Fatalf("AppendHistogram %d: %v", i, err)
+		}
+	}
+
+	stats, err := dh.Flush()
+	if err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if stats.HistogramBytes == 0 {
+		t.Fatal("Flush reported 0 histogram bytes after real AppendHistogram calls")
+	}
+
+	if err := dh.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reloaded, err := LoadDurableHead(dir)
+	if err != nil {
+		t.Fatalf("LoadDurableHead: %v", err)
+	}
+	defer reloaded.Close()
+
+	refs, ok := reloaded.SeriesRefsForName("request_duration_seconds")
+	if !ok || len(refs) != 1 {
+		t.Fatalf("series not found as expected: %v %v", refs, ok)
+	}
+	if !reloaded.HasFloatHistogram(refs[0]) {
+		t.Fatal("reloaded series lost its float-histogram type - decoded as int-typed")
+	}
+	it := reloaded.HistogramIterator(refs[0])
+	for i, want := range hists {
+		if !it.Next() {
+			t.Fatalf("HistogramIterator.Next() = false at sample %d, want true", i)
+		}
+		gotTS, gotH := it.AtFloat()
+		if gotTS != base+int64(i)*15000 {
+			t.Fatalf("sample %d: ts = %d, want %d", i, gotTS, base+int64(i)*15000)
+		}
+		floatHistEqual(t, gotH, want)
+	}
+	if it.Next() {
+		t.Fatal("HistogramIterator has more samples than expected after reload")
+	}
+}
+
+// TestDurableHeadPersistsHistogramLayoutChange confirms a multi-segment histogram
+// series (histoSegment's own doc comment - a genuine schema/zero-threshold/span
+// change mid-series) survives a Flush+reload with every segment intact, not just a
+// single-layout series - the durability format's own multi-segment encoding
+// (encodeHistogramStore/decodeHistogramStore), exercised for real rather than only
+// unit-tested against HistogramStore directly (TestHistogramStoreLayoutChange
+// StartsNewSegment).
+func TestDurableHeadPersistsHistogramLayoutChange(t *testing.T) {
+	dir := t.TempDir()
+	dh, err := CreateDurableHead(dir, 2, 1, 8)
+	if err != nil {
+		t.Fatalf("CreateDurableHead: %v", err)
+	}
+
+	l := labels.FromStrings(labels.MetricName, "request_duration_seconds", "cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j")
+	app := dh.Appender(context.Background())
+	base := int64(1700000000000)
+	hists := []*histogram.Histogram{
+		{Schema: 0, PositiveSpans: []histogram.Span{{Offset: 0, Length: 2}}, PositiveBuckets: []int64{1, 1}},
+		{Schema: 1, PositiveSpans: []histogram.Span{{Offset: 0, Length: 3}}, PositiveBuckets: []int64{2, 1, 1}}, // schema+span change -> new segment
+	}
+	for i, h := range hists {
+		if _, err := app.AppendHistogram(0, l, base+int64(i)*15000, h, nil); err != nil {
+			t.Fatalf("AppendHistogram %d: %v", i, err)
+		}
+	}
+
+	if _, err := dh.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if err := dh.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reloaded, err := LoadDurableHead(dir)
+	if err != nil {
+		t.Fatalf("LoadDurableHead: %v", err)
+	}
+	defer reloaded.Close()
+
+	refs, ok := reloaded.SeriesRefsForName("request_duration_seconds")
+	if !ok || len(refs) != 1 {
+		t.Fatalf("series not found as expected: %v %v", refs, ok)
+	}
+	it := reloaded.HistogramIterator(refs[0])
+	for i, want := range hists {
+		if !it.Next() {
+			t.Fatalf("HistogramIterator.Next() = false at sample %d, want true", i)
+		}
+		gotTS, gotH := it.At()
+		if gotTS != base+int64(i)*15000 {
+			t.Fatalf("sample %d: ts = %d, want %d", i, gotTS, base+int64(i)*15000)
+		}
+		histEqual(t, gotH, want)
+	}
+	if it.Next() {
+		t.Fatal("HistogramIterator has more samples than expected after reload")
+	}
+}
+
 // TestDurableHeadPersistsMinMaxTime confirms Head.MinTime/MaxTime survive a
 // simulated crash and reload (headtimes.bin) - added alongside OOO support,
 // since MinTime/MaxTime are also what OOO's window check depends on. Also

@@ -321,17 +321,33 @@ func decodeExemplarStorage(buf []byte) (*exemplarStorage, error) {
 }
 
 // encodeHistogramStore serializes one shard's current histogram series as a
-// variable-length record: ref(4, LOCAL to this shard) , schema(4), zeroThreshold(8),
-// bitOff(4), nSamples(4), ts.lastTS(8), ts.lastDelta(8), sum.lastBits(8)+leading(1)+
-// trailing(1), lastZeroCount(8), lastCount(8), posSpans (count(4) + each
-// Offset(4)+Length(4)), negSpans (same shape), lastPosBuckets (count(4) + each
-// int64(8)), lastNegBuckets (same shape), then the series' USED arena prefix
-// (byteLen(4) + that many bytes - not the full backing capacity, matching
-// Compact's tight-packing instinct for the float path).
+// variable-length record: ref(4, LOCAL to this shard), isFloat(1), numSegments(4),
+// then each segment in append order: schema(4), zeroThreshold(8), bitOff(4),
+// nSamples(4), ts.lastTS(8), ts.lastDelta(8), sum.lastBits(8)+leading(1)+
+// trailing(1), then EITHER lastZeroCount(8)+lastCount(8) (isFloat == false) OR
+// zeroCountVal+countVal as two encoded valueStates (isFloat == true - see
+// putValueState), posSpans (count(4) + each Offset(4)+Length(4)), negSpans (same
+// shape), then EITHER lastPosBuckets/lastNegBuckets (count(4) + each int64(8),
+// isFloat == false) OR posVal/negVal (count(4) + each encoded valueState, isFloat
+// == true), then the segment's USED arena prefix (byteLen(4) + that many bytes -
+// not the full backing capacity, matching Compact's tight-packing instinct for the
+// float path).
+//
+// A previously-latent gap fixed here, found while reworking this for multi-segment
+// layout support (CHECKLIST.md's Phase 3): this format never serialized isFloat or
+// any float-path field at all - encodeHistogramStore silently wrote only
+// lastZeroCount/lastCount/lastPosBuckets/lastNegBuckets (the int path's own state)
+// for EVERY series regardless of type, and decodeHistogramStore always produced an
+// int-typed (isFloat == false, zero value) histoSeries. A FloatHistogram-typed
+// series that survived a Flush+reload would decode with the wrong scratch fields
+// and, worse, have its gorilla-XOR-encoded arena bytes misinterpreted as
+// varbit-delta-encoded ones on the next read - garbled data, not a clean error.
+// Never caught before because no durability test exercised a FloatHistogram
+// series (TestDurableHeadPersistsFloatHistograms, new, closes that gap).
 //
 // Full rewrite on every Flush, a real, stated tradeoff unlike the float path's
 // incremental per-series tracking: HistogramStore's per-series arenas are
-// independent (no shared pool, no free-list reuse - growHisto just appends), so
+// independent (no shared pool, no free-list reuse - growHistoSeg just appends), so
 // the SeriesStore-style slotOff/generation bookkeeping doesn't apply the same
 // way, and Truncate's delete-then-recreate (see HistogramStore.Truncate) means a
 // ref's identity itself can change, not just its size - correctly handled for
@@ -339,9 +355,9 @@ func decodeExemplarStorage(buf []byte) (*exemplarStorage, error) {
 // full stop) at the cost of O(total histogram data) per flush instead of
 // O(new data). Native histograms are already this project's largest
 // unfinished item (see CHECKLIST.md's Phase 3) and HistogramStore itself is
-// already a stable-layout-only prototype, not the finished feature - matching
-// that scope here rather than building a second incremental-tracking scheme
-// this early is a deliberate choice, not an oversight.
+// already a not-fully-finished feature (no custom bucket boundaries yet) -
+// matching that scope here rather than building a second incremental-tracking
+// scheme this early is a deliberate choice, not an oversight.
 func encodeHistogramStore(hst *HistogramStore) []byte {
 	var buf []byte
 	putU32 := func(v uint32) {
@@ -355,42 +371,72 @@ func encodeHistogramStore(hst *HistogramStore) []byte {
 		buf = append(buf, b[:]...)
 	}
 	putI64 := func(v int64) { putU64(uint64(v)) }
+	putValueState := func(vs valueState) {
+		putU64(vs.lastBits)
+		buf = append(buf, vs.leading, vs.trailing)
+	}
 
 	for ref, s := range hst.series {
 		putU32(ref)
-		putU32(uint32(s.schema))
-		putU64(math.Float64bits(s.zeroThreshold))
-		putU32(s.bitOff)
-		putU32(s.nSamples)
-		putI64(s.ts.lastTS)
-		putI64(s.ts.lastDelta)
-		putU64(s.sum.lastBits)
-		buf = append(buf, s.sum.leading, s.sum.trailing)
-		putU64(s.lastZeroCount)
-		putU64(s.lastCount)
+		if s.isFloat {
+			buf = append(buf, 1)
+		} else {
+			buf = append(buf, 0)
+		}
+		putU32(uint32(len(s.segments)))
 
-		putU32(uint32(len(s.posSpans)))
-		for _, sp := range s.posSpans {
-			putU32(uint32(sp.Offset))
-			putU32(sp.Length)
-		}
-		putU32(uint32(len(s.negSpans)))
-		for _, sp := range s.negSpans {
-			putU32(uint32(sp.Offset))
-			putU32(sp.Length)
-		}
-		putU32(uint32(len(s.lastPosBuckets)))
-		for _, v := range s.lastPosBuckets {
-			putI64(v)
-		}
-		putU32(uint32(len(s.lastNegBuckets)))
-		for _, v := range s.lastNegBuckets {
-			putI64(v)
-		}
+		for _, seg := range s.segments {
+			putU32(uint32(seg.schema))
+			putU64(math.Float64bits(seg.zeroThreshold))
+			putU32(seg.bitOff)
+			putU32(seg.nSamples)
+			putI64(seg.ts.lastTS)
+			putI64(seg.ts.lastDelta)
+			putValueState(seg.sum)
 
-		usedBytes := (s.bitOff + 7) / 8
-		putU32(usedBytes)
-		buf = append(buf, s.arena[:usedBytes]...)
+			if s.isFloat {
+				putValueState(seg.zeroCountVal)
+				putValueState(seg.countVal)
+			} else {
+				putU64(seg.lastZeroCount)
+				putU64(seg.lastCount)
+			}
+
+			putU32(uint32(len(seg.posSpans)))
+			for _, sp := range seg.posSpans {
+				putU32(uint32(sp.Offset))
+				putU32(sp.Length)
+			}
+			putU32(uint32(len(seg.negSpans)))
+			for _, sp := range seg.negSpans {
+				putU32(uint32(sp.Offset))
+				putU32(sp.Length)
+			}
+
+			if s.isFloat {
+				putU32(uint32(len(seg.posVal)))
+				for _, vs := range seg.posVal {
+					putValueState(vs)
+				}
+				putU32(uint32(len(seg.negVal)))
+				for _, vs := range seg.negVal {
+					putValueState(vs)
+				}
+			} else {
+				putU32(uint32(len(seg.lastPosBuckets)))
+				for _, v := range seg.lastPosBuckets {
+					putI64(v)
+				}
+				putU32(uint32(len(seg.lastNegBuckets)))
+				for _, v := range seg.lastNegBuckets {
+					putI64(v)
+				}
+			}
+
+			usedBytes := (seg.bitOff + 7) / 8
+			putU32(usedBytes)
+			buf = append(buf, seg.arena[:usedBytes]...)
+		}
 	}
 	return buf
 }
@@ -426,137 +472,206 @@ func decodeHistogramStore(buf []byte) (*HistogramStore, error) {
 		v, err := getU64()
 		return int64(v), err
 	}
+	getByte := func() (byte, error) {
+		if err := need(1); err != nil {
+			return 0, err
+		}
+		v := buf[off]
+		off++
+		return v, nil
+	}
+	getValueState := func() (valueState, error) {
+		bits, err := getU64()
+		if err != nil {
+			return valueState{}, err
+		}
+		leading, err := getByte()
+		if err != nil {
+			return valueState{}, err
+		}
+		trailing, err := getByte()
+		if err != nil {
+			return valueState{}, err
+		}
+		return valueState{lastBits: bits, leading: leading, trailing: trailing}, nil
+	}
+	getSpans := func() ([]histogram.Span, error) {
+		n, err := getU32()
+		if err != nil {
+			return nil, err
+		}
+		if n == 0 {
+			return nil, nil
+		}
+		spans := make([]histogram.Span, n)
+		for i := range spans {
+			o, err := getU32()
+			if err != nil {
+				return nil, err
+			}
+			l, err := getU32()
+			if err != nil {
+				return nil, err
+			}
+			spans[i] = histogram.Span{Offset: int32(o), Length: l}
+		}
+		return spans, nil
+	}
+	getInt64s := func() ([]int64, error) {
+		n, err := getU32()
+		if err != nil {
+			return nil, err
+		}
+		if n == 0 {
+			return nil, nil
+		}
+		out := make([]int64, n)
+		for i := range out {
+			v, err := getI64()
+			if err != nil {
+				return nil, err
+			}
+			out[i] = v
+		}
+		return out, nil
+	}
+	getValueStates := func() ([]valueState, error) {
+		n, err := getU32()
+		if err != nil {
+			return nil, err
+		}
+		if n == 0 {
+			return nil, nil
+		}
+		out := make([]valueState, n)
+		for i := range out {
+			vs, err := getValueState()
+			if err != nil {
+				return nil, err
+			}
+			out[i] = vs
+		}
+		return out, nil
+	}
 
 	for off < len(buf) {
 		ref, err := getU32()
 		if err != nil {
 			return nil, err
 		}
-		schema, err := getU32()
+		isFloatByte, err := getByte()
 		if err != nil {
 			return nil, err
 		}
-		zeroThresholdBits, err := getU64()
-		if err != nil {
-			return nil, err
-		}
-		bitOff, err := getU32()
-		if err != nil {
-			return nil, err
-		}
-		nSamples, err := getU32()
-		if err != nil {
-			return nil, err
-		}
-		lastTS, err := getI64()
-		if err != nil {
-			return nil, err
-		}
-		lastDelta, err := getI64()
-		if err != nil {
-			return nil, err
-		}
-		sumBits, err := getU64()
-		if err != nil {
-			return nil, err
-		}
-		if err := need(2); err != nil {
-			return nil, err
-		}
-		leading, trailing := buf[off], buf[off+1]
-		off += 2
-		lastZeroCount, err := getU64()
-		if err != nil {
-			return nil, err
-		}
-		lastCount, err := getU64()
+		isFloat := isFloatByte != 0
+		numSegments, err := getU32()
 		if err != nil {
 			return nil, err
 		}
 
-		getSpans := func() ([]histogram.Span, error) {
-			n, err := getU32()
+		s := &histoSeries{isFloat: isFloat, segments: make([]*histoSegment, numSegments)}
+		for i := uint32(0); i < numSegments; i++ {
+			schema, err := getU32()
 			if err != nil {
 				return nil, err
 			}
-			if n == 0 {
-				return nil, nil
-			}
-			spans := make([]histogram.Span, n)
-			for i := range spans {
-				o, err := getU32()
-				if err != nil {
-					return nil, err
-				}
-				l, err := getU32()
-				if err != nil {
-					return nil, err
-				}
-				spans[i] = histogram.Span{Offset: int32(o), Length: l}
-			}
-			return spans, nil
-		}
-		posSpans, err := getSpans()
-		if err != nil {
-			return nil, err
-		}
-		negSpans, err := getSpans()
-		if err != nil {
-			return nil, err
-		}
-
-		getInt64s := func() ([]int64, error) {
-			n, err := getU32()
+			zeroThresholdBits, err := getU64()
 			if err != nil {
 				return nil, err
 			}
-			if n == 0 {
-				return nil, nil
+			bitOff, err := getU32()
+			if err != nil {
+				return nil, err
 			}
-			out := make([]int64, n)
-			for i := range out {
-				v, err := getI64()
+			nSamples, err := getU32()
+			if err != nil {
+				return nil, err
+			}
+			lastTS, err := getI64()
+			if err != nil {
+				return nil, err
+			}
+			lastDelta, err := getI64()
+			if err != nil {
+				return nil, err
+			}
+			sum, err := getValueState()
+			if err != nil {
+				return nil, err
+			}
+
+			seg := &histoSegment{
+				schema:        int32(schema),
+				zeroThreshold: math.Float64frombits(zeroThresholdBits),
+				bitOff:        bitOff,
+				nSamples:      nSamples,
+				ts:            tsState{lastTS: lastTS, lastDelta: lastDelta},
+				sum:           sum,
+			}
+
+			if isFloat {
+				seg.zeroCountVal, err = getValueState()
 				if err != nil {
 					return nil, err
 				}
-				out[i] = v
+				seg.countVal, err = getValueState()
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				seg.lastZeroCount, err = getU64()
+				if err != nil {
+					return nil, err
+				}
+				seg.lastCount, err = getU64()
+				if err != nil {
+					return nil, err
+				}
 			}
-			return out, nil
-		}
-		lastPosBuckets, err := getInt64s()
-		if err != nil {
-			return nil, err
-		}
-		lastNegBuckets, err := getInt64s()
-		if err != nil {
-			return nil, err
+
+			seg.posSpans, err = getSpans()
+			if err != nil {
+				return nil, err
+			}
+			seg.negSpans, err = getSpans()
+			if err != nil {
+				return nil, err
+			}
+
+			if isFloat {
+				seg.posVal, err = getValueStates()
+				if err != nil {
+					return nil, err
+				}
+				seg.negVal, err = getValueStates()
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				seg.lastPosBuckets, err = getInt64s()
+				if err != nil {
+					return nil, err
+				}
+				seg.lastNegBuckets, err = getInt64s()
+				if err != nil {
+					return nil, err
+				}
+			}
+
+			arenaLen, err := getU32()
+			if err != nil {
+				return nil, err
+			}
+			if err := need(int(arenaLen)); err != nil {
+				return nil, err
+			}
+			seg.arena = append([]byte(nil), buf[off:off+int(arenaLen)]...)
+			off += int(arenaLen)
+
+			s.segments[i] = seg
 		}
 
-		arenaLen, err := getU32()
-		if err != nil {
-			return nil, err
-		}
-		if err := need(int(arenaLen)); err != nil {
-			return nil, err
-		}
-		arena := append([]byte(nil), buf[off:off+int(arenaLen)]...)
-		off += int(arenaLen)
-
-		hst.series[ref] = &histoSeries{
-			schema:         int32(schema),
-			zeroThreshold:  math.Float64frombits(zeroThresholdBits),
-			posSpans:       posSpans,
-			negSpans:       negSpans,
-			arena:          arena,
-			bitOff:         bitOff,
-			ts:             tsState{lastTS: lastTS, lastDelta: lastDelta},
-			sum:            valueState{lastBits: sumBits, leading: leading, trailing: trailing},
-			lastZeroCount:  lastZeroCount,
-			lastCount:      lastCount,
-			lastPosBuckets: lastPosBuckets,
-			lastNegBuckets: lastNegBuckets,
-			nSamples:       nSamples,
-		}
+		hst.series[ref] = s
 	}
 	return hst, nil
 }

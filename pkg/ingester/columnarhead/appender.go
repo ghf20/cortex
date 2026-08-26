@@ -24,10 +24,11 @@ import (
 var ErrUnsupportedLabelShape = errors.New("columnarhead: label set has more than one non-target, non-__name__ label - unsupported by this prototype")
 
 // ErrNotImplemented now guards exactly one remaining gap: AppendHistogramSTZeroSample
-// (see its own doc comment for why). Exemplars, native histograms (the stable-layout
-// case), metadata, and float start-timestamp zero samples - all originally listed
-// here as missing, per design doc §9 gap #1 - are now implemented; see metadata.go,
-// exemplar.go, histogram.go, and Head.SetSTZeroSample.
+// (see its own doc comment for why). Exemplars, native histograms (still no custom
+// bucket boundaries - see ErrCustomBucketsUnsupported), metadata, and float
+// start-timestamp zero samples - all originally listed here as missing, per design
+// doc §9 gap #1 - are now implemented; see metadata.go, exemplar.go, histogram.go,
+// and Head.SetSTZeroSample.
 var ErrNotImplemented = errors.New("columnarhead: not implemented in this prototype")
 
 const (
@@ -233,10 +234,11 @@ func (a *headAppender) AppendExemplar(ref storage.SeriesRef, l labels.Labels, e 
 // AppendHistogram resolves l to a series (creating it if needed, same as Append) and
 // records h or fh - exactly one is expected to be non-nil, matching
 // storage.Appender's own documented contract. See Head.AppendHistogram/
-// AppendFloatHistogram and HistogramStore's doc comment for what layouts are
-// supported (stable schema/zero-threshold/span layout, no custom buckets - both
-// paths share those limits) and ErrHistogramTypeChanged for what happens if a series
-// switches between the two kinds mid-stream.
+// AppendFloatHistogram and histoSegment's doc comment for what's supported (a
+// schema/zero-threshold/span change mid-series starts a new segment rather than
+// erroring; custom bucket boundaries still aren't supported at all - both paths
+// share that one remaining limit) and ErrHistogramTypeChanged for what happens if
+// a series switches between the two kinds mid-stream.
 func (a *headAppender) AppendHistogram(ref storage.SeriesRef, l labels.Labels, t int64, h *histogram.Histogram, fh *histogram.FloatHistogram) (storage.SeriesRef, error) {
 	if h != nil {
 		if ref != 0 {

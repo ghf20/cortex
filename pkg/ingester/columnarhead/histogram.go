@@ -6,57 +6,61 @@ import (
 	"github.com/prometheus/prometheus/model/histogram"
 )
 
-// ErrHistogramLayoutChanged is returned when a histogram sample's schema, zero
-// threshold, or span layout doesn't match the series' first sample. Real Prometheus
-// histograms support schema/span changes over time (e.g. an exponential bucket schema
-// upgrade); this prototype does not - see CHECKLIST.md for why that's a deliberate,
-// stated scope limit, not an oversight. Design doc §8 already calls native histograms
-// "the largest single implementation item" of the whole project; this covers the
-// stable-layout common case, not full generality.
-var ErrHistogramLayoutChanged = errors.New("columnarhead: histogram schema/zero-threshold/span layout changed - unsupported by this prototype")
-
 // ErrCustomBucketsUnsupported is returned for schema -53 (custom bucket bounds via
 // CustomValues). Not implemented - see CHECKLIST.md.
 var ErrCustomBucketsUnsupported = errors.New("columnarhead: custom bucket boundaries (schema -53) are not supported by this prototype")
+
+// ErrHistogramLayoutChanged is returned when a layout-changed sample's own bucket
+// count doesn't match its declared spans - a violated assumption (spans are supposed
+// to determine bucket count consistently), not an expected mid-stream event any more.
+// A genuine schema/zero-threshold/span change no longer errors at all: see
+// histoSegment's own doc comment for why it now starts a new segment instead.
+var ErrHistogramLayoutChanged = errors.New("columnarhead: histogram bucket count doesn't match its declared spans")
 
 // ErrHistogramTypeChanged is returned when a series' first histogram sample was one
 // of *histogram.Histogram/*histogram.FloatHistogram and a later sample on the same
 // ref is the other - real Prometheus semantics don't allow a series' sample type to
 // change mid-stream any more than switching between float and histogram samples
-// does (see HistogramStore's own doc comment on that). Failing loudly here matches
-// ErrHistogramLayoutChanged's own posture: a violated assumption should error, not
-// silently misinterpret one representation's bits as the other's.
+// does (see HistogramStore's own doc comment on that). Unlike a schema/zero-
+// threshold/span change (histoSegment), this still fails loudly rather than starting
+// a new segment - out of scope for the mid-stream-layout-change work (CHECKLIST.md's
+// Phase 3 explicitly scopes that to schema/zero-threshold/span, not sample type).
 var ErrHistogramTypeChanged = errors.New("columnarhead: series switched between Histogram and FloatHistogram samples - unsupported")
 
-// histoInitialArenaBytes is a histogram series' starting arena allocation, doubled via
-// simple append-growth on demand (see growHisto) - not the shared-arena/free-list
-// machinery SeriesStore's float path uses (series.go). That's a real, separate,
-// already-proven technique; unifying histogram storage with it is future work, stated
-// explicitly rather than silently assumed away.
+// histoInitialArenaBytes is a histogram segment's starting arena allocation, doubled
+// via simple append-growth on demand (see growHistoSeg) - not the shared-arena/
+// free-list machinery SeriesStore's float path uses (series.go). That's a real,
+// separate, already-proven technique; unifying histogram storage with it is future
+// work, stated explicitly rather than silently assumed away.
 const histoInitialArenaBytes = 64
 
-// histoSeries is one series' histogram value stream: a delta/XOR-encoded bit arena
-// using the same primitives as the float path (writeBits/writeVarbit/writeValue/
-// writeTimestamp from bits.go/tsenc.go/valenc.go), reused rather than reinvented.
-// Schema, zero threshold, and span layout are fixed at the first sample and validated
-// unchanged on every subsequent one (sameLayout/sameLayoutFloat) - this is what makes
-// cross-sample per-bucket delta encoding well-defined: matching span layout guarantees
-// a matching, index-aligned bucket count every time.
+// histoSegment is one layout-stable run of a series' histogram samples: a delta/XOR-
+// encoded bit arena using the same primitives as the float path (writeBits/
+// writeVarbit/writeValue/writeTimestamp from bits.go/tsenc.go/valenc.go), reused
+// rather than reinvented. Schema, zero threshold, and span layout are fixed for a
+// segment's whole life (sameLayout/sameLayoutFloat) - this is what makes cross-sample
+// per-bucket delta encoding well-defined within it: matching span layout guarantees a
+// matching, index-aligned bucket count every time.
 //
-// isFloat picks which of the two disjoint field groups below is populated and which
-// encoding scheme Append/AppendFloat use - a series is either integer-count or
-// float-count for its whole life (ErrHistogramTypeChanged rejects switching), mirroring
-// how HistogramStore itself is a separate store from SeriesStore's plain floats: real
-// Prometheus doesn't let a series' sample kind change mid-stream, and this format's
-// cross-sample delta encoding depends on that being true.
+// A series (histoSeries) is a SEQUENCE of these, not a single one: real Prometheus
+// histogram chunks handle a schema/zero-threshold/span change by starting a new
+// chunk with the new layout (chunkenc.HistogramAppender.AppendHistogram's own
+// recode-or-new-chunk contract - the same shape chunk_querier.go's counter-reset
+// handling already uses), not by rejecting the series outright. A previous version
+// of this type WAS the whole series (one fixed layout, ErrHistogramLayoutChanged on
+// any change) - segmenting it is what lets Append/AppendFloat now start a new
+// segment instead of erroring, matching that real behavior. Nothing downstream
+// needs to know: HistogramIterator walks segments transparently, and
+// HistogramStore.Truncate's decode-then-re-Append round trip re-segments on replay
+// for free, no special-casing.
 //
-// The integer path (isFloat == false) delta-encodes each bucket's ABSOLUTE count as a
-// varbit integer relative to the previous sample's absolute count for that same bucket
-// position - cheap for the common case (typical bucket deltas are small integers).
-// Real Histogram.PositiveBuckets/NegativeBuckets are themselves spatially delta-encoded
-// (each element relative to the PREVIOUS BUCKET, not the previous sample) -
-// absoluteBuckets/deltaEncode convert between that and this store's own per-position
-// absolute values.
+// The integer path (isFloat == false on the owning histoSeries) delta-encodes each
+// bucket's ABSOLUTE count as a varbit integer relative to the previous sample's
+// absolute count for that same bucket position - cheap for the common case (typical
+// bucket deltas are small integers). Real Histogram.PositiveBuckets/NegativeBuckets
+// are themselves spatially delta-encoded (each element relative to the PREVIOUS
+// BUCKET, not the previous sample) - absoluteBuckets/deltaEncode convert between
+// that and this store's own per-position absolute values.
 //
 // The float path (isFloat == true) cannot reuse that scheme: real
 // FloatHistogram.PositiveBuckets/NegativeBuckets are already absolute per-bucket
@@ -67,13 +71,11 @@ const histoInitialArenaBytes = 64
 // (writeValue/valenc.go), just applied PER BUCKET POSITION - one independent
 // valueState per bucket, since XOR encoding needs its own leading/trailing/lastBits
 // window per value-stream, not a single shared one.
-type histoSeries struct {
+type histoSegment struct {
 	schema        int32
 	zeroThreshold float64
 	posSpans      []histogram.Span
 	negSpans      []histogram.Span
-
-	isFloat bool
 
 	arena  []byte
 	bitOff uint32
@@ -81,21 +83,71 @@ type histoSeries struct {
 	ts  tsState
 	sum valueState
 
-	// Integer path only (isFloat == false).
+	// Integer path only (owning histoSeries.isFloat == false).
 	lastZeroCount  uint64
 	lastCount      uint64
 	lastPosBuckets []int64 // absolute per-bucket counts from the previous sample
 	lastNegBuckets []int64
 
-	// Float path only (isFloat == true) - one XOR value-stream per bucket
-	// position, sized once at series creation (bucket count is fixed for the
-	// series' life, same as the integer path).
+	// Float path only (owning histoSeries.isFloat == true) - one XOR value-stream
+	// per bucket position, sized once at segment creation (bucket count is fixed
+	// for the segment's life, same as the integer path).
 	zeroCountVal valueState
 	countVal     valueState
 	posVal       []valueState
 	negVal       []valueState
 
 	nSamples uint32
+}
+
+// newHistoSegment starts a fresh integer-path segment with the given layout.
+func newHistoSegment(schema int32, zeroThreshold float64, posSpans, negSpans []histogram.Span) *histoSegment {
+	return &histoSegment{
+		schema:        schema,
+		zeroThreshold: zeroThreshold,
+		posSpans:      append([]histogram.Span(nil), posSpans...),
+		negSpans:      append([]histogram.Span(nil), negSpans...),
+		arena:         make([]byte, histoInitialArenaBytes),
+		sum:           newValueState(),
+	}
+}
+
+// newHistoSegmentFloat starts a fresh float-path segment with the given layout and
+// bucket counts (nPos/nNeg) - the per-bucket XOR windows must be sized up front,
+// unlike the integer path's varbit encoding which needs no per-position state.
+func newHistoSegmentFloat(schema int32, zeroThreshold float64, posSpans, negSpans []histogram.Span, nPos, nNeg int) *histoSegment {
+	seg := newHistoSegment(schema, zeroThreshold, posSpans, negSpans)
+	seg.zeroCountVal = newValueState()
+	seg.countVal = newValueState()
+	seg.posVal = newValueStates(nPos)
+	seg.negVal = newValueStates(nNeg)
+	return seg
+}
+
+// histoSeries is one series' full histogram value stream, as a sequence of
+// layout-stable segments (see histoSegment's own doc comment for why). isFloat picks
+// which of histoSegment's two disjoint field groups every segment uses and which
+// encoding scheme Append/AppendFloat use - a series is either integer-count or
+// float-count for its whole life (ErrHistogramTypeChanged rejects switching),
+// mirroring how HistogramStore itself is a separate store from SeriesStore's plain
+// floats: real Prometheus doesn't let a series' sample kind change mid-stream, and
+// this format's cross-sample delta/XOR encoding depends on that being true within a
+// segment.
+type histoSeries struct {
+	isFloat  bool
+	segments []*histoSegment
+}
+
+// lastSegment returns the series' current (most recently appended-to) segment, or
+// nil if the series has none yet - only possible transiently inside Append/
+// AppendFloat before they create the first one, never in a stored *histoSeries
+// (HistogramStore never keeps an entry with zero segments - see Truncate's doc
+// comment on why an all-aged-out series is deleted from the map entirely instead).
+func (s *histoSeries) lastSegment() *histoSegment {
+	if len(s.segments) == 0 {
+		return nil
+	}
+	return s.segments[len(s.segments)-1]
 }
 
 // HistogramStore holds histogram-typed series, keyed by the same series refs Head's
@@ -137,7 +189,10 @@ func (hst *HistogramStore) IsFloat(ref uint32) bool {
 }
 
 // Append encodes one integer-count histogram sample for the series at ref, creating
-// its histogram stream on first use.
+// its histogram stream on first use. A schema/zero-threshold/span change from the
+// current segment's layout starts a fresh segment (histoSegment's own doc comment)
+// rather than erroring - only a genuine bucket-count/span mismatch WITHIN a
+// (supposedly) stable layout, or a Histogram/FloatHistogram type switch, still does.
 func (hst *HistogramStore) Append(ref uint32, ts int64, h *histogram.Histogram) error {
 	if histogram.IsCustomBucketsSchema(h.Schema) {
 		return ErrCustomBucketsUnsupported
@@ -145,24 +200,21 @@ func (hst *HistogramStore) Append(ref uint32, ts int64, h *histogram.Histogram) 
 
 	s, ok := hst.series[ref]
 	if !ok {
-		s = &histoSeries{
-			schema:        h.Schema,
-			zeroThreshold: h.ZeroThreshold,
-			posSpans:      append([]histogram.Span(nil), h.PositiveSpans...),
-			negSpans:      append([]histogram.Span(nil), h.NegativeSpans...),
-			arena:         make([]byte, histoInitialArenaBytes),
-			sum:           newValueState(),
-		}
+		s = &histoSeries{}
 		hst.series[ref] = s
 	} else if s.isFloat {
 		return ErrHistogramTypeChanged
-	} else if !sameLayout(s, h) {
-		return ErrHistogramLayoutChanged
+	}
+
+	seg := s.lastSegment()
+	if seg == nil || !sameLayout(seg, h) {
+		seg = newHistoSegment(h.Schema, h.ZeroThreshold, h.PositiveSpans, h.NegativeSpans)
+		s.segments = append(s.segments, seg)
 	}
 
 	posAbs := absoluteBuckets(h.PositiveBuckets)
 	negAbs := absoluteBuckets(h.NegativeBuckets)
-	if s.nSamples > 0 && (len(posAbs) != len(s.lastPosBuckets) || len(negAbs) != len(s.lastNegBuckets)) {
+	if seg.nSamples > 0 && (len(posAbs) != len(seg.lastPosBuckets) || len(negAbs) != len(seg.lastNegBuckets)) {
 		// Spans matched (sameLayout passed) but bucket count differs. Shouldn't
 		// happen if spans truly determine bucket count consistently - guarded rather
 		// than trusted, so a violated assumption fails loudly instead of silently
@@ -177,45 +229,46 @@ func (hst *HistogramStore) Append(ref uint32, ts int64, h *histogram.Histogram) 
 	// and subsequent-delta-varbit cases since 68 > 64) + one varbit (68 worst case)
 	// per bucket.
 	needBits := uint32(68+77+136) + uint32(len(posAbs)+len(negAbs))*68
-	growHisto(s, needBits)
+	growHistoSeg(seg, needBits)
 
-	n := s.nSamples
-	s.bitOff = writeTimestamp(s.arena, 0, s.bitOff, ts, &s.ts, n)
-	s.bitOff = writeValue(s.arena, 0, s.bitOff, h.Sum, &s.sum, n == 0)
+	n := seg.nSamples
+	seg.bitOff = writeTimestamp(seg.arena, 0, seg.bitOff, ts, &seg.ts, n)
+	seg.bitOff = writeValue(seg.arena, 0, seg.bitOff, h.Sum, &seg.sum, n == 0)
 
 	if n == 0 {
-		s.bitOff = writeBits(s.arena, 0, s.bitOff, h.ZeroCount, 64)
-		s.bitOff = writeBits(s.arena, 0, s.bitOff, h.Count, 64)
+		seg.bitOff = writeBits(seg.arena, 0, seg.bitOff, h.ZeroCount, 64)
+		seg.bitOff = writeBits(seg.arena, 0, seg.bitOff, h.Count, 64)
 		for _, v := range posAbs {
-			s.bitOff = writeVarbit(s.arena, 0, s.bitOff, v)
+			seg.bitOff = writeVarbit(seg.arena, 0, seg.bitOff, v)
 		}
 		for _, v := range negAbs {
-			s.bitOff = writeVarbit(s.arena, 0, s.bitOff, v)
+			seg.bitOff = writeVarbit(seg.arena, 0, seg.bitOff, v)
 		}
 	} else {
-		s.bitOff = writeVarbit(s.arena, 0, s.bitOff, int64(h.ZeroCount)-int64(s.lastZeroCount))
-		s.bitOff = writeVarbit(s.arena, 0, s.bitOff, int64(h.Count)-int64(s.lastCount))
+		seg.bitOff = writeVarbit(seg.arena, 0, seg.bitOff, int64(h.ZeroCount)-int64(seg.lastZeroCount))
+		seg.bitOff = writeVarbit(seg.arena, 0, seg.bitOff, int64(h.Count)-int64(seg.lastCount))
 		for i, v := range posAbs {
-			s.bitOff = writeVarbit(s.arena, 0, s.bitOff, v-s.lastPosBuckets[i])
+			seg.bitOff = writeVarbit(seg.arena, 0, seg.bitOff, v-seg.lastPosBuckets[i])
 		}
 		for i, v := range negAbs {
-			s.bitOff = writeVarbit(s.arena, 0, s.bitOff, v-s.lastNegBuckets[i])
+			seg.bitOff = writeVarbit(seg.arena, 0, seg.bitOff, v-seg.lastNegBuckets[i])
 		}
 	}
 
-	s.lastZeroCount = h.ZeroCount
-	s.lastCount = h.Count
-	s.lastPosBuckets = posAbs
-	s.lastNegBuckets = negAbs
-	s.nSamples = n + 1
+	seg.lastZeroCount = h.ZeroCount
+	seg.lastCount = h.Count
+	seg.lastPosBuckets = posAbs
+	seg.lastNegBuckets = negAbs
+	seg.nSamples = n + 1
 	return nil
 }
 
 // AppendFloat encodes one float-count histogram sample for the series at ref,
 // creating its histogram stream on first use - the FloatHistogram counterpart to
-// Append, see histoSeries' own doc comment for why the encoding scheme genuinely
+// Append, see histoSegment's own doc comment for why the encoding scheme genuinely
 // differs (per-bucket gorilla XOR, not per-bucket varbit delta) rather than being a
-// thin parallel path.
+// thin parallel path, and for the same start-a-new-segment-on-layout-change
+// behavior Append has.
 func (hst *HistogramStore) AppendFloat(ref uint32, ts int64, h *histogram.FloatHistogram) error {
 	if histogram.IsCustomBucketsSchema(h.Schema) {
 		return ErrCustomBucketsUnsupported
@@ -223,27 +276,19 @@ func (hst *HistogramStore) AppendFloat(ref uint32, ts int64, h *histogram.FloatH
 
 	s, ok := hst.series[ref]
 	if !ok {
-		s = &histoSeries{
-			schema:        h.Schema,
-			zeroThreshold: h.ZeroThreshold,
-			posSpans:      append([]histogram.Span(nil), h.PositiveSpans...),
-			negSpans:      append([]histogram.Span(nil), h.NegativeSpans...),
-			arena:         make([]byte, histoInitialArenaBytes),
-			sum:           newValueState(),
-			isFloat:       true,
-			zeroCountVal:  newValueState(),
-			countVal:      newValueState(),
-			posVal:        newValueStates(len(h.PositiveBuckets)),
-			negVal:        newValueStates(len(h.NegativeBuckets)),
-		}
+		s = &histoSeries{isFloat: true}
 		hst.series[ref] = s
 	} else if !s.isFloat {
 		return ErrHistogramTypeChanged
-	} else if !sameLayoutFloat(s, h) {
-		return ErrHistogramLayoutChanged
 	}
 
-	if s.nSamples > 0 && (len(h.PositiveBuckets) != len(s.posVal) || len(h.NegativeBuckets) != len(s.negVal)) {
+	seg := s.lastSegment()
+	if seg == nil || !sameLayoutFloat(seg, h) {
+		seg = newHistoSegmentFloat(h.Schema, h.ZeroThreshold, h.PositiveSpans, h.NegativeSpans, len(h.PositiveBuckets), len(h.NegativeBuckets))
+		s.segments = append(s.segments, seg)
+	}
+
+	if seg.nSamples > 0 && (len(h.PositiveBuckets) != len(seg.posVal) || len(h.NegativeBuckets) != len(seg.negVal)) {
 		// Same guard Append has, for the same reason - spans matched but bucket
 		// count differs shouldn't happen, fail loudly rather than misalign.
 		return ErrHistogramLayoutChanged
@@ -254,22 +299,22 @@ func (hst *HistogramStore) AppendFloat(ref uint32, ts int64, h *histogram.FloatH
 	// the sum field), applied here to sum, zeroCount, count, and every bucket -
 	// all genuinely independent value-streams under this scheme.
 	needBits := uint32(68+77*3) + uint32(len(h.PositiveBuckets)+len(h.NegativeBuckets))*77
-	growHisto(s, needBits)
+	growHistoSeg(seg, needBits)
 
-	n := s.nSamples
+	n := seg.nSamples
 	first := n == 0
-	s.bitOff = writeTimestamp(s.arena, 0, s.bitOff, ts, &s.ts, n)
-	s.bitOff = writeValue(s.arena, 0, s.bitOff, h.Sum, &s.sum, first)
-	s.bitOff = writeValue(s.arena, 0, s.bitOff, h.ZeroCount, &s.zeroCountVal, first)
-	s.bitOff = writeValue(s.arena, 0, s.bitOff, h.Count, &s.countVal, first)
+	seg.bitOff = writeTimestamp(seg.arena, 0, seg.bitOff, ts, &seg.ts, n)
+	seg.bitOff = writeValue(seg.arena, 0, seg.bitOff, h.Sum, &seg.sum, first)
+	seg.bitOff = writeValue(seg.arena, 0, seg.bitOff, h.ZeroCount, &seg.zeroCountVal, first)
+	seg.bitOff = writeValue(seg.arena, 0, seg.bitOff, h.Count, &seg.countVal, first)
 	for i, v := range h.PositiveBuckets {
-		s.bitOff = writeValue(s.arena, 0, s.bitOff, v, &s.posVal[i], first)
+		seg.bitOff = writeValue(seg.arena, 0, seg.bitOff, v, &seg.posVal[i], first)
 	}
 	for i, v := range h.NegativeBuckets {
-		s.bitOff = writeValue(s.arena, 0, s.bitOff, v, &s.negVal[i], first)
+		seg.bitOff = writeValue(seg.arena, 0, seg.bitOff, v, &seg.negVal[i], first)
 	}
 
-	s.nSamples = n + 1
+	seg.nSamples = n + 1
 	return nil
 }
 
@@ -287,27 +332,27 @@ func newValueStates(n int) []valueState {
 	return out
 }
 
-// growHisto doubles s.arena until it has room for needBits more, starting from
+// growHistoSeg doubles seg.arena until it has room for needBits more, starting from
 // histoInitialArenaBytes - simple append-growth, not the free-list/reuse machinery
 // series.go's growSlot has (see the HistogramStore doc comment on why).
-func growHisto(s *histoSeries, needBits uint32) {
-	for s.bitOff+needBits > uint32(len(s.arena))*8 {
-		s.arena = append(s.arena, make([]byte, len(s.arena))...)
+func growHistoSeg(seg *histoSegment, needBits uint32) {
+	for seg.bitOff+needBits > uint32(len(seg.arena))*8 {
+		seg.arena = append(seg.arena, make([]byte, len(seg.arena))...)
 	}
 }
 
-func sameLayout(s *histoSeries, h *histogram.Histogram) bool {
-	if s.schema != h.Schema || s.zeroThreshold != h.ZeroThreshold {
+func sameLayout(seg *histoSegment, h *histogram.Histogram) bool {
+	if seg.schema != h.Schema || seg.zeroThreshold != h.ZeroThreshold {
 		return false
 	}
-	return spansEqual(s.posSpans, h.PositiveSpans) && spansEqual(s.negSpans, h.NegativeSpans)
+	return spansEqual(seg.posSpans, h.PositiveSpans) && spansEqual(seg.negSpans, h.NegativeSpans)
 }
 
-func sameLayoutFloat(s *histoSeries, h *histogram.FloatHistogram) bool {
-	if s.schema != h.Schema || s.zeroThreshold != h.ZeroThreshold {
+func sameLayoutFloat(seg *histoSegment, h *histogram.FloatHistogram) bool {
+	if seg.schema != h.Schema || seg.zeroThreshold != h.ZeroThreshold {
 		return false
 	}
-	return spansEqual(s.posSpans, h.PositiveSpans) && spansEqual(s.negSpans, h.NegativeSpans)
+	return spansEqual(seg.posSpans, h.PositiveSpans) && spansEqual(seg.negSpans, h.NegativeSpans)
 }
 
 func spansEqual(a, b []histogram.Span) bool {
@@ -354,19 +399,22 @@ func deltaEncode(abs []int64) []int64 {
 	return out
 }
 
-// HistogramIterator replays a histogram series' encoded samples in order - either
-// integer- or float-typed (see HistogramStore.IsFloat), never both for the same
-// series. Matching the "wrong accessor panics" convention this package's other
+// HistogramIterator replays a histogram series' encoded samples in order, across
+// every layout segment in turn (see histoSegment's own doc comment) - either
+// integer- or float-typed for the whole series (see HistogramStore.IsFloat), never
+// both. Matching the "wrong accessor panics" convention this package's other
 // dual-type iterators already use (querier.go's floatSampleIterator/
 // histogramSampleIterator), At panics on a float-typed series and AtFloat panics on
 // an integer-typed one - a caller is expected to check IsFloat (or the
 // chunkenc.ValueType Next-equivalent one layer up) before choosing which to call,
 // not call both defensively.
 type HistogramIterator struct {
-	s     *histoSeries
-	off   uint32
-	i     uint32
-	total uint32
+	s      *histoSeries
+	segIdx int
+	seg    *histoSegment
+	off    uint32
+	i      uint32
+	total  uint32
 
 	ts  tsState
 	sum valueState
@@ -402,29 +450,22 @@ func (hst *HistogramStore) Iterator(ref uint32) *HistogramIterator {
 	if s == nil {
 		return &HistogramIterator{}
 	}
-	it := &HistogramIterator{
-		s:     s,
-		total: s.nSamples,
-		sum:   newValueState(),
-	}
-	if s.isFloat {
-		it.zeroCountVal = newValueState()
-		it.countVal = newValueState()
-		it.posVal = newValueStates(len(s.posVal))
-		it.negVal = newValueStates(len(s.negVal))
-		it.posF = make([]float64, len(s.posVal))
-		it.negF = make([]float64, len(s.negVal))
-	} else {
-		it.posAbs = make([]int64, len(s.lastPosBuckets))
-		it.negAbs = make([]int64, len(s.lastNegBuckets))
-	}
-	return it
+	return &HistogramIterator{s: s, segIdx: -1}
 }
 
-// Next advances to the next sample, returning false when exhausted.
+// Next advances to the next sample, returning false when exhausted - moving to the
+// next segment transparently once the current one runs out (the it.i >= it.total
+// loop below), instead of stopping there.
 func (it *HistogramIterator) Next() bool {
-	if it.s == nil || it.i >= it.total {
+	if it.s == nil {
 		return false
+	}
+	for it.i >= it.total {
+		it.segIdx++
+		if it.segIdx >= len(it.s.segments) {
+			return false
+		}
+		it.startSegment(it.s.segments[it.segIdx])
 	}
 	if it.s.isFloat {
 		return it.nextFloat()
@@ -432,37 +473,63 @@ func (it *HistogramIterator) Next() bool {
 	return it.nextInt()
 }
 
+// startSegment resets every per-segment decode scratch field for seg - each segment
+// restarts its own ts/sum/bucket encoding windows from scratch (a segment's first
+// sample is always written "raw", never delta/XOR-relative to the PREVIOUS
+// segment's last sample - see Append/AppendFloat), and bucket-count-sized scratch
+// slices must be resized since bucket count can genuinely differ across a layout
+// change.
+func (it *HistogramIterator) startSegment(seg *histoSegment) {
+	it.seg = seg
+	it.off = 0
+	it.i = 0
+	it.total = seg.nSamples
+	it.ts = tsState{}
+	it.sum = newValueState()
+	if it.s.isFloat {
+		it.zeroCountVal = newValueState()
+		it.countVal = newValueState()
+		it.posVal = newValueStates(len(seg.posVal))
+		it.negVal = newValueStates(len(seg.negVal))
+		it.posF = make([]float64, len(seg.posVal))
+		it.negF = make([]float64, len(seg.negVal))
+	} else {
+		it.posAbs = make([]int64, len(seg.lastPosBuckets))
+		it.negAbs = make([]int64, len(seg.lastNegBuckets))
+	}
+}
+
 func (it *HistogramIterator) nextInt() bool {
-	ts, off := readTimestamp(it.s.arena, 0, it.off, &it.ts, it.i)
-	sum, off2 := readValue(it.s.arena, 0, off, &it.sum, it.i == 0)
+	ts, off := readTimestamp(it.seg.arena, 0, it.off, &it.ts, it.i)
+	sum, off2 := readValue(it.seg.arena, 0, off, &it.sum, it.i == 0)
 	off = off2
 
 	if it.i == 0 {
-		zc, o := readBits(it.s.arena, 0, off, 64)
-		c, o2 := readBits(it.s.arena, 0, o, 64)
+		zc, o := readBits(it.seg.arena, 0, off, 64)
+		c, o2 := readBits(it.seg.arena, 0, o, 64)
 		off = o2
 		it.zeroCount, it.count = zc, c
 		for j := range it.posAbs {
-			v, o3 := readVarbit(it.s.arena, 0, off)
+			v, o3 := readVarbit(it.seg.arena, 0, off)
 			it.posAbs[j], off = v, o3
 		}
 		for j := range it.negAbs {
-			v, o3 := readVarbit(it.s.arena, 0, off)
+			v, o3 := readVarbit(it.seg.arena, 0, off)
 			it.negAbs[j], off = v, o3
 		}
 	} else {
-		dzc, o := readVarbit(it.s.arena, 0, off)
-		dc, o2 := readVarbit(it.s.arena, 0, o)
+		dzc, o := readVarbit(it.seg.arena, 0, off)
+		dc, o2 := readVarbit(it.seg.arena, 0, o)
 		off = o2
 		it.zeroCount = uint64(int64(it.zeroCount) + dzc)
 		it.count = uint64(int64(it.count) + dc)
 		for j := range it.posAbs {
-			d, o3 := readVarbit(it.s.arena, 0, off)
+			d, o3 := readVarbit(it.seg.arena, 0, off)
 			it.posAbs[j] += d
 			off = o3
 		}
 		for j := range it.negAbs {
-			d, o3 := readVarbit(it.s.arena, 0, off)
+			d, o3 := readVarbit(it.seg.arena, 0, off)
 			it.negAbs[j] += d
 			off = o3
 		}
@@ -470,13 +537,13 @@ func (it *HistogramIterator) nextInt() bool {
 
 	it.curTS = ts
 	it.curH = &histogram.Histogram{
-		Schema:          it.s.schema,
-		ZeroThreshold:   it.s.zeroThreshold,
+		Schema:          it.seg.schema,
+		ZeroThreshold:   it.seg.zeroThreshold,
 		ZeroCount:       it.zeroCount,
 		Count:           it.count,
 		Sum:             sum,
-		PositiveSpans:   it.s.posSpans,
-		NegativeSpans:   it.s.negSpans,
+		PositiveSpans:   it.seg.posSpans,
+		NegativeSpans:   it.seg.negSpans,
 		PositiveBuckets: deltaEncode(it.posAbs),
 		NegativeBuckets: deltaEncode(it.negAbs),
 	}
@@ -487,29 +554,29 @@ func (it *HistogramIterator) nextInt() bool {
 
 func (it *HistogramIterator) nextFloat() bool {
 	first := it.i == 0
-	ts, off := readTimestamp(it.s.arena, 0, it.off, &it.ts, it.i)
-	sum, off := readValue(it.s.arena, 0, off, &it.sum, first)
-	zc, off := readValue(it.s.arena, 0, off, &it.zeroCountVal, first)
-	c, off := readValue(it.s.arena, 0, off, &it.countVal, first)
+	ts, off := readTimestamp(it.seg.arena, 0, it.off, &it.ts, it.i)
+	sum, off := readValue(it.seg.arena, 0, off, &it.sum, first)
+	zc, off := readValue(it.seg.arena, 0, off, &it.zeroCountVal, first)
+	c, off := readValue(it.seg.arena, 0, off, &it.countVal, first)
 	it.zeroCountF, it.countF = zc, c
 	for j := range it.posF {
-		v, o := readValue(it.s.arena, 0, off, &it.posVal[j], first)
+		v, o := readValue(it.seg.arena, 0, off, &it.posVal[j], first)
 		it.posF[j], off = v, o
 	}
 	for j := range it.negF {
-		v, o := readValue(it.s.arena, 0, off, &it.negVal[j], first)
+		v, o := readValue(it.seg.arena, 0, off, &it.negVal[j], first)
 		it.negF[j], off = v, o
 	}
 
 	it.curTS = ts
 	it.curFH = &histogram.FloatHistogram{
-		Schema:          it.s.schema,
-		ZeroThreshold:   it.s.zeroThreshold,
+		Schema:          it.seg.schema,
+		ZeroThreshold:   it.seg.zeroThreshold,
 		ZeroCount:       it.zeroCountF,
 		Count:           it.countF,
 		Sum:             sum,
-		PositiveSpans:   it.s.posSpans,
-		NegativeSpans:   it.s.negSpans,
+		PositiveSpans:   it.seg.posSpans,
+		NegativeSpans:   it.seg.negSpans,
 		PositiveBuckets: append([]float64(nil), it.posF...),
 		NegativeBuckets: append([]float64(nil), it.negF...),
 	}
@@ -542,6 +609,11 @@ func (it *HistogramIterator) AtFloat() (int64, *histogram.FloatHistogram) {
 // delta-encoded stream). Returns the number of samples retained. A no-op (returns 0)
 // if ref has no histogram stream at all (Has(ref) false) - not a caller bug, since a
 // mixed-type Head can have plenty of refs with no histogram samples.
+//
+// Re-Appending the kept samples naturally re-segments them exactly as a fresh
+// ingest would (Append/AppendFloat start a new segment on any layout change) - no
+// special-casing needed here for a retained range that happens to span a layout
+// change.
 //
 // If every sample ages out, ref's entry is dropped from the map entirely rather than
 // kept as an empty placeholder: Has(ref) then reports false, and the read path falls

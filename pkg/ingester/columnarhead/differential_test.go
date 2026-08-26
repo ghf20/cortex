@@ -532,6 +532,88 @@ func TestDifferentialHistogramRealVsColumnar(t *testing.T) {
 	}
 }
 
+// histLayoutChangeDiffWorkload is histDiffWorkload's mid-stream-layout-change
+// counterpart: two samples on schema 0 (a single positive bucket), then a genuine
+// schema+span change to schema 1 (two positive buckets) for two more - each
+// sample's Count is computed from its OWN spatial bucket deltas the same way
+// histDiffWorkload's mk helper does, independent of any other sample's layout.
+func histLayoutChangeDiffWorkload() []*histogram.Histogram {
+	mk := func(schema int32, spans []histogram.Span, sum float64, posDeltas []int64) *histogram.Histogram {
+		var count uint64
+		var cur int64
+		for _, d := range posDeltas {
+			cur += d
+			count += uint64(cur)
+		}
+		return &histogram.Histogram{
+			Schema:          schema,
+			PositiveSpans:   spans,
+			PositiveBuckets: posDeltas,
+			Count:           count,
+			Sum:             sum,
+		}
+	}
+	schema0Spans := []histogram.Span{{Offset: 0, Length: 1}}
+	schema1Spans := []histogram.Span{{Offset: 0, Length: 2}}
+	return []*histogram.Histogram{
+		mk(0, schema0Spans, 1, []int64{1}),
+		mk(0, schema0Spans, 4, []int64{3}),
+		mk(1, schema1Spans, 9, []int64{3, 2}), // schema+span change here
+		mk(1, schema1Spans, 15, []int64{1, 1}),
+	}
+}
+
+// TestDifferentialHistogramLayoutChangeRealVsColumnar extends
+// TestDifferentialHistogramRealVsColumnar with a genuine schema/span change
+// mid-series (histoSegment's own doc comment, CHECKLIST.md's Phase 3 mid-stream
+// layout-change work) - the strongest verification available: real tsdb.Head's
+// own chunk-writing path ALSO starts a new chunk on an incompatible layout
+// (chunkenc.HistogramAppender.AppendHistogram's own recode-or-new-chunk
+// contract), so a bit-exact match here proves columnarhead's multi-segment
+// storage reproduces real behavior, not just "doesn't error."
+func TestDifferentialHistogramLayoutChangeRealVsColumnar(t *testing.T) {
+	l := labels.FromStrings(
+		labels.MetricName, "request_duration_seconds",
+		"cluster", "eks-prod-1", "namespace", "ns-7", "pod", "payments-api-1",
+		"container", "app", "node", "ip-10-1-2-3", "job", "cadvisor",
+	)
+	base := int64(1700000000000)
+	workload := histLayoutChangeDiffWorkload()
+
+	realHead := newRealHead(t)
+	appendHistogramsToReal(t, realHead, l, base, workload)
+	colHead := NewHead(1, 1, 16)
+	appendHistogramsToColumnar(t, colHead, l, base, workload)
+
+	realQuerier, err := tsdb.NewBlockQuerier(realHead, math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("real head querier: %v", err)
+	}
+	defer realQuerier.Close()
+	colQuerier, err := colHead.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("columnar head querier: %v", err)
+	}
+	defer colQuerier.Close()
+
+	m := labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "request_duration_seconds")
+	realSamples := collectHistogramSamples(t, realQuerier.Select(context.Background(), true, nil, m))
+	colSamples := collectHistogramSamples(t, colQuerier.Select(context.Background(), true, nil, m))
+
+	if len(realSamples) != len(colSamples) {
+		t.Fatalf("real head returned %d histogram samples, columnar returned %d", len(realSamples), len(colSamples))
+	}
+	if len(realSamples) != len(workload) {
+		t.Fatalf("sanity check failed: got %d samples back, want %d (the differential test would pass vacuously otherwise)", len(realSamples), len(workload))
+	}
+	for i := range realSamples {
+		if realSamples[i].ts != colSamples[i].ts {
+			t.Fatalf("sample %d: ts real=%d columnar=%d", i, realSamples[i].ts, colSamples[i].ts)
+		}
+		histEqual(t, colSamples[i].h, realSamples[i].h)
+	}
+}
+
 // floatHistDiffWorkload is histDiffWorkload's FloatHistogram counterpart -
 // same shape and same scope note (stable layout, no counter reset), buckets
 // given as absolute values directly since FloatHistogram's own representation
@@ -635,6 +717,65 @@ func TestDifferentialFloatHistogramRealVsColumnar(t *testing.T) {
 	)
 	base := int64(1700000000000)
 	workload := floatHistDiffWorkload()
+
+	realHead := newRealHead(t)
+	appendFloatHistogramsToReal(t, realHead, l, base, workload)
+	colHead := NewHead(1, 1, 16)
+	appendFloatHistogramsToColumnar(t, colHead, l, base, workload)
+
+	realQuerier, err := tsdb.NewBlockQuerier(realHead, math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("real head querier: %v", err)
+	}
+	defer realQuerier.Close()
+	colQuerier, err := colHead.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("columnar head querier: %v", err)
+	}
+	defer colQuerier.Close()
+
+	m := labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "request_duration_seconds")
+	realSamples := collectFloatHistogramSamples(t, realQuerier.Select(context.Background(), true, nil, m))
+	colSamples := collectFloatHistogramSamples(t, colQuerier.Select(context.Background(), true, nil, m))
+
+	if len(realSamples) != len(colSamples) {
+		t.Fatalf("real head returned %d float histogram samples, columnar returned %d", len(realSamples), len(colSamples))
+	}
+	if len(realSamples) != len(workload) {
+		t.Fatalf("sanity check failed: got %d samples back, want %d (the differential test would pass vacuously otherwise)", len(realSamples), len(workload))
+	}
+	for i := range realSamples {
+		if realSamples[i].ts != colSamples[i].ts {
+			t.Fatalf("sample %d: ts real=%d columnar=%d", i, realSamples[i].ts, colSamples[i].ts)
+		}
+		floatHistEqual(t, colSamples[i].h, realSamples[i].h)
+	}
+}
+
+// floatHistLayoutChangeDiffWorkload is histLayoutChangeDiffWorkload's
+// FloatHistogram counterpart - buckets given as absolute values directly (see
+// floatHistDiffWorkload's own doc comment for why, unlike the int path's
+// spatial-delta representation).
+func floatHistLayoutChangeDiffWorkload() []*histogram.FloatHistogram {
+	return []*histogram.FloatHistogram{
+		{Schema: 0, Count: 1, Sum: 1, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []float64{1}},
+		{Schema: 0, Count: 3, Sum: 4, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []float64{3}},
+		{Schema: 1, Count: 8, Sum: 9, PositiveSpans: []histogram.Span{{Offset: 0, Length: 2}}, PositiveBuckets: []float64{3, 5}}, // schema+span change here
+		{Schema: 1, Count: 3, Sum: 15, PositiveSpans: []histogram.Span{{Offset: 0, Length: 2}}, PositiveBuckets: []float64{1, 2}},
+	}
+}
+
+// TestDifferentialFloatHistogramLayoutChangeRealVsColumnar is
+// TestDifferentialHistogramLayoutChangeRealVsColumnar's FloatHistogram
+// counterpart.
+func TestDifferentialFloatHistogramLayoutChangeRealVsColumnar(t *testing.T) {
+	l := labels.FromStrings(
+		labels.MetricName, "request_duration_seconds",
+		"cluster", "eks-prod-1", "namespace", "ns-7", "pod", "payments-api-1",
+		"container", "app", "node", "ip-10-1-2-3", "job", "cadvisor",
+	)
+	base := int64(1700000000000)
+	workload := floatHistLayoutChangeDiffWorkload()
 
 	realHead := newRealHead(t)
 	appendFloatHistogramsToReal(t, realHead, l, base, workload)

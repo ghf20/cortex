@@ -780,9 +780,10 @@ func (h *Head) Exemplars(ref uint32) []exemplarEntry {
 }
 
 // AppendHistogram encodes one integer-count histogram sample for the series at ref.
-// See HistogramStore's doc comment for what this does and does not support (stable
-// schema/zero-threshold/span layout only, no custom buckets). Self-locking: ref's
-// shard's write lock for the call.
+// See HistogramStore/histoSegment's doc comments for what this does and does not
+// support (a schema/zero-threshold/span change mid-series starts a new segment;
+// custom bucket boundaries are still unsupported). Self-locking: ref's shard's
+// write lock for the call.
 func (h *Head) AppendHistogram(ref uint32, ts int64, hg *histogram.Histogram) error {
 	shard, localIdx := h.shardFor(ref)
 	shard.mu.Lock()

@@ -211,17 +211,18 @@ func TestHistogramStoreRejectsCustomBuckets(t *testing.T) {
 	}
 }
 
-func TestHistogramStoreRejectsLayoutChange(t *testing.T) {
-	hst := NewHistogramStore()
+// TestHistogramStoreLayoutChangeStartsNewSegment confirms Append no longer rejects
+// a genuine schema/zero-threshold/span change (histoSegment's own doc comment on
+// why) - it starts a fresh segment instead, and a full decode still returns every
+// sample, each carrying ITS OWN layout, in the order appended. Replaces the old
+// TestHistogramStoreRejectsLayoutChange, whose whole premise (any layout change
+// errors) is no longer true.
+func TestHistogramStoreLayoutChangeStartsNewSegment(t *testing.T) {
 	h1 := &histogram.Histogram{
 		Schema:          0,
 		PositiveSpans:   []histogram.Span{{Offset: 0, Length: 2}},
 		PositiveBuckets: []int64{1, 1},
 	}
-	if err := hst.Append(0, 1700000000000, h1); err != nil {
-		t.Fatalf("Append: %v", err)
-	}
-
 	cases := map[string]*histogram.Histogram{
 		"schema changed": {
 			Schema: 1, PositiveSpans: h1.PositiveSpans, PositiveBuckets: []int64{1, 1},
@@ -235,26 +236,50 @@ func TestHistogramStoreRejectsLayoutChange(t *testing.T) {
 			PositiveBuckets: []int64{1, 1, 1},
 		},
 	}
-	for name, h := range cases {
+	for name, h2 := range cases {
 		t.Run(name, func(t *testing.T) {
-			if err := hst.Append(0, 1700000015000, h); err != ErrHistogramLayoutChanged {
-				t.Fatalf("Append with %s = %v, want ErrHistogramLayoutChanged", name, err)
+			hst := NewHistogramStore()
+			if err := hst.Append(0, 1700000000000, h1); err != nil {
+				t.Fatalf("Append h1: %v", err)
+			}
+			if err := hst.Append(0, 1700000015000, h2); err != nil {
+				t.Fatalf("Append with %s = %v, want no error (new segment)", name, err)
+			}
+
+			it := hst.Iterator(0)
+			if !it.Next() {
+				t.Fatal("sample 0: Next() = false")
+			}
+			ts0, got0 := it.At()
+			if ts0 != 1700000000000 {
+				t.Fatalf("sample 0 ts = %d, want 1700000000000", ts0)
+			}
+			histEqual(t, got0, h1)
+
+			if !it.Next() {
+				t.Fatal("sample 1: Next() = false")
+			}
+			ts1, got1 := it.At()
+			if ts1 != 1700000015000 {
+				t.Fatalf("sample 1 ts = %d, want 1700000015000", ts1)
+			}
+			histEqual(t, got1, h2)
+
+			if it.Next() {
+				t.Fatal("more samples than expected")
 			}
 		})
 	}
 }
 
-func TestHistogramStoreRejectsLayoutChangeFloat(t *testing.T) {
-	hst := NewHistogramStore()
+// TestHistogramStoreLayoutChangeStartsNewSegmentFloat is
+// TestHistogramStoreLayoutChangeStartsNewSegment's FloatHistogram counterpart.
+func TestHistogramStoreLayoutChangeStartsNewSegmentFloat(t *testing.T) {
 	h1 := &histogram.FloatHistogram{
 		Schema:          0,
 		PositiveSpans:   []histogram.Span{{Offset: 0, Length: 2}},
 		PositiveBuckets: []float64{1, 1},
 	}
-	if err := hst.AppendFloat(0, 1700000000000, h1); err != nil {
-		t.Fatalf("AppendFloat: %v", err)
-	}
-
 	cases := map[string]*histogram.FloatHistogram{
 		"schema changed": {
 			Schema: 1, PositiveSpans: h1.PositiveSpans, PositiveBuckets: []float64{1, 1},
@@ -268,12 +293,125 @@ func TestHistogramStoreRejectsLayoutChangeFloat(t *testing.T) {
 			PositiveBuckets: []float64{1, 1, 1},
 		},
 	}
-	for name, h := range cases {
+	for name, h2 := range cases {
 		t.Run(name, func(t *testing.T) {
-			if err := hst.AppendFloat(0, 1700000015000, h); err != ErrHistogramLayoutChanged {
-				t.Fatalf("AppendFloat with %s = %v, want ErrHistogramLayoutChanged", name, err)
+			hst := NewHistogramStore()
+			if err := hst.AppendFloat(0, 1700000000000, h1); err != nil {
+				t.Fatalf("AppendFloat h1: %v", err)
+			}
+			if err := hst.AppendFloat(0, 1700000015000, h2); err != nil {
+				t.Fatalf("AppendFloat with %s = %v, want no error (new segment)", name, err)
+			}
+
+			it := hst.Iterator(0)
+			if !it.Next() {
+				t.Fatal("sample 0: Next() = false")
+			}
+			ts0, got0 := it.AtFloat()
+			if ts0 != 1700000000000 {
+				t.Fatalf("sample 0 ts = %d, want 1700000000000", ts0)
+			}
+			floatHistEqual(t, got0, h1)
+
+			if !it.Next() {
+				t.Fatal("sample 1: Next() = false")
+			}
+			ts1, got1 := it.AtFloat()
+			if ts1 != 1700000015000 {
+				t.Fatalf("sample 1 ts = %d, want 1700000015000", ts1)
+			}
+			floatHistEqual(t, got1, h2)
+
+			if it.Next() {
+				t.Fatal("more samples than expected")
 			}
 		})
+	}
+}
+
+// TestHistogramStoreRejectsBucketCountMismatch confirms ErrHistogramLayoutChanged's
+// new, narrower meaning still fires: a sample whose spans/schema/zero-threshold
+// match the current segment (so Append reuses it, not a new one) but whose own
+// bucket slice length doesn't match what those spans imply - an internally
+// inconsistent input, not a legitimate layout change, still a guarded error.
+func TestHistogramStoreRejectsBucketCountMismatch(t *testing.T) {
+	hst := NewHistogramStore()
+	h1 := &histogram.Histogram{
+		Schema:          0,
+		PositiveSpans:   []histogram.Span{{Offset: 0, Length: 2}},
+		PositiveBuckets: []int64{1, 1},
+	}
+	if err := hst.Append(0, 1700000000000, h1); err != nil {
+		t.Fatalf("Append h1: %v", err)
+	}
+	hBad := &histogram.Histogram{
+		Schema:          0,
+		PositiveSpans:   h1.PositiveSpans, // same spans -> Append reuses the current segment
+		PositiveBuckets: []int64{1, 1, 1}, // but 3 buckets, not the 2 those spans imply
+	}
+	if err := hst.Append(0, 1700000015000, hBad); err != ErrHistogramLayoutChanged {
+		t.Fatalf("Append with mismatched bucket count = %v, want ErrHistogramLayoutChanged", err)
+	}
+}
+
+// TestHistogramStoreRejectsBucketCountMismatchFloat is
+// TestHistogramStoreRejectsBucketCountMismatch's FloatHistogram counterpart.
+func TestHistogramStoreRejectsBucketCountMismatchFloat(t *testing.T) {
+	hst := NewHistogramStore()
+	h1 := &histogram.FloatHistogram{
+		Schema:          0,
+		PositiveSpans:   []histogram.Span{{Offset: 0, Length: 2}},
+		PositiveBuckets: []float64{1, 1},
+	}
+	if err := hst.AppendFloat(0, 1700000000000, h1); err != nil {
+		t.Fatalf("AppendFloat h1: %v", err)
+	}
+	hBad := &histogram.FloatHistogram{
+		Schema:          0,
+		PositiveSpans:   h1.PositiveSpans,
+		PositiveBuckets: []float64{1, 1, 1},
+	}
+	if err := hst.AppendFloat(0, 1700000015000, hBad); err != ErrHistogramLayoutChanged {
+		t.Fatalf("AppendFloat with mismatched bucket count = %v, want ErrHistogramLayoutChanged", err)
+	}
+}
+
+// TestHistogramStoreTruncateAcrossLayoutChange confirms Truncate's decode-then-
+// re-Append round trip correctly re-segments a kept range that spans a genuine
+// layout change, rather than assuming (as a single-segment implementation would
+// have to) that every retained sample shares one layout.
+func TestHistogramStoreTruncateAcrossLayoutChange(t *testing.T) {
+	hst := NewHistogramStore()
+	h1 := &histogram.Histogram{Schema: 0, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{1}}
+	h2 := &histogram.Histogram{Schema: 0, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{2}} // aged out by Truncate
+	h3 := &histogram.Histogram{Schema: 1, PositiveSpans: []histogram.Span{{Offset: 0, Length: 2}}, PositiveBuckets: []int64{3, 1}}
+	base := int64(1700000000000)
+	if err := hst.Append(0, base, h1); err != nil {
+		t.Fatalf("Append h1: %v", err)
+	}
+	if err := hst.Append(0, base+15000, h2); err != nil {
+		t.Fatalf("Append h2: %v", err)
+	}
+	if err := hst.Append(0, base+30000, h3); err != nil {
+		t.Fatalf("Append h3: %v", err)
+	}
+
+	n := hst.Truncate(0, base+20000) // drops h1, h2 (both < mint), keeps h3
+	if n != 1 {
+		t.Fatalf("Truncate retained %d samples, want 1", n)
+	}
+
+	it := hst.Iterator(0)
+	if !it.Next() {
+		t.Fatal("Next() = false after Truncate")
+	}
+	ts, got := it.At()
+	if ts != base+30000 {
+		t.Fatalf("ts = %d, want %d", ts, base+30000)
+	}
+	histEqual(t, got, h3)
+	if it.Next() {
+		t.Fatal("more samples than expected after Truncate")
 	}
 }
 

@@ -270,6 +270,78 @@ func TestChunkQuerierHistogramSeriesCounterResetSplitsChunk(t *testing.T) {
 	histEqual(t, metas[1].h, small)
 }
 
+// TestChunkQuerierHistogramSeriesLayoutChangeSplitsChunk confirms a genuine
+// schema/zero-threshold/span change (histoSegment's own doc comment, CHECKLIST.md's
+// Phase 3 mid-stream-layout-change work) reaches the real gRPC chunks path
+// correctly: HistogramStore now stores this as two segments instead of erroring,
+// HistogramIterator walks both transparently, and chunkenc.HistogramAppender.
+// AppendHistogram (called exactly the same way for every decoded sample,
+// layout-changed or not) detects the incompatible layout on its own and starts a
+// genuinely new chunk - no special-casing needed anywhere in this file for the
+// reason the split happened.
+func TestChunkQuerierHistogramSeriesLayoutChangeSplitsChunk(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	app := h.Appender(context.Background())
+	l := labels.FromStrings(
+		labels.MetricName, "request_latency",
+		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+	)
+	base := int64(1700000000000)
+	h1 := &histogram.Histogram{Schema: 0, Count: 1, Sum: 1, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{1}}
+	// A genuine layout change - different schema AND span shape, not a counter
+	// reset (Count/Sum still increase).
+	h2 := &histogram.Histogram{Schema: 1, Count: 5, Sum: 9, PositiveSpans: []histogram.Span{{Offset: 0, Length: 2}}, PositiveBuckets: []int64{3, 2}}
+
+	if _, err := app.AppendHistogram(0, l, base, h1, nil); err != nil {
+		t.Fatalf("AppendHistogram(h1): %v", err)
+	}
+	if _, err := app.AppendHistogram(0, l, base+15000, h2, nil); err != nil {
+		t.Fatalf("AppendHistogram(h2): %v", err)
+	}
+
+	cq, err := h.ChunkQuerier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("ChunkQuerier: %v", err)
+	}
+	defer cq.Close()
+	css := cq.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "request_latency"))
+	if !css.Next() {
+		t.Fatal("Select found no series")
+	}
+	cit := css.At().Iterator(nil)
+
+	var metas []struct {
+		ts int64
+		h  *histogram.Histogram
+	}
+	for cit.Next() {
+		meta := cit.At()
+		it := meta.Chunk.Iterator(nil)
+		if it.Next() != chunkenc.ValHistogram {
+			t.Fatalf("chunk has no samples: %v", it.Err())
+		}
+		ts, hg := it.AtHistogram(nil)
+		metas = append(metas, struct {
+			ts int64
+			h  *histogram.Histogram
+		}{ts, hg})
+		if it.Next() != chunkenc.ValNone {
+			t.Fatal("expected exactly one sample per chunk in this test's setup")
+		}
+	}
+	if err := cit.Err(); err != nil {
+		t.Fatalf("chunks.Iterator error: %v", err)
+	}
+	if len(metas) != 2 {
+		t.Fatalf("got %d chunks, want 2 (the layout change should have split into a new chunk)", len(metas))
+	}
+	if metas[0].ts != base || metas[1].ts != base+15000 {
+		t.Fatalf("chunk timestamps = [%d, %d], want [%d, %d]", metas[0].ts, metas[1].ts, base, base+15000)
+	}
+	histEqual(t, metas[0].h, h1)
+	histEqual(t, metas[1].h, h2)
+}
+
 // TestChunkQuerierFloatHistogramSeriesRoundTrip is
 // TestChunkQuerierHistogramSeriesRoundTrip's FloatHistogram counterpart - a
 // stable-layout, no-counter-reset sequence must round-trip through ONE real
@@ -401,6 +473,70 @@ func TestChunkQuerierFloatHistogramSeriesCounterResetSplitsChunk(t *testing.T) {
 	}
 	floatHistEqual(t, metas[0].h, big)
 	floatHistEqual(t, metas[1].h, small)
+}
+
+// TestChunkQuerierFloatHistogramSeriesLayoutChangeSplitsChunk is
+// TestChunkQuerierHistogramSeriesLayoutChangeSplitsChunk's FloatHistogram
+// counterpart.
+func TestChunkQuerierFloatHistogramSeriesLayoutChangeSplitsChunk(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	app := h.Appender(context.Background())
+	l := labels.FromStrings(
+		labels.MetricName, "request_latency",
+		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+	)
+	base := int64(1700000000000)
+	h1 := &histogram.FloatHistogram{Schema: 0, Count: 1, Sum: 1, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []float64{1}}
+	h2 := &histogram.FloatHistogram{Schema: 1, Count: 5, Sum: 9, PositiveSpans: []histogram.Span{{Offset: 0, Length: 2}}, PositiveBuckets: []float64{3, 2}}
+
+	if _, err := app.AppendHistogram(0, l, base, nil, h1); err != nil {
+		t.Fatalf("AppendHistogram(h1): %v", err)
+	}
+	if _, err := app.AppendHistogram(0, l, base+15000, nil, h2); err != nil {
+		t.Fatalf("AppendHistogram(h2): %v", err)
+	}
+
+	cq, err := h.ChunkQuerier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("ChunkQuerier: %v", err)
+	}
+	defer cq.Close()
+	css := cq.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "request_latency"))
+	if !css.Next() {
+		t.Fatal("Select found no series")
+	}
+	cit := css.At().Iterator(nil)
+
+	var metas []struct {
+		ts int64
+		h  *histogram.FloatHistogram
+	}
+	for cit.Next() {
+		meta := cit.At()
+		it := meta.Chunk.Iterator(nil)
+		if it.Next() != chunkenc.ValFloatHistogram {
+			t.Fatalf("chunk has no samples: %v", it.Err())
+		}
+		ts, hg := it.AtFloatHistogram(nil)
+		metas = append(metas, struct {
+			ts int64
+			h  *histogram.FloatHistogram
+		}{ts, hg})
+		if it.Next() != chunkenc.ValNone {
+			t.Fatal("expected exactly one sample per chunk in this test's setup")
+		}
+	}
+	if err := cit.Err(); err != nil {
+		t.Fatalf("chunks.Iterator error: %v", err)
+	}
+	if len(metas) != 2 {
+		t.Fatalf("got %d chunks, want 2 (the layout change should have split into a new chunk)", len(metas))
+	}
+	if metas[0].ts != base || metas[1].ts != base+15000 {
+		t.Fatalf("chunk timestamps = [%d, %d], want [%d, %d]", metas[0].ts, metas[1].ts, base, base+15000)
+	}
+	floatHistEqual(t, metas[0].h, h1)
+	floatHistEqual(t, metas[1].h, h2)
 }
 
 func TestChunkQuerierLabelValuesAndNames(t *testing.T) {
