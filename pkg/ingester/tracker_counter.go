@@ -7,7 +7,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/model/labels"
-	"github.com/prometheus/prometheus/tsdb"
 
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
@@ -54,14 +53,8 @@ func (tc *trackerCounter) updateConfig(ctx context.Context, db tsdbStore, tracke
 		return
 	}
 
-	ir, err := db.Head().Index()
-	if err != nil {
-		return
-	}
-	defer ir.Close()
-
 	for name, m := range tc.matchers {
-		p, err := tsdb.PostingsForMatchers(ctx, ir, m...)
+		p, err := db.PostingsForMatchers(ctx, m...)
 		if err != nil {
 			continue
 		}

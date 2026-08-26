@@ -729,7 +729,12 @@ func TestPushRace(t *testing.T) {
 	wg.Wait()
 
 	db, _ := ing.getTSDB(userID)
-	ir, err := db.db.Head().Index()
+	// Reaches through tsdbStore's narrow interface to the concrete backend for a
+	// deep index check (SortedPostings/Series) beyond what PostingsForMatchers
+	// exposes - same pattern blocksToDelete uses for tsdb.DefaultBlocksToDelete.
+	nativeStore, ok := db.db.(*nativeTSDBStore)
+	require.True(t, ok)
+	ir, err := nativeStore.db.Head().Index()
 	require.NoError(t, err)
 
 	p, err := ir.Postings(ctx, "", "")
@@ -749,7 +754,7 @@ func TestPushRace(t *testing.T) {
 		builder.Reset()
 	}
 	require.Equal(t, 2*numberOfSeries, total)
-	require.Equal(t, uint64(2*numberOfSeries), db.Head().NumSeries())
+	require.Equal(t, uint64(2*numberOfSeries), db.NumSeries())
 }
 
 func TestIngesterUserLimitExceeded(t *testing.T) {
@@ -5171,7 +5176,7 @@ func TestIngester_seriesCountIsCorrectAfterClosingTSDBForDeletedTenant(t *testin
 	require.True(t, db.deletionMarkFound.Load())
 
 	// If we try to close TSDB now, it should succeed, even though TSDB is not idle and empty.
-	require.Equal(t, uint64(1), db.Head().NumSeries())
+	require.Equal(t, uint64(1), db.NumSeries())
 	require.Equal(t, tsdbTenantMarkedForDeletion, i.closeAndDeleteUserTSDBIfIdle(userID))
 
 	// Closing should decrease series count.
@@ -6147,8 +6152,7 @@ func verifyCompactedHead(t *testing.T, i *Ingester, expected bool) {
 	require.NoError(t, err)
 	require.NotNil(t, db)
 
-	h := db.Head()
-	require.Equal(t, expected, h.NumSeries() == 0)
+	require.Equal(t, expected, db.NumSeries() == 0)
 }
 
 func pushSingleSampleWithMetadata(t *testing.T, i *Ingester) {
@@ -6227,9 +6231,7 @@ func TestHeadCompactionOnStartup(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, db)
 
-	h := db.Head()
-
-	dur := time.Duration(h.MaxTime()-h.MinTime()) * time.Millisecond
+	dur := time.Duration(db.MaxTime()-db.MinTime()) * time.Millisecond
 	require.True(t, dur <= 2*time.Hour)
 	require.Equal(t, 11, len(db.Blocks()))
 }
@@ -6461,7 +6463,7 @@ func TestIngesterNoFlushWithInFlightRequest(t *testing.T) {
 		if err != nil || db == nil {
 			return false
 		}
-		return db.Head().NumSeries()
+		return db.NumSeries()
 	})
 
 	require.NoError(t, testutil.GatherAndCompare(registry, strings.NewReader(`
@@ -7520,7 +7522,7 @@ func TestIngester_UserTSDB_BlocksToDelete(t *testing.T) {
 			block4.Meta().ULID: {},
 		}
 		userDB := &userTSDB{
-			db:                   db,
+			db:                   newNativeTSDBStore(db),
 			shipper:              &shipperMock{},
 			shippedBlocks:        shippedBlocks,
 			blockRetentionPeriod: 2 * time.Hour.Milliseconds(),
@@ -7552,7 +7554,7 @@ func TestIngester_UserTSDB_BlocksToDelete(t *testing.T) {
 			block3.Meta().ULID: {},
 		}
 		userDB := &userTSDB{
-			db:                   db,
+			db:                   newNativeTSDBStore(db),
 			shipper:              &shipperMock{},
 			shippedBlocks:        shippedBlocks,
 			blockRetentionPeriod: 2 * time.Hour.Milliseconds(),
@@ -7580,7 +7582,7 @@ func TestIngester_UserTSDB_BlocksToDelete(t *testing.T) {
 
 		shippedBlocks := map[ulid.ULID]struct{}{}
 		userDB := &userTSDB{
-			db:                   db,
+			db:                   newNativeTSDBStore(db),
 			shipper:              &shipperMock{},
 			shippedBlocks:        shippedBlocks,
 			blockRetentionPeriod: 2 * time.Hour.Milliseconds(),
@@ -7612,7 +7614,7 @@ func TestIngester_UserTSDB_BlocksToDelete(t *testing.T) {
 			block4.Meta().ULID: {},
 		}
 		userDB := &userTSDB{
-			db:                   db,
+			db:                   newNativeTSDBStore(db),
 			shipper:              &shipperMock{},
 			shippedBlocks:        shippedBlocks,
 			blockRetentionPeriod: 2 * time.Hour.Milliseconds(),
@@ -7645,7 +7647,7 @@ func TestIngester_UserTSDB_BlocksToDelete(t *testing.T) {
 			block4.Meta().ULID: {},
 		}
 		userDB := &userTSDB{
-			db:                   db,
+			db:                   newNativeTSDBStore(db),
 			shipper:              &shipperMock{},
 			shippedBlocks:        shippedBlocks,
 			blockRetentionPeriod: 2 * time.Hour.Milliseconds(),
@@ -7671,7 +7673,7 @@ func TestIngester_UserTSDB_BlocksToDelete(t *testing.T) {
 		block4 := CreateBlock(t, context.Background(), tempDir, currentTime.Add(-6*time.Hour).UnixMilli(), currentTime.Add(-5*time.Hour).UnixMilli())
 		blocks = append(blocks, block4)
 		userDB := &userTSDB{
-			db:                   db,
+			db:                   newNativeTSDBStore(db),
 			blockRetentionPeriod: 2 * time.Hour.Milliseconds(),
 		}
 

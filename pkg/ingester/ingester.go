@@ -35,6 +35,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
+	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/prometheus/prometheus/util/compression"
 	"github.com/prometheus/prometheus/util/zeropool"
 	"github.com/thanos-io/objstore"
@@ -375,24 +376,143 @@ func (r tsdbCloseCheckResult) shouldClose() bool {
 	return r == tsdbIdle || r == tsdbTenantMarkedForDeletion
 }
 
-// tsdbStore is the subset of *tsdb.DB that userTSDB uses, extracted to make userTSDB mockable in tests.
+// tsdbStore is the subset of *tsdb.DB-like functionality userTSDB uses, extracted
+// to make userTSDB mockable in tests and, longer-term, to allow a non-*tsdb.DB
+// backend (see cortex/pkg/ingester/columnarhead, CHECKLIST.md's Phase 7) to satisfy
+// it too. Unlike the original extraction, this does NOT expose Head() *tsdb.Head:
+// every real .Head() call site in this package was audited (not assumed) and each
+// one only ever needed NumSeries/MinTime/MaxTime, or index-level postings for a set
+// of matchers - both now first-class methods here instead of requiring the caller
+// to hold a concrete *tsdb.Head or a full tsdb.IndexReader. See nativeTSDBStore's
+// doc comment for the adapter *tsdb.DB itself needs to satisfy this shape (it isn't
+// vendored code Cortex can add these methods to directly).
 type tsdbStore interface {
 	Appender(ctx context.Context) storage.Appender
 	Querier(mint, maxt int64) (storage.Querier, error)
 	ChunkQuerier(mint, maxt int64) (storage.ChunkQuerier, error)
 	ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier, error)
-	Head() *tsdb.Head
 	Blocks() []*tsdb.Block
 	Close() error
 	Compact(ctx context.Context) error
 	StartTime() (int64, error)
-	CompactHead(head *tsdb.RangeHead) error
+	// CompactHeadRange replaces the original CompactHead(*tsdb.RangeHead) shape -
+	// tsdb.RangeHead is itself constructed from a concrete *tsdb.Head
+	// (tsdb.NewRangeHead), which the caller used to build itself from Head()'s
+	// result. Asking for a time range instead lets each backend build whatever
+	// concrete range-selection it needs internally (a real *tsdb.DB still builds
+	// a tsdb.RangeHead, just inside nativeTSDBStore now).
+	CompactHeadRange(ctx context.Context, mint, maxt int64) error
 	CompactOOOHead(ctx context.Context) error
 	ApplyConfig(conf *config.Config) error
 	Dir() string
+	NumSeries() uint64
+	MinTime() int64
+	MaxTime() int64
+	// PostingsForMatchers is the narrow index-level query capability the
+	// label-set/tracker cardinality counters (user_state.go, tracker_counter.go)
+	// actually use - traced through their real call chains (down to
+	// tsdb.PostingsForMatchers's own implementation) before choosing this
+	// shape: they only ever touch 4 of tsdb.IndexReader's 11 methods
+	// (Postings/PostingsForAllLabelValues/PostingsForLabelMatching/Close), never
+	// Symbols/SortedLabelValues/LabelValues/SortedPostings/ShardedPostings/
+	// Series/LabelNames/LabelNamesFor. Exposing exactly this instead of the full
+	// tsdb.IndexReader interface means a non-tsdb.Head-backed store never needs
+	// to implement 7 unused methods just to satisfy the type.
+	PostingsForMatchers(ctx context.Context, ms ...*labels.Matcher) (index.Postings, error)
 }
 
-var _ tsdbStore = (*tsdb.DB)(nil)
+var _ tsdbStore = (*nativeTSDBStore)(nil)
+
+// nativeTSDBStore adapts a real *tsdb.DB to tsdbStore's shape. *tsdb.DB is vendored
+// (see AGENTS.md: "Do not modify vendored code directly"), and doesn't have
+// NumSeries/MinTime/MaxTime/PostingsForMatchers/CompactHeadRange as literal methods
+// of its own (those live on *tsdb.Head, reached via db.Head()) - this is the
+// non-vendored adapter that supplies them, so *tsdb.DB itself no longer needs to
+// satisfy tsdbStore directly. A columnarhead-backed tsdbStore implementation (Phase
+// 7) satisfies the exact same interface without ever constructing a concrete
+// *tsdb.Head or tsdb.RangeHead.
+type nativeTSDBStore struct {
+	db *tsdb.DB
+}
+
+func newNativeTSDBStore(db *tsdb.DB) *nativeTSDBStore {
+	return &nativeTSDBStore{db: db}
+}
+
+func (s *nativeTSDBStore) Appender(ctx context.Context) storage.Appender {
+	return s.db.Appender(ctx)
+}
+
+func (s *nativeTSDBStore) Querier(mint, maxt int64) (storage.Querier, error) {
+	return s.db.Querier(mint, maxt)
+}
+
+func (s *nativeTSDBStore) ChunkQuerier(mint, maxt int64) (storage.ChunkQuerier, error) {
+	return s.db.ChunkQuerier(mint, maxt)
+}
+
+func (s *nativeTSDBStore) ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier, error) {
+	return s.db.ExemplarQuerier(ctx)
+}
+
+func (s *nativeTSDBStore) Blocks() []*tsdb.Block {
+	return s.db.Blocks()
+}
+
+func (s *nativeTSDBStore) Close() error {
+	return s.db.Close()
+}
+
+func (s *nativeTSDBStore) Compact(ctx context.Context) error {
+	return s.db.Compact(ctx)
+}
+
+func (s *nativeTSDBStore) StartTime() (int64, error) {
+	return s.db.StartTime()
+}
+
+func (s *nativeTSDBStore) CompactHeadRange(_ context.Context, mint, maxt int64) error {
+	return s.db.CompactHead(tsdb.NewRangeHead(s.db.Head(), mint, maxt))
+}
+
+func (s *nativeTSDBStore) CompactOOOHead(ctx context.Context) error {
+	return s.db.CompactOOOHead(ctx)
+}
+
+func (s *nativeTSDBStore) ApplyConfig(conf *config.Config) error {
+	return s.db.ApplyConfig(conf)
+}
+
+func (s *nativeTSDBStore) Dir() string {
+	return s.db.Dir()
+}
+
+func (s *nativeTSDBStore) NumSeries() uint64 {
+	return s.db.Head().NumSeries()
+}
+
+func (s *nativeTSDBStore) MinTime() int64 {
+	return s.db.Head().MinTime()
+}
+
+func (s *nativeTSDBStore) MaxTime() int64 {
+	return s.db.Head().MaxTime()
+}
+
+// PostingsForMatchers opens the head's index reader, resolves ms through real
+// Prometheus's own tsdb.PostingsForMatchers, and closes the reader before
+// returning - safe to do before the caller finishes iterating the result despite
+// looking like a use-after-close, because headIndexReader.Close (vendor/.../tsdb/
+// head_read.go) is a real no-op: an in-memory head index has nothing to release,
+// unlike a block's mmap'd one.
+func (s *nativeTSDBStore) PostingsForMatchers(ctx context.Context, ms ...*labels.Matcher) (index.Postings, error) {
+	ir, err := s.db.Head().Index()
+	if err != nil {
+		return nil, err
+	}
+	defer ir.Close()
+	return tsdb.PostingsForMatchers(ctx, ir, ms...)
+}
 
 type userTSDB struct {
 	db                  tsdbStore
@@ -465,8 +585,20 @@ func (u *userTSDB) ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier
 	return u.db.ExemplarQuerier(ctx)
 }
 
-func (u *userTSDB) Head() *tsdb.Head {
-	return u.db.Head()
+func (u *userTSDB) NumSeries() uint64 {
+	return u.db.NumSeries()
+}
+
+func (u *userTSDB) MinTime() int64 {
+	return u.db.MinTime()
+}
+
+func (u *userTSDB) MaxTime() int64 {
+	return u.db.MaxTime()
+}
+
+func (u *userTSDB) PostingsForMatchers(ctx context.Context, ms ...*labels.Matcher) (index.Postings, error) {
+	return u.db.PostingsForMatchers(ctx, ms...)
 }
 
 func (u *userTSDB) Blocks() []*tsdb.Block {
@@ -514,23 +646,21 @@ func (u *userTSDB) compactHead(ctx context.Context, blockDuration int64) error {
 	// So we wait for existing in-flight requests to finish. Future push requests would fail until compaction is over.
 	u.pushesInFlight.Wait()
 
-	h := u.Head()
-
-	minTime, maxTime := h.MinTime(), h.MaxTime()
+	minTime, maxTime := u.MinTime(), u.MaxTime()
 
 	for (minTime/blockDuration)*blockDuration != (maxTime/blockDuration)*blockDuration {
 		// Data in Head spans across multiple block ranges, so we break it into blocks here.
 		// Block max time is exclusive, so we do a -1 here.
 		blockMaxTime := ((minTime/blockDuration)+1)*blockDuration - 1
-		if err := u.db.CompactHead(tsdb.NewRangeHead(h, minTime, blockMaxTime)); err != nil {
+		if err := u.db.CompactHeadRange(ctx, minTime, blockMaxTime); err != nil {
 			return err
 		}
 
 		// Get current min/max times after compaction.
-		minTime, maxTime = h.MinTime(), h.MaxTime()
+		minTime, maxTime = u.MinTime(), u.MaxTime()
 	}
 
-	if err := u.db.CompactHead(tsdb.NewRangeHead(h, minTime, maxTime)); err != nil {
+	if err := u.db.CompactHeadRange(ctx, minTime, maxTime); err != nil {
 		return err
 	}
 	return u.db.CompactOOOHead(ctx)
@@ -551,7 +681,7 @@ func (u *userTSDB) PreCreation(metric labels.Labels) error {
 	}
 
 	// Total series limit.
-	if err := u.limiter.AssertMaxSeriesPerUser(u.userID, int(u.Head().NumSeries())); err != nil {
+	if err := u.limiter.AssertMaxSeriesPerUser(u.userID, int(u.NumSeries())); err != nil {
 		return err
 	}
 
@@ -623,11 +753,11 @@ func (u *userTSDB) blocksToDelete(blocks []*tsdb.Block) map[ulid.ULID]struct{} {
 		return nil
 	}
 	// tsdb.DefaultBlocksToDelete is vendored and needs the concrete *tsdb.DB.
-	realDB, ok := u.db.(*tsdb.DB)
+	store, ok := u.db.(*nativeTSDBStore)
 	if !ok {
 		return nil
 	}
-	deletable := tsdb.DefaultBlocksToDelete(realDB)(blocks)
+	deletable := tsdb.DefaultBlocksToDelete(store.db)(blocks)
 
 	now := time.Now().UnixMilli()
 	for _, b := range blocks {
@@ -724,7 +854,7 @@ func (u *userTSDB) shouldCloseTSDB(idleTimeout time.Duration) tsdbCloseCheckResu
 	}
 
 	// If head is not compacted, we cannot close this yet.
-	if u.Head().NumSeries() > 0 {
+	if u.NumSeries() > 0 {
 		return tsdbNotCompacted
 	}
 
@@ -1541,7 +1671,7 @@ func (i *Ingester) Push(ctx context.Context, req *cortexpb.WriteRequest) (*corte
 
 	// Walk the samples, appending them to the users database
 	app := db.Appender(ctx).(extendedAppender)
-	headMaxTime = db.Head().MaxTime()
+	headMaxTime = db.MaxTime()
 
 	// Ensure the appender is always released so that we don't leak TSDB head
 	// series references, mmap'd chunks and pending state on early returns.
@@ -2568,7 +2698,7 @@ func createUserStats(db *userTSDB, activeSeriesMetricsEnabled bool) UserStats {
 		IngestionRate:     apiRate + ruleRate,
 		APIIngestionRate:  apiRate,
 		RuleIngestionRate: ruleRate,
-		NumSeries:         db.Head().NumSeries(),
+		NumSeries:         db.NumSeries(),
 		ActiveSeries:      activeSeries,
 		LoadedBlocks:      uint64(len(db.Blocks())),
 	}
@@ -3012,7 +3142,7 @@ func (i *Ingester) blockChunkQuerierFunc(userId string) tsdb.BlockChunkQuerierFu
 		// For more details, see: https://github.com/cortexproject/cortex/issues/6556
 		// TODO: alanprot: Consider removing this logic when prometheus is updated as this logic is "fixed" upstream.
 		var q storage.ChunkQuerier
-		if postingCache == nil || mint > db.Head().MaxTime() {
+		if postingCache == nil || mint > db.MaxTime() {
 			q, err = tsdb.NewBlockChunkQuerier(b, mint, maxt)
 		} else {
 			q, err = cortex_tsdb.NewCachedBlockChunkQuerier(postingCache, b, mint, maxt)
@@ -3142,15 +3272,15 @@ func (i *Ingester) createTSDB(userID string) (*userTSDB, error) {
 		return nil, errors.Wrapf(err, "failed to compact TSDB: %s", udir)
 	}
 
-	userDB.db = db
+	userDB.db = newNativeTSDBStore(db)
 	// We set the limiter here because we don't want to limit
 	// series during WAL replay.
 	userDB.limiter = i.limiter
 
-	if db.Head().NumSeries() > 0 {
+	if userDB.NumSeries() > 0 {
 		// If there are series in the head, use max time from head. If this time is too old,
 		// TSDB will be eligible for flushing and closing sooner, unless more data is pushed to it quickly.
-		userDB.setLastUpdate(util.TimeFromMillis(db.Head().MaxTime()))
+		userDB.setLastUpdate(util.TimeFromMillis(userDB.MaxTime()))
 	} else {
 		// If head is empty (eg. new TSDB), don't close it right after.
 		userDB.setLastUpdate(time.Now())
@@ -3340,7 +3470,7 @@ func (i *Ingester) getMemorySeriesMetric() float64 {
 
 	count := uint64(0)
 	for _, db := range i.TSDBState.dbs {
-		count += db.Head().NumSeries()
+		count += db.NumSeries()
 	}
 
 	return float64(count)
@@ -3523,8 +3653,7 @@ func (i *Ingester) compactBlocks(ctx context.Context, force bool, allowed *users
 		}
 
 		// Don't do anything, if there is nothing to compact.
-		h := userDB.Head()
-		if h.NumSeries() == 0 {
+		if userDB.NumSeries() == 0 {
 			return nil
 		}
 
@@ -3621,7 +3750,7 @@ func (i *Ingester) closeAndDeleteUserTSDBIfIdle(userID string) tsdbCloseCheckRes
 	// At this point there are no more pushes to TSDB, and no possible compaction. Normally TSDB is empty,
 	// but if we're closing TSDB because of tenant deletion mark, then it may still contain some series.
 	// We need to remove these series from series count.
-	i.TSDBState.seriesCount.Sub(int64(userDB.Head().NumSeries()))
+	i.TSDBState.seriesCount.Sub(int64(userDB.NumSeries()))
 
 	dir := userDB.db.Dir()
 
@@ -3980,7 +4109,7 @@ func metadataQueryRange(queryStart, queryEnd int64, db *userTSDB, queryIngesters
 
 	// Completely outside.
 	if queryEnd < lowestTs {
-		mint, maxt = db.Head().MinTime(), db.Head().MaxTime()
+		mint, maxt = db.MinTime(), db.MaxTime()
 	} else if queryStart < lowestTs {
 		// Partially inside.
 		mint, maxt = 0, math.MaxInt64

@@ -212,7 +212,7 @@ func TestGetCardinalityForLimitsPerLabelSet(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cnt, err := getCardinalityForLimitsPerLabelSet(ctx, tc.numSeries, tc.ir, tc.limits, tc.limits[tc.idx])
+			cnt, err := getCardinalityForLimitsPerLabelSet(ctx, tc.numSeries, &mockTSDBStore{ir: tc.ir}, tc.limits, tc.limits[tc.idx])
 			if err != nil {
 				require.EqualError(t, err, tc.err.Error())
 			} else {
@@ -262,7 +262,7 @@ func TestGetPostingForLabels(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			p, err := getPostingForLabels(ctx, tc.ir, tc.lbls)
+			p, err := getPostingForLabels(ctx, &mockTSDBStore{ir: tc.ir}, tc.lbls)
 			if err != nil {
 				require.EqualError(t, err, tc.err.Error())
 			} else {
@@ -374,6 +374,20 @@ func (ir *mockIndexReader) LabelNamesFor(ctx context.Context, postings index.Pos
 }
 
 func (ir *mockIndexReader) Close() error { return nil }
+
+// mockTSDBStore adapts a mockIndexReader to tsdbStore for
+// TestGetCardinalityForLimitsPerLabelSet/TestGetPostingForLabels, which only ever
+// exercise PostingsForMatchers - embedding tsdbStore (left nil) satisfies every
+// other method structurally without a real implementation; these tests never call
+// one, so there's nothing to fake beyond PostingsForMatchers itself.
+type mockTSDBStore struct {
+	tsdbStore
+	ir tsdb.IndexReader
+}
+
+func (s *mockTSDBStore) PostingsForMatchers(ctx context.Context, ms ...*labels.Matcher) (index.Postings, error) {
+	return tsdb.PostingsForMatchers(ctx, s.ir, ms...)
+}
 
 func TestMetricCounter_ActiveMetricNames(t *testing.T) {
 	limits := validation.Limits{MaxLocalSeriesPerMetric: 100}

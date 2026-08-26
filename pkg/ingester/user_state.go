@@ -6,7 +6,6 @@ import (
 
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
-	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/segmentio/fasthash/fnv1a"
 
@@ -151,15 +150,8 @@ func (m *labelSetCounter) backFillLimit(ctx context.Context, u *userTSDB, forceB
 		}
 	}
 
-	ir, err := u.db.Head().Index()
-	if err != nil {
-		return 0, err
-	}
-
-	defer ir.Close()
-
-	numSeries := u.db.Head().NumSeries()
-	totalCount, err := getCardinalityForLimitsPerLabelSet(ctx, numSeries, ir, allLimits, limit)
+	numSeries := u.db.NumSeries()
+	totalCount, err := getCardinalityForLimitsPerLabelSet(ctx, numSeries, u.db, allLimits, limit)
 	if err != nil {
 		return 0, err
 	}
@@ -171,10 +163,10 @@ func (m *labelSetCounter) backFillLimit(ctx context.Context, u *userTSDB, forceB
 	return totalCount, nil
 }
 
-func getCardinalityForLimitsPerLabelSet(ctx context.Context, numSeries uint64, ir tsdb.IndexReader, allLimits []validation.LimitsPerLabelSet, limit validation.LimitsPerLabelSet) (int, error) {
+func getCardinalityForLimitsPerLabelSet(ctx context.Context, numSeries uint64, db tsdbStore, allLimits []validation.LimitsPerLabelSet, limit validation.LimitsPerLabelSet) (int, error) {
 	// Easy path with explicit labels.
 	if limit.LabelSet.Len() > 0 {
-		p, err := getPostingForLabels(ctx, ir, limit.LabelSet)
+		p, err := getPostingForLabels(ctx, db, limit.LabelSet)
 		if err != nil {
 			return 0, err
 		}
@@ -187,7 +179,7 @@ func getCardinalityForLimitsPerLabelSet(ctx context.Context, numSeries uint64, i
 		if l.Hash == limit.Hash {
 			continue
 		}
-		p, err := getPostingForLabels(ctx, ir, l.LabelSet)
+		p, err := getPostingForLabels(ctx, db, l.LabelSet)
 		if err != nil {
 			return 0, err
 		}
@@ -201,17 +193,18 @@ func getCardinalityForLimitsPerLabelSet(ctx context.Context, numSeries uint64, i
 	return int(numSeries) - mergedCardinality, nil
 }
 
-func getPostingForLabels(ctx context.Context, ir tsdb.IndexReader, lbls labels.Labels) (index.Postings, error) {
-	postings := make([]index.Postings, 0, lbls.Len())
+// getPostingForLabels resolves lbls (an exact label set, every name matched by
+// equality) to its postings via tsdbStore.PostingsForMatchers - the narrow
+// index-query surface every tsdbStore backend implements, rather than a raw
+// tsdb.IndexReader (see tsdbStore's own doc comment in ingester.go for why). One
+// matcher per label name, intersected internally by PostingsForMatchers exactly
+// like the old per-label index.Intersect(...) loop did.
+func getPostingForLabels(ctx context.Context, db tsdbStore, lbls labels.Labels) (index.Postings, error) {
+	matchers := make([]*labels.Matcher, 0, lbls.Len())
 	for name, value := range lbls.Map() {
-		p, err := ir.Postings(ctx, name, value)
-		if err != nil {
-			return nil, err
-		}
-		postings = append(postings, p)
+		matchers = append(matchers, labels.MustNewMatcher(labels.MatchEqual, name, value))
 	}
-
-	return index.Intersect(postings...), nil
+	return db.PostingsForMatchers(ctx, matchers...)
 }
 
 func getPostingCardinality(p index.Postings) (int, error) {
