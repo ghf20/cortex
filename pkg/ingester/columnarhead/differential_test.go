@@ -8,6 +8,8 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/prometheus/prometheus/model/exemplar"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/storage"
@@ -352,5 +354,397 @@ func TestDifferentialSanityCheck(t *testing.T) {
 	t.Logf("total real samples compared: %d", totalSamples)
 	if len(realSeries) == 0 || totalSamples == 0 {
 		t.Fatal("sanity check failed: zero series or zero samples - the differential test would pass vacuously")
+	}
+}
+
+// histDiffWorkload is the shared golden native-histogram dataset for
+// TestDifferentialHistogramRealVsColumnar - deliberately kept within
+// HistogramStore's own stated scope (see its doc comment): stable schema/
+// zero-threshold/span layout for a series' whole lifetime, only bucket counts/
+// sum/count/zero-count changing sample to sample. Counter-reset detection and
+// mid-stream layout changes are a real, separate, not-yet-built gap (Phase 3) -
+// this harness doesn't exercise them, matching what's actually implemented on
+// both sides fairly (real tsdb.Head supports far more than this; comparing
+// outside HistogramStore's scope would only prove real Prometheus's own
+// correctness, not columnarhead's).
+func histDiffWorkload() []*histogram.Histogram {
+	// mk computes Count itself from zeroCount and the buckets' absolute values
+	// (each bucket's absolute count is the running cumulative sum of its
+	// spatial deltas, real histogram.Histogram's own documented encoding -
+	// "guarantees that the count in the previous bucket is the sum of the
+	// current and all the deltas before it") - real tsdb.Head validates that
+	// Count equals zeroCount plus every bucket's absolute count on Append
+	// (found the hard way: hand-picked Count values from histogram_test.go's
+	// own lower-level HistogramStore unit test - which doesn't validate this,
+	// since it only exercises the encoding format directly - are rejected
+	// here). Computing it mechanically avoids hand-arithmetic errors.
+	mk := func(zeroCount uint64, sum float64, posDeltas, negDeltas []int64) *histogram.Histogram {
+		count := zeroCount
+		var cur int64
+		for _, d := range posDeltas {
+			cur += d
+			count += uint64(cur)
+		}
+		cur = 0
+		for _, d := range negDeltas {
+			cur += d
+			count += uint64(cur)
+		}
+		return &histogram.Histogram{
+			Schema:          1,
+			ZeroThreshold:   0.0001,
+			ZeroCount:       zeroCount,
+			Count:           count,
+			Sum:             sum,
+			PositiveSpans:   []histogram.Span{{Offset: -2, Length: 4}},
+			NegativeSpans:   []histogram.Span{{Offset: 0, Length: 2}},
+			PositiveBuckets: posDeltas,
+			NegativeBuckets: negDeltas,
+		}
+	}
+	return []*histogram.Histogram{
+		mk(2, 5.5, []int64{1, 0, 0, 1}, []int64{1, 0}),
+		mk(3, 8.25, []int64{1, 1, -1, 2}, []int64{0, 1}),
+		mk(3, 8.25, []int64{1, 1, -1, 2}, []int64{0, 1}), // identical spatial deltas to the previous sample - a real, legitimate "no new observations this interval" case
+		mk(9, -12.75, []int64{5, -3, 2, -1}, []int64{2, -1}),
+	}
+}
+
+func appendHistogramsToReal(t *testing.T, h *tsdb.Head, l labels.Labels, base int64, hists []*histogram.Histogram) {
+	t.Helper()
+	app := h.Appender(context.Background())
+	var ref storage.SeriesRef
+	ts := base
+	for _, hg := range hists {
+		var err error
+		ref, err = app.AppendHistogram(ref, l, ts, hg, nil)
+		if err != nil {
+			t.Fatalf("real head AppendHistogram(ts=%d): %v", ts, err)
+		}
+		ts += 15000
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("real head Commit: %v", err)
+	}
+}
+
+func appendHistogramsToColumnar(t *testing.T, h *Head, l labels.Labels, base int64, hists []*histogram.Histogram) {
+	t.Helper()
+	app := h.Appender(context.Background())
+	var ref storage.SeriesRef
+	ts := base
+	for _, hg := range hists {
+		var err error
+		ref, err = app.AppendHistogram(ref, l, ts, hg, nil)
+		if err != nil {
+			t.Fatalf("columnar head AppendHistogram(ts=%d): %v", ts, err)
+		}
+		ts += 15000
+	}
+	if err := app.Commit(); err != nil {
+		t.Fatalf("columnar head Commit: %v", err)
+	}
+}
+
+// collectHistogramSamples drains a single matching series' (ts, *histogram.Histogram)
+// pairs from ss - like collectSeries, but for the histogram value type, and
+// asserting exactly one matching series (this harness always queries by exact
+// series label match, unlike the float differential tests' multi-series scan).
+func collectHistogramSamples(t *testing.T, ss storage.SeriesSet) []struct {
+	ts int64
+	h  *histogram.Histogram
+} {
+	t.Helper()
+	if !ss.Next() {
+		t.Fatalf("SeriesSet: no series returned")
+	}
+	series := ss.At()
+	it := series.Iterator(nil)
+	var out []struct {
+		ts int64
+		h  *histogram.Histogram
+	}
+	for it.Next() == chunkenc.ValHistogram {
+		ts, h := it.AtHistogram(nil)
+		out = append(out, struct {
+			ts int64
+			h  *histogram.Histogram
+		}{ts, h})
+	}
+	if err := it.Err(); err != nil {
+		t.Fatalf("iterator error: %v", err)
+	}
+	if ss.Next() {
+		t.Fatalf("SeriesSet: more than one matching series")
+	}
+	if err := ss.Err(); err != nil {
+		t.Fatalf("SeriesSet error: %v", err)
+	}
+	return out
+}
+
+// TestDifferentialHistogramRealVsColumnar is Phase 6's histogram extension to
+// the float differential harness above (CHECKLIST.md: "what remains here is
+// extending the same harness to histograms, OOO, exemplars, and metadata") -
+// same real tsdb.Head vs. columnarhead.Head comparison, same bit-exact bar
+// (histEqual, not just "close"), for native histograms within HistogramStore's
+// documented stable-layout scope.
+func TestDifferentialHistogramRealVsColumnar(t *testing.T) {
+	l := labels.FromStrings(
+		labels.MetricName, "request_duration_seconds",
+		"cluster", "eks-prod-1", "namespace", "ns-7", "pod", "payments-api-1",
+		"container", "app", "node", "ip-10-1-2-3", "job", "cadvisor",
+	)
+	base := int64(1700000000000)
+	workload := histDiffWorkload()
+
+	realHead := newRealHead(t)
+	appendHistogramsToReal(t, realHead, l, base, workload)
+	colHead := NewHead(1, 1, 16)
+	appendHistogramsToColumnar(t, colHead, l, base, workload)
+
+	realQuerier, err := tsdb.NewBlockQuerier(realHead, math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("real head querier: %v", err)
+	}
+	defer realQuerier.Close()
+	colQuerier, err := colHead.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("columnar head querier: %v", err)
+	}
+	defer colQuerier.Close()
+
+	m := labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "request_duration_seconds")
+	realSamples := collectHistogramSamples(t, realQuerier.Select(context.Background(), true, nil, m))
+	colSamples := collectHistogramSamples(t, colQuerier.Select(context.Background(), true, nil, m))
+
+	if len(realSamples) != len(colSamples) {
+		t.Fatalf("real head returned %d histogram samples, columnar returned %d", len(realSamples), len(colSamples))
+	}
+	if len(realSamples) != len(workload) {
+		t.Fatalf("sanity check failed: got %d samples back, want %d (the differential test would pass vacuously otherwise)", len(realSamples), len(workload))
+	}
+	for i := range realSamples {
+		if realSamples[i].ts != colSamples[i].ts {
+			t.Fatalf("sample %d: ts real=%d columnar=%d", i, realSamples[i].ts, colSamples[i].ts)
+		}
+		histEqual(t, colSamples[i].h, realSamples[i].h)
+	}
+}
+
+// newRealDBWithOOO opens a real *tsdb.DB (not a bare *tsdb.Head, unlike
+// newRealHead) with out-of-order ingestion enabled - OOO-aware querying needs
+// db.Querier's internal NewHeadAndOOOQuerier/isolation-state wiring
+// (vendor/.../tsdb/db.go, ooo_head_read.go), which isn't reachable from outside
+// the tsdb package against a bare *Head the way the float/histogram
+// differential tests above use one directly.
+func newRealDBWithOOO(t *testing.T, window int64) *tsdb.DB {
+	t.Helper()
+	dir := t.TempDir()
+	db, err := tsdb.Open(dir, nil, nil, &tsdb.Options{
+		RetentionDuration:    int64(1000 * 60 * 60 * 24),
+		MinBlockDuration:     2 * 60 * 60 * 1000,
+		MaxBlockDuration:     2 * 60 * 60 * 1000,
+		NoLockfile:           true,
+		OutOfOrderTimeWindow: window,
+		IsolationDisabled:    true,
+	}, nil)
+	if err != nil {
+		t.Fatalf("tsdb.Open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+// TestDifferentialOOORealVsColumnar is Phase 6's OOO extension to the
+// differential harness: append the same in-order-then-out-of-order sequence to
+// a real *tsdb.DB (OOO enabled) and to columnarhead.Head (SetOOOTimeWindow),
+// and confirm both produce the identical merged, strictly-timestamp-ordered
+// stream - not just that each side accepts the OOO sample, but that the
+// MERGE point (real tsdb's NewHeadAndOOOQuerier vs. this package's
+// mergedIterator, ooo.go) agrees exactly.
+func TestDifferentialOOORealVsColumnar(t *testing.T) {
+	const window = 60_000
+	l := labels.FromStrings(
+		labels.MetricName, "cpu_seconds_total",
+		"cluster", "eks-prod-1", "namespace", "ns-7", "pod", "payments-api-1",
+		"container", "app", "node", "ip-10-1-2-3", "job", "cadvisor",
+	)
+	base := int64(1700000000000)
+	// In-order: 0s, 30s. Then OOO: 15s (within the 60s window) - lands between
+	// the two in-order samples once merged.
+	inOrder := []sample{{base, 1}, {base + 30000, 3}}
+	ooo := sample{base + 15000, 2}
+	want := []sample{{base, 1}, {base + 15000, 2}, {base + 30000, 3}}
+
+	realDB := newRealDBWithOOO(t, window)
+	realApp := realDB.Appender(context.Background())
+	var ref storage.SeriesRef
+	for _, sm := range inOrder {
+		var err error
+		ref, err = realApp.Append(ref, l, sm.ts, sm.v)
+		if err != nil {
+			t.Fatalf("real db Append(in-order, ts=%d): %v", sm.ts, err)
+		}
+	}
+	if _, err := realApp.Append(ref, l, ooo.ts, ooo.v); err != nil {
+		t.Fatalf("real db Append(OOO, ts=%d): %v", ooo.ts, err)
+	}
+	if err := realApp.Commit(); err != nil {
+		t.Fatalf("real db Commit: %v", err)
+	}
+
+	colHead := NewHead(1, 1, 16)
+	colHead.SetOOOTimeWindow(window)
+	colApp := colHead.Appender(context.Background())
+	var colRef storage.SeriesRef
+	for _, sm := range inOrder {
+		var err error
+		colRef, err = colApp.Append(colRef, l, sm.ts, sm.v)
+		if err != nil {
+			t.Fatalf("columnar head Append(in-order, ts=%d): %v", sm.ts, err)
+		}
+	}
+	if _, err := colApp.Append(colRef, l, ooo.ts, ooo.v); err != nil {
+		t.Fatalf("columnar head Append(OOO, ts=%d): %v", ooo.ts, err)
+	}
+	if err := colApp.Commit(); err != nil {
+		t.Fatalf("columnar head Commit: %v", err)
+	}
+
+	realQuerier, err := realDB.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("real db querier: %v", err)
+	}
+	defer realQuerier.Close()
+	colQuerier, err := colHead.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("columnar head querier: %v", err)
+	}
+	defer colQuerier.Close()
+
+	m := labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "cpu_seconds_total")
+	realSeries := collectSeries(t, realQuerier.Select(context.Background(), true, nil, m))
+	colSeries := collectSeries(t, colQuerier.Select(context.Background(), true, nil, m))
+
+	key := l.String()
+	real, ok := realSeries[key]
+	if !ok {
+		t.Fatalf("series missing from real db result: %v", realSeries)
+	}
+	col, ok := colSeries[key]
+	if !ok {
+		t.Fatalf("series missing from columnar head result: %v", colSeries)
+	}
+	if len(real) != len(want) {
+		t.Fatalf("sanity check failed: real db returned %d samples, want %d - the differential test would pass vacuously otherwise", len(real), len(want))
+	}
+	assertSamplesBitIdentical(t, "real vs want", real, want)
+	assertSamplesBitIdentical(t, key, real, col)
+}
+
+// TestDifferentialExemplarRealVsColumnar is Phase 6's exemplar extension to the
+// differential harness. Deliberately stays within a known, already-documented
+// gap rather than exercising it: exemplarStorage.append (exemplar.go) never
+// records the original exemplar.Exemplar's HasTs bit, so columnarhead's
+// ExemplarQuerier always reports HasTs: true (see CHECKLIST.md's Phase 7 step 4
+// note) - every exemplar here is constructed with HasTs: true already, so this
+// comparison exercises real correctness (labels, value, timestamp, matcher
+// semantics) without generating known-gap noise unrelated to what's being
+// tested.
+func TestDifferentialExemplarRealVsColumnar(t *testing.T) {
+	l := labels.FromStrings(
+		labels.MetricName, "cpu_seconds_total",
+		"cluster", "eks-prod-1", "namespace", "ns-7", "pod", "payments-api-1",
+		"container", "app", "node", "ip-10-1-2-3", "job", "cadvisor",
+	)
+	base := int64(1700000000000)
+	ex1 := exemplar.Exemplar{Labels: labels.FromStrings("trace_id", "abc123"), Value: 1.5, Ts: base, HasTs: true}
+	ex2 := exemplar.Exemplar{Labels: labels.FromStrings("trace_id", "def456"), Value: 2.5, Ts: base + 15000, HasTs: true}
+
+	dir := t.TempDir()
+	realDB, err := tsdb.Open(dir, nil, nil, &tsdb.Options{
+		RetentionDuration:     int64(1000 * 60 * 60 * 24),
+		MinBlockDuration:      2 * 60 * 60 * 1000,
+		MaxBlockDuration:      2 * 60 * 60 * 1000,
+		NoLockfile:            true,
+		IsolationDisabled:     true,
+		EnableExemplarStorage: true,
+		MaxExemplars:          100,
+	}, nil)
+	if err != nil {
+		t.Fatalf("tsdb.Open: %v", err)
+	}
+	t.Cleanup(func() { realDB.Close() })
+
+	realApp := realDB.Appender(context.Background())
+	ref, err := realApp.Append(0, l, base, 1)
+	if err != nil {
+		t.Fatalf("real db Append: %v", err)
+	}
+	for _, e := range []exemplar.Exemplar{ex1, ex2} {
+		if _, err := realApp.AppendExemplar(ref, l, e); err != nil {
+			t.Fatalf("real db AppendExemplar: %v", err)
+		}
+	}
+	if err := realApp.Commit(); err != nil {
+		t.Fatalf("real db Commit: %v", err)
+	}
+
+	colHead := NewHead(1, 1, 16)
+	colApp := colHead.Appender(context.Background())
+	colRef, err := colApp.Append(0, l, base, 1)
+	if err != nil {
+		t.Fatalf("columnar head Append: %v", err)
+	}
+	for _, e := range []exemplar.Exemplar{ex1, ex2} {
+		if _, err := colApp.AppendExemplar(colRef, l, e); err != nil {
+			t.Fatalf("columnar head AppendExemplar: %v", err)
+		}
+	}
+	if err := colApp.Commit(); err != nil {
+		t.Fatalf("columnar head Commit: %v", err)
+	}
+
+	realEQ, err := realDB.ExemplarQuerier(context.Background())
+	if err != nil {
+		t.Fatalf("real db ExemplarQuerier: %v", err)
+	}
+	colEQ, err := colHead.ExemplarQuerier(context.Background())
+	if err != nil {
+		t.Fatalf("columnar head ExemplarQuerier: %v", err)
+	}
+
+	m := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "cpu_seconds_total")}
+	realResults, err := realEQ.Select(base-1, base+30000, m)
+	if err != nil {
+		t.Fatalf("real db Select: %v", err)
+	}
+	colResults, err := colEQ.Select(base-1, base+30000, m)
+	if err != nil {
+		t.Fatalf("columnar head Select: %v", err)
+	}
+
+	if len(realResults) != 1 || len(colResults) != 1 {
+		t.Fatalf("sanity check failed: real=%d columnar=%d result sets, want exactly 1 each", len(realResults), len(colResults))
+	}
+	if !labels.Equal(realResults[0].SeriesLabels, l) {
+		t.Fatalf("real db SeriesLabels = %v, want %v", realResults[0].SeriesLabels, l)
+	}
+	if !labels.Equal(colResults[0].SeriesLabels, l) {
+		t.Fatalf("columnar head SeriesLabels = %v, want %v", colResults[0].SeriesLabels, l)
+	}
+
+	want := []exemplar.Exemplar{ex1, ex2}
+	for name, got := range map[string][]exemplar.Exemplar{"real": realResults[0].Exemplars, "columnar": colResults[0].Exemplars} {
+		if len(got) != len(want) {
+			t.Fatalf("%s: got %d exemplars, want %d", name, len(got), len(want))
+		}
+		for i, w := range want {
+			g := got[i]
+			if g.Ts != w.Ts || g.Value != w.Value || !labels.Equal(g.Labels, w.Labels) || g.HasTs != w.HasTs {
+				t.Fatalf("%s exemplar %d = %+v, want %+v", name, i, g, w)
+			}
+		}
 	}
 }
