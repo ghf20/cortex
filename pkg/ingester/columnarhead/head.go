@@ -503,12 +503,30 @@ func (h *Head) SeriesLabels(ref uint32) labels.Labels {
 	tRefs := h.targets.Get(shard.series.TargetID(localIdx))
 	b := labels.NewScratchBuilder(8)
 	b.Add(labels.MetricName, h.symbols.String(uint32(shard.series.NameID(localIdx))))
-	b.Add(labelCluster, h.symbols.String(tRefs[0]))
-	b.Add(labelNamespace, h.symbols.String(tRefs[1]))
-	b.Add(labelPod, h.symbols.String(tRefs[2]))
-	b.Add(labelContainer, h.symbols.String(tRefs[3]))
-	b.Add(labelNode, h.symbols.String(tRefs[4]))
-	b.Add(labelJob, h.symbols.String(tRefs[5]))
+	// A target label that was never set on the original series interns to the
+	// empty string (GetOrCreateSeries interns target.Cluster etc. as-is, with
+	// no separate "absent" sentinel) - real Prometheus label-set semantics
+	// treat an empty-valued label as equivalent to absent (Labels.Get returns
+	// "" either way, and no matcher ever distinguishes the two), so it must
+	// be OMITTED here, not added as a real, present, empty-string label pair.
+	// splitLabels (appender.go) already accepts a series with some or all
+	// target labels absent - a bug found via a genuinely minimal end-to-end
+	// push (just __name__, no target labels) through the real ingester path,
+	// CHECKLIST.md's Phase 7 step 5; every existing test in this package
+	// happened to always set all six, so the asymmetry between what
+	// splitLabels accepts and what this reconstructed was never exercised
+	// until then.
+	addIfNotEmpty := func(name string, symID uint32) {
+		if v := h.symbols.String(symID); v != "" {
+			b.Add(name, v)
+		}
+	}
+	addIfNotEmpty(labelCluster, tRefs[0])
+	addIfNotEmpty(labelNamespace, tRefs[1])
+	addIfNotEmpty(labelPod, tRefs[2])
+	addIfNotEmpty(labelContainer, tRefs[3])
+	addIfNotEmpty(labelNode, tRefs[4])
+	addIfNotEmpty(labelJob, tRefs[5])
 	if shard.series.HasLocal(localIdx) {
 		b.Add(h.symbols.String(uint32(shard.series.LocalName(localIdx))), h.symbols.String(uint32(shard.series.LocalRef(localIdx))))
 	}

@@ -132,6 +132,44 @@ func TestHeadSeriesLabels(t *testing.T) {
 	}
 }
 
+// TestHeadSeriesLabelsOmitsEmptyTargetLabels is the decisive test for a real,
+// previously latent bug (found via a genuinely minimal end-to-end push through
+// the real ingester, CHECKLIST.md's Phase 7 step 5 notes): a target label never
+// set on the original series (GetOrCreateSeries interns "" for it, same as any
+// other string - there's no separate "absent" sentinel) must be OMITTED from
+// SeriesLabels' reconstruction, not included as a real, present, empty-string
+// label pair - real Prometheus label-set semantics treat the two as identical
+// (Labels.Get returns "" either way, no matcher distinguishes them), and
+// splitLabels (appender.go) already accepts a series with some or all target
+// labels absent, so the read side must round-trip that faithfully.
+func TestHeadSeriesLabelsOmitsEmptyTargetLabels(t *testing.T) {
+	h := NewHead(2, 2, 2)
+
+	noTargetRef, err := h.GetOrCreateSeries(TargetLabels{}, "up", "", "")
+	if err != nil {
+		t.Fatalf("GetOrCreateSeries (no target labels at all): %v", err)
+	}
+	want := labels.FromStrings(labels.MetricName, "up")
+	if got := h.SeriesLabels(noTargetRef); !labels.Equal(got, want) {
+		t.Fatalf("SeriesLabels(noTargetRef) = %v, want %v (no target labels present)", got, want)
+	}
+	// SeriesLabelValue must agree with SeriesLabels: "" for an absent target
+	// label either way, not just at the full-label-set level.
+	if v := h.SeriesLabelValue(noTargetRef, "cluster"); v != "" {
+		t.Fatalf("SeriesLabelValue(noTargetRef, \"cluster\") = %q, want \"\"", v)
+	}
+
+	partialTarget := TargetLabels{Cluster: "c", Job: "j"} // namespace/pod/container/node all absent
+	partialRef, err := h.GetOrCreateSeries(partialTarget, "down", "", "")
+	if err != nil {
+		t.Fatalf("GetOrCreateSeries (partial target labels): %v", err)
+	}
+	wantPartial := labels.FromStrings(labels.MetricName, "down", "cluster", "c", "job", "j")
+	if got := h.SeriesLabels(partialRef); !labels.Equal(got, wantPartial) {
+		t.Fatalf("SeriesLabels(partialRef) = %v, want %v (only cluster/job present)", got, wantPartial)
+	}
+}
+
 func TestHeadAppendAndIterate(t *testing.T) {
 	h := NewHead(1, 1, 1)
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}

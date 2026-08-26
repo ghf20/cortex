@@ -326,14 +326,16 @@ func TestIngester_UseColumnarHead(t *testing.T) {
 	})
 
 	ctx := user.InjectOrgID(context.Background(), userID)
-	// All six fixed target labels set, not just __name__ - the shape
-	// columnarhead's appender.splitLabels/Head.SeriesLabels round-trip is
-	// actually built and tested for (see CHECKLIST.md's own note on the
-	// separate, pre-existing gap: SeriesLabels currently always emits these
-	// six labels even when empty, rather than omitting absent ones like real
-	// Prometheus label-set semantics require - not exercised by this test,
-	// which deliberately stays within the documented, tested shape).
-	lbls := seriesLabels("foo", "p")
+	// Deliberately minimal - just __name__, no target labels at all. This is
+	// the exact shape that originally surfaced a real bug here: SeriesLabels
+	// used to unconditionally emit all six fixed target labels even when
+	// never set, rather than omitting them (real Prometheus label-set
+	// semantics treat an empty-valued label as absent) - fixed in head.go,
+	// see TestHeadSeriesLabelsOmitsEmptyTargetLabels for the focused
+	// unit-level regression test. Kept minimal here rather than reverted to
+	// a full-target-label series so this end-to-end path keeps covering the
+	// exact scenario that found it.
+	lbls := labels.FromStrings(labels.MetricName, "foo")
 	req, _ := mockWriteRequest(t, lbls, 456, 123000)
 	_, err = i.Push(ctx, req)
 	require.NoError(t, err)
