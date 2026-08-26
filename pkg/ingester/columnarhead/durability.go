@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -46,10 +47,11 @@ import (
 // reproduces real data corruption after reload. Free-list reuse is therefore always
 // enabled - NewHead/NewSeriesStore are used directly, no separate durable variant.
 //
-// Scope, stated plainly: metadata is persisted (see encodeMetadataMap), but
-// histograms, exemplars, and start-timestamps are NOT - a crash loses them even if
-// this were wired into the real ingest path (which it isn't yet - this proves the
-// mechanism, it is not itself the finished Phase 5 feature).
+// Scope, stated plainly: metadata and exemplars are persisted (see
+// encodeMetadataMap/encodeExemplarStorage), but histograms and start-timestamps
+// are NOT - a crash loses them even if this were wired into the real ingest path
+// (which it isn't yet - this proves the mechanism, it is not itself the finished
+// Phase 5 feature).
 const (
 	fileSymbolsBlob    = "symbols_blob.bin"
 	fileSymbolsOffsets = "symbols_offsets.bin"
@@ -57,6 +59,7 @@ const (
 	fileArena          = "arena.bin"
 	fileSeriesMeta     = "series_meta.bin"
 	fileMetadata       = "metadata.bin"
+	fileExemplars      = "exemplars.bin"
 )
 
 // seriesMetaRecordSize is one series' fixed-width persisted record: targetID(4) +
@@ -174,6 +177,120 @@ func decodeMetadataMap(buf []byte) (map[uint32]metadata.Metadata, error) {
 	return byRef, nil
 }
 
+// encodeExemplarStorage serializes es's entire fixed-capacity ring (including
+// still-empty, never-written slots - simpler than tracking which of them are
+// "real," and cheap: bounded by capacity, not by how many are actually filled) as
+// capacity(4) + next(4) + filled(1), followed by each entry in array order:
+// seriesRef(4) + ts(8) + value(8, float64 bits) + labelCount(2) + each label as
+// nameLen(2)+name+valueLen(2)+value. Same full-rewrite-per-Flush tradeoff as
+// metadata.bin - bounded by exemplar capacity (10,000 by default), not head size.
+func encodeExemplarStorage(es *exemplarStorage) []byte {
+	var buf []byte
+	putU32 := func(v uint32) {
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], v)
+		buf = append(buf, b[:]...)
+	}
+	putU64 := func(v uint64) {
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], v)
+		buf = append(buf, b[:]...)
+	}
+	putStr := func(s string) {
+		var b [2]byte
+		binary.LittleEndian.PutUint16(b[:], uint16(len(s)))
+		buf = append(buf, b[:]...)
+		buf = append(buf, s...)
+	}
+
+	putU32(uint32(len(es.entries)))
+	putU32(uint32(es.next))
+	if es.filled {
+		buf = append(buf, 1)
+	} else {
+		buf = append(buf, 0)
+	}
+	for _, e := range es.entries {
+		putU32(e.seriesRef)
+		putU64(uint64(e.ts))
+		putU64(math.Float64bits(e.value))
+		var b [2]byte
+		binary.LittleEndian.PutUint16(b[:], uint16(len(e.labels)))
+		buf = append(buf, b[:]...)
+		for name, value := range e.labels {
+			putStr(name)
+			putStr(value)
+		}
+	}
+	return buf
+}
+
+// decodeExemplarStorage is encodeExemplarStorage's inverse. An empty buf (a durable
+// head that crashed before its first Flush ever ran) is not an error - it means "no
+// exemplars yet," the same state a brand-new Head starts in, not corruption.
+func decodeExemplarStorage(buf []byte) (*exemplarStorage, error) {
+	if len(buf) == 0 {
+		return newExemplarStorage(defaultExemplarCapacity), nil
+	}
+	if len(buf) < 9 {
+		return nil, fmt.Errorf("truncated exemplar storage header (%d bytes)", len(buf))
+	}
+	capacity := binary.LittleEndian.Uint32(buf[0:4])
+	next := binary.LittleEndian.Uint32(buf[4:8])
+	filled := buf[8] != 0
+	off := 9
+
+	es := &exemplarStorage{entries: make([]exemplarEntry, capacity), next: int(next), filled: filled}
+	need := func(n int) error {
+		if off+n > len(buf) {
+			return fmt.Errorf("truncated exemplar storage at offset %d (need %d more bytes)", off, n)
+		}
+		return nil
+	}
+	for i := range es.entries {
+		if err := need(4 + 8 + 8 + 2); err != nil {
+			return nil, err
+		}
+		seriesRef := binary.LittleEndian.Uint32(buf[off : off+4])
+		off += 4
+		ts := int64(binary.LittleEndian.Uint64(buf[off : off+8]))
+		off += 8
+		value := math.Float64frombits(binary.LittleEndian.Uint64(buf[off : off+8]))
+		off += 8
+		labelCount := int(binary.LittleEndian.Uint16(buf[off : off+2]))
+		off += 2
+		var lbls map[string]string
+		if labelCount > 0 {
+			lbls = make(map[string]string, labelCount)
+		}
+		for range labelCount {
+			if err := need(2); err != nil {
+				return nil, err
+			}
+			nameLen := int(binary.LittleEndian.Uint16(buf[off : off+2]))
+			off += 2
+			if err := need(nameLen); err != nil {
+				return nil, err
+			}
+			name := string(buf[off : off+nameLen])
+			off += nameLen
+			if err := need(2); err != nil {
+				return nil, err
+			}
+			valueLen := int(binary.LittleEndian.Uint16(buf[off : off+2]))
+			off += 2
+			if err := need(valueLen); err != nil {
+				return nil, err
+			}
+			value := string(buf[off : off+valueLen])
+			off += valueLen
+			lbls[name] = value
+		}
+		es.entries[i] = exemplarEntry{seriesRef: seriesRef, ts: ts, value: value, labels: lbls}
+	}
+	return es, nil
+}
+
 // DurableHead wraps a Head with on-disk persistence for its append-only structures.
 // Not wired into the real ingest path - a standalone harness for measuring whether
 // the underlying mechanism (see this file's package-level doc comment) is viable.
@@ -181,7 +298,7 @@ type DurableHead struct {
 	*Head
 	dir string
 
-	blobFile, offsetFile, targetsFile, arenaFile, metaFile, metadataFile *os.File
+	blobFile, offsetFile, targetsFile, arenaFile, metaFile, metadataFile, exemplarsFile *os.File
 
 	// High-water marks: how much of each append-only structure is already durable.
 	// Units match what's being flushed - bytes for blob, element counts (multiplied
@@ -223,7 +340,7 @@ type DurableHead struct {
 // one). Fails if any of the five files already exist, rather than silently
 // overwriting a prior head's data.
 func CreateDurableHead(dir string, expectedSeries, expectedTargets, expectedSymbols int) (*DurableHead, error) {
-	for _, name := range []string{fileSymbolsBlob, fileSymbolsOffsets, fileTargets, fileArena, fileSeriesMeta, fileMetadata} {
+	for _, name := range []string{fileSymbolsBlob, fileSymbolsOffsets, fileTargets, fileArena, fileSeriesMeta, fileMetadata, fileExemplars} {
 		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
 			return nil, fmt.Errorf("columnarhead: %s already exists in %s - use LoadDurableHead", name, dir)
 		}
@@ -246,6 +363,9 @@ func CreateDurableHead(dir string, expectedSeries, expectedTargets, expectedSymb
 		return nil, err
 	}
 	if dh.metadataFile, err = os.OpenFile(filepath.Join(dir, fileMetadata), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
+		return nil, err
+	}
+	if dh.exemplarsFile, err = os.OpenFile(filepath.Join(dir, fileExemplars), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
 		return nil, err
 	}
 	return dh, nil
@@ -299,6 +419,14 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 	if err != nil {
 		return nil, fmt.Errorf("columnarhead: decode %s: %w", fileMetadata, err)
 	}
+	exemplarsBytes, err := os.ReadFile(filepath.Join(dir, fileExemplars))
+	if err != nil {
+		return nil, err
+	}
+	exemplars, err := decodeExemplarStorage(exemplarsBytes)
+	if err != nil {
+		return nil, fmt.Errorf("columnarhead: decode %s: %w", fileExemplars, err)
+	}
 	numSeries := len(metaBytes) / seriesMetaRecordSize
 	numTargets := len(targetBytes) / 4 / targetFields
 
@@ -345,7 +473,7 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 		namePostings: make(map[uint16][]uint32),
 		metadata:     &seriesMetadata{byRef: metadataByRef},
 		lastST:       make(map[uint32]int64),
-		exemplars:    newExemplarStorage(defaultExemplarCapacity),
+		exemplars:    exemplars,
 		histograms:   NewHistogramStore(),
 	}
 	for id := uint32(0); id < uint32(numTargets); id++ {
@@ -398,6 +526,9 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 	if dh.metadataFile, err = os.OpenFile(filepath.Join(dir, fileMetadata), os.O_RDWR, 0o644); err != nil {
 		return nil, err
 	}
+	if dh.exemplarsFile, err = os.OpenFile(filepath.Join(dir, fileExemplars), os.O_RDWR, 0o644); err != nil {
+		return nil, err
+	}
 	return dh, nil
 }
 
@@ -408,6 +539,7 @@ type FlushStats struct {
 	NewBlobBytes, NewTargetBytes, NewArenaBytes int
 	SeriesMetaBytes                             int // always a full rewrite - see seriesMetaRecordSize's doc comment
 	MetadataBytes                               int // always a full rewrite - see encodeMetadataMap's doc comment
+	ExemplarBytes                               int // always a full rewrite - see encodeExemplarStorage's doc comment
 }
 
 // Flush durably persists everything appended since the last Flush (or since
@@ -514,7 +646,21 @@ func (dh *DurableHead) Flush() (FlushStats, error) {
 	}
 	stats.MetadataBytes = len(metadataBuf)
 
-	for _, f := range []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.arenaFile, dh.metaFile, dh.metadataFile} {
+	// Same non-decreasing-size caveat as metadata.bin: a ring slot overwritten
+	// with a new exemplar carrying shorter label values shrinks the total
+	// encoded size, so this also needs an explicit Truncate, not just WriteAt.
+	exemplarsBuf := encodeExemplarStorage(dh.exemplars)
+	if len(exemplarsBuf) > 0 {
+		if _, err := dh.exemplarsFile.WriteAt(exemplarsBuf, 0); err != nil {
+			return stats, fmt.Errorf("write %s: %w", fileExemplars, err)
+		}
+	}
+	if err := dh.exemplarsFile.Truncate(int64(len(exemplarsBuf))); err != nil {
+		return stats, fmt.Errorf("truncate %s: %w", fileExemplars, err)
+	}
+	stats.ExemplarBytes = len(exemplarsBuf)
+
+	for _, f := range []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.arenaFile, dh.metaFile, dh.metadataFile, dh.exemplarsFile} {
 		if err := f.Sync(); err != nil {
 			return stats, fmt.Errorf("sync: %w", err)
 		}
@@ -640,7 +786,7 @@ func (dh *DurableHead) Close() error {
 		dh.stopAutoFlush = nil
 	}
 	var err error
-	for _, f := range []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.arenaFile, dh.metaFile, dh.metadataFile} {
+	for _, f := range []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.arenaFile, dh.metaFile, dh.metadataFile, dh.exemplarsFile} {
 		if cerr := f.Close(); cerr != nil {
 			err = errors.Join(err, cerr)
 		}

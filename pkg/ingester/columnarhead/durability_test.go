@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/exemplar"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/metadata"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
@@ -833,5 +834,61 @@ func TestDurableHeadPersistsMetadata(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("Metadata after reload = %+v, want %+v", got, want)
+	}
+}
+
+// TestDurableHeadPersistsExemplars is the decisive test for exemplar persistence:
+// AppendExemplar via the real Appender, Flush, simulate a crash, reload, and
+// confirm the exemplar survives via Head.Exemplars, including its labels (the
+// variable-length part encodeExemplarStorage has to get right).
+func TestDurableHeadPersistsExemplars(t *testing.T) {
+	dir := t.TempDir()
+	dh, err := CreateDurableHead(dir, 2, 1, 8)
+	if err != nil {
+		t.Fatalf("CreateDurableHead: %v", err)
+	}
+
+	l := labels.FromStrings(labels.MetricName, "requests_total", "cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j")
+	app := dh.Appender(context.Background())
+	if _, err := app.Append(0, l, 1700000000000, 1); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	traceLabels := labels.FromStrings("trace_id", "abc123", "span_id", "def456")
+	want := exemplar.Exemplar{Labels: traceLabels, Value: 42.5, Ts: 1700000000000, HasTs: true}
+	if _, err := app.AppendExemplar(0, l, want); err != nil {
+		t.Fatalf("AppendExemplar: %v", err)
+	}
+
+	stats, err := dh.Flush()
+	if err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if stats.ExemplarBytes == 0 {
+		t.Fatal("Flush reported 0 exemplar bytes after a real AppendExemplar call")
+	}
+
+	if err := dh.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reloaded, err := LoadDurableHead(dir)
+	if err != nil {
+		t.Fatalf("LoadDurableHead: %v", err)
+	}
+	defer reloaded.Close()
+
+	refs, ok := reloaded.SeriesRefsForName("requests_total")
+	if !ok || len(refs) != 1 {
+		t.Fatalf("series 'requests_total' not found as expected: %v %v", refs, ok)
+	}
+	got := reloaded.Exemplars(refs[0])
+	if len(got) != 1 {
+		t.Fatalf("Exemplars after reload = %v, want exactly 1", got)
+	}
+	if got[0].ts != want.Ts || got[0].value != want.Value {
+		t.Fatalf("Exemplars[0] = {ts:%d value:%v}, want {ts:%d value:%v}", got[0].ts, got[0].value, want.Ts, want.Value)
+	}
+	if got[0].labels["trace_id"] != "abc123" || got[0].labels["span_id"] != "def456" || len(got[0].labels) != 2 {
+		t.Fatalf("Exemplars[0].labels = %v, want trace_id=abc123, span_id=def456", got[0].labels)
 	}
 }
