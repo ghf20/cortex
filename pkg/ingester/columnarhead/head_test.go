@@ -213,6 +213,23 @@ func TestHeadTruncate(t *testing.T) {
 	if h.NumSeries() != 2 {
 		t.Fatalf("NumSeries() = %d after Truncate, want 2 (no series ever removed)", h.NumSeries())
 	}
+
+	// MinTime() must advance to the truncation boundary - matching real
+	// tsdb.Head.truncateMemory's own convention (h.minTime.Store(mint)). Without
+	// this, a caller relying on MinTime() shrinking after Truncate to know
+	// what's left to do (e.g. a periodic auto-compaction loop) would recompute
+	// the same already-empty range forever - a real bug found exactly that way
+	// while wiring a columnarhead-backed tsdbStore (CHECKLIST.md's Phase 7).
+	if h.MinTime() != 1700000030000 {
+		t.Fatalf("MinTime() = %d after Truncate(1700000030000), want 1700000030000", h.MinTime())
+	}
+
+	// A Truncate with an OLDER mint than the current MinTime must be a no-op -
+	// MinTime never moves backward.
+	h.Truncate(1700000000000)
+	if h.MinTime() != 1700000030000 {
+		t.Fatalf("MinTime() = %d after a no-op Truncate with an older mint, want unchanged 1700000030000", h.MinTime())
+	}
 }
 
 // TestHeadAtScale measures the real, honest end-to-end memory cost of the actual

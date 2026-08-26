@@ -3,7 +3,9 @@ package columnarhead
 import (
 	"context"
 	"log/slog"
+	"path/filepath"
 
+	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 )
@@ -41,5 +43,23 @@ func CompactHead(h *Head, mint, maxt int64, dir string, chunkRange int64, logger
 		return "", err
 	}
 
-	return tsdb.CreateBlock(series, dir, chunkRange, logger)
+	blockDir, err := tsdb.CreateBlock(series, dir, chunkRange, logger)
+	if err != nil {
+		return "", err
+	}
+	// tsdb.CreateBlock's own BlockWriter.Flush returns a ZERO ulid.ULID (not an
+	// error, and not an empty path - filepath.Join(dir, ulid.ULID{}.String())
+	// is a real, non-empty string) when nothing was actually written to disk
+	// (vendor/.../tsdb/blockwriter.go: "No block was produced. Caller is
+	// responsible to check empty ulid.ULID based on its use case."). Every
+	// existing caller in this package assumed blockDir == "" signals that case
+	// (see compact_test.go's blockDir == "" checks) - a real, previously latent
+	// gap, since every existing test happened to compact non-empty ranges.
+	// Translate real Prometheus's zero-ULID convention into that expected ""
+	// convention here, rather than returning a path to a block that was never
+	// actually written.
+	if filepath.Base(blockDir) == (ulid.ULID{}).String() {
+		return "", nil
+	}
+	return blockDir, nil
 }

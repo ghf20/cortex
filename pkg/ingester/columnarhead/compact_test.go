@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"math"
+	"os"
 	"testing"
 
 	"github.com/prometheus/prometheus/model/labels"
@@ -291,6 +292,44 @@ func TestCompactHeadToleratesUnsortedInput(t *testing.T) {
 // live head for that same range, and confirm the live head's in-memory data is
 // genuinely gone while the block (checked independently via the real tsdb.OpenBlock
 // path) still has it.
+// TestCompactHeadEmptyRangeReturnsEmptyString is the decisive test for a
+// previously latent gap: every OTHER test in this file compacts a non-empty
+// range, so none of them ever exercised whether CompactHead's own documented
+// "" return actually happens on an empty one. tsdb.CreateBlock's real
+// BlockWriter.Flush returns a ZERO ulid.ULID (not an error, and NOT an empty
+// path - filepath.Join(dir, ulid.ULID{}.String()) is a real, syntactically valid
+// path to a block that was never written) when nothing was written -
+// CompactHead must translate that into "" itself, not hand back a dangling path.
+func TestCompactHeadEmptyRangeReturnsEmptyString(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
+	ref, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	if err != nil {
+		t.Fatalf("GetOrCreateSeries: %v", err)
+	}
+	if err := h.Append(ref, 1700000000000, 1); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	dir := t.TempDir()
+	// A range that excludes the only sample entirely - CompactHead must find
+	// nothing to write.
+	blockDir, err := CompactHead(h, 1800000000000, 1900000000000, dir, 2*60*60*1000, testLogger())
+	if err != nil {
+		t.Fatalf("CompactHead: %v", err)
+	}
+	if blockDir != "" {
+		t.Fatalf("CompactHead on an empty range returned %q, want \"\"", blockDir)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("CompactHead left %d entries on disk for an empty range, want 0: %v", len(entries), entries)
+	}
+}
+
 func TestCompactHeadThenTruncateClosesTheLoop(t *testing.T) {
 	h := NewHead(1, 1, 1)
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}

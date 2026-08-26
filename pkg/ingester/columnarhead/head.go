@@ -785,6 +785,23 @@ func (h *Head) Truncate(mint int64) {
 		}
 		shard.mu.Unlock()
 	}
+	// Advance minTime to at least mint, matching real tsdb.Head.truncateMemory's
+	// own convention (vendor/.../tsdb/head.go: h.minTime.Store(mint)). Without
+	// this, MinTime() never reflects a Truncate at all - it's otherwise only
+	// ever moved forward by real appends (updateMinMaxTime) - so a caller that
+	// relies on MinTime() shrinking after Truncate to know what's left to do
+	// (e.g. a periodic auto-compaction loop deciding whether there's still a
+	// compactable range) would recompute the SAME already-empty range forever.
+	// Forward-only CAS, the same pattern updateMinMaxTime itself uses: never
+	// moves minTime backward, and a genuine no-op if mint is behind the
+	// current value already (including the empty-head sentinel case, where
+	// mint <= math.MaxInt64 is always true and this correctly does nothing).
+	for {
+		cur := h.minTime.Load()
+		if mint <= cur || h.minTime.CompareAndSwap(cur, mint) {
+			break
+		}
+	}
 }
 
 // NumSeries, NumTargets, NumSymbols report the head's current cardinality.
