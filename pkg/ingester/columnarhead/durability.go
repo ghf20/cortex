@@ -89,15 +89,17 @@ func shardFileName(base string, shard int) string {
 }
 
 // seriesMetaRecordSize is one series' fixed-width persisted record: targetID(4) +
-// nameID(2) + localName(2) + localRef(2) + hasLocal(1) + bitOff(2) + nSamples(2) +
+// nameID(2) + localName(2) + localRef(2) + hasLocal(1) + bitOff(4) + nSamples(2) +
 // slotOff(4) + slotCap(4) + val.lastBits(8) + val.leading(1) + val.trailing(1) +
-// ts.lastTS(8) + ts.lastDelta(8). Unlike the identity fields (targetID etc.), bitOff/
+// ts.lastTS(8) + ts.lastDelta(8). bitOff is 4 bytes, not 2, matching SeriesStore's own
+// uint32 field (see its doc comment - a uint16 here silently wrapped for a highly
+// compressible, long-lived series). Unlike the identity fields (targetID etc.), bitOff/
 // nSamples/slotOff/slotCap/val/ts mutate on every Append - persisted via a full
 // rewrite of this (small, O(shard's series count) not O(shard arena size)) table on
 // every Flush, rather than tracked incrementally like the arena; simpler, and cheap
 // at any realistic series count (500k series here is ~24 MB total across all shards
 // - see TestHeadAtScale for how fast a live head of that size already builds).
-const seriesMetaRecordSize = 4 + 2 + 2 + 2 + 1 + 2 + 2 + 4 + 4 + 8 + 1 + 1 + 8 + 8
+const seriesMetaRecordSize = 4 + 2 + 2 + 2 + 1 + 4 + 2 + 4 + 4 + 8 + 1 + 1 + 8 + 8
 
 func encodeSeriesMetaRecord(s *SeriesStore, ref uint32, buf []byte) {
 	binary.LittleEndian.PutUint32(buf[0:4], s.targetID[ref])
@@ -109,32 +111,32 @@ func encodeSeriesMetaRecord(s *SeriesStore, ref uint32, buf []byte) {
 	} else {
 		buf[10] = 0
 	}
-	binary.LittleEndian.PutUint16(buf[11:13], s.bitOff[ref])
-	binary.LittleEndian.PutUint16(buf[13:15], s.nSamples[ref])
-	binary.LittleEndian.PutUint32(buf[15:19], s.slotOff[ref])
-	binary.LittleEndian.PutUint32(buf[19:23], s.slotCap[ref])
-	binary.LittleEndian.PutUint64(buf[23:31], s.val[ref].lastBits)
-	buf[31] = s.val[ref].leading
-	buf[32] = s.val[ref].trailing
-	binary.LittleEndian.PutUint64(buf[33:41], uint64(s.ts[ref].lastTS))
-	binary.LittleEndian.PutUint64(buf[41:49], uint64(s.ts[ref].lastDelta))
+	binary.LittleEndian.PutUint32(buf[11:15], s.bitOff[ref])
+	binary.LittleEndian.PutUint16(buf[15:17], s.nSamples[ref])
+	binary.LittleEndian.PutUint32(buf[17:21], s.slotOff[ref])
+	binary.LittleEndian.PutUint32(buf[21:25], s.slotCap[ref])
+	binary.LittleEndian.PutUint64(buf[25:33], s.val[ref].lastBits)
+	buf[33] = s.val[ref].leading
+	buf[34] = s.val[ref].trailing
+	binary.LittleEndian.PutUint64(buf[35:43], uint64(s.ts[ref].lastTS))
+	binary.LittleEndian.PutUint64(buf[43:51], uint64(s.ts[ref].lastDelta))
 }
 
-func decodeSeriesMetaRecord(buf []byte) (targetID uint32, nameID, localName, localRef uint16, hasLocal bool, bitOff, nSamples uint16, slotOff, slotCap uint32, val valueState, ts tsState) {
+func decodeSeriesMetaRecord(buf []byte) (targetID uint32, nameID, localName, localRef uint16, hasLocal bool, bitOff uint32, nSamples uint16, slotOff, slotCap uint32, val valueState, ts tsState) {
 	targetID = binary.LittleEndian.Uint32(buf[0:4])
 	nameID = binary.LittleEndian.Uint16(buf[4:6])
 	localName = binary.LittleEndian.Uint16(buf[6:8])
 	localRef = binary.LittleEndian.Uint16(buf[8:10])
 	hasLocal = buf[10] != 0
-	bitOff = binary.LittleEndian.Uint16(buf[11:13])
-	nSamples = binary.LittleEndian.Uint16(buf[13:15])
-	slotOff = binary.LittleEndian.Uint32(buf[15:19])
-	slotCap = binary.LittleEndian.Uint32(buf[19:23])
-	val.lastBits = binary.LittleEndian.Uint64(buf[23:31])
-	val.leading = buf[31]
-	val.trailing = buf[32]
-	ts.lastTS = int64(binary.LittleEndian.Uint64(buf[33:41]))
-	ts.lastDelta = int64(binary.LittleEndian.Uint64(buf[41:49]))
+	bitOff = binary.LittleEndian.Uint32(buf[11:15])
+	nSamples = binary.LittleEndian.Uint16(buf[15:17])
+	slotOff = binary.LittleEndian.Uint32(buf[17:21])
+	slotCap = binary.LittleEndian.Uint32(buf[21:25])
+	val.lastBits = binary.LittleEndian.Uint64(buf[25:33])
+	val.leading = buf[33]
+	val.trailing = buf[34]
+	ts.lastTS = int64(binary.LittleEndian.Uint64(buf[35:43]))
+	ts.lastDelta = int64(binary.LittleEndian.Uint64(buf[43:51]))
 	return
 }
 

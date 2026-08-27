@@ -67,7 +67,17 @@ type SeriesStore struct {
 	// (whichever string happens to be interned first) - localName/localRef == 0 does
 	// NOT mean "absent," so absence needs its own explicit signal, not an inferred one.
 	hasLocal []bool
-	bitOff   []uint16
+	// bitOff is a series' current bit offset within its slot. uint32, not uint16 like
+	// nSamples: unlike sample COUNT (bounded by ErrTooManySamples below), bit count has
+	// no comparable natural ceiling - a highly compressible series (near-constant
+	// value, regular scrape interval) can pack many thousands of samples into well
+	// under 145 bits each, so 65,535 bits (uint16's range) is reachable in the low
+	// thousands of samples, not the 65,536-sample range the name suggests. A uint16
+	// here silently wrapped, corrupting the next Append's write offset - found via
+	// promqltest's own dense (1ms-interval) load block, not a synthetic case (see
+	// CHECKLIST.md). histoSegment.bitOff (histogram.go) already used uint32 for the
+	// same reason.
+	bitOff   []uint32
 	nSamples []uint16
 
 	// generation counts how many times Truncate has re-encoded this series' bytes
@@ -107,7 +117,7 @@ func NewSeriesStore(expectedSeries int) *SeriesStore {
 		localName:  make([]uint16, 0, expectedSeries),
 		localRef:   make([]uint16, 0, expectedSeries),
 		hasLocal:   make([]bool, 0, expectedSeries),
-		bitOff:     make([]uint16, 0, expectedSeries),
+		bitOff:     make([]uint32, 0, expectedSeries),
 		nSamples:   make([]uint16, 0, expectedSeries),
 		generation: make([]uint32, 0, expectedSeries),
 		slotOff:    make([]uint32, 0, expectedSeries),
@@ -220,7 +230,7 @@ func (s *SeriesStore) Append(ref uint32, ts int64, v float64) error {
 	if n == 0 {
 		need = firstSampleBits
 	}
-	off := uint32(s.bitOff[ref])
+	off := s.bitOff[ref]
 	cap := s.slotCap[ref]
 	for off+need > cap*8 {
 		cap *= 2
@@ -233,7 +243,7 @@ func (s *SeriesStore) Append(ref uint32, ts int64, v float64) error {
 	off = writeTimestamp(s.arena, base, off, ts, &s.ts[ref], uint32(n))
 	off = writeValue(s.arena, base, off, v, &s.val[ref], n == 0)
 
-	s.bitOff[ref] = uint16(off)
+	s.bitOff[ref] = off
 	s.nSamples[ref] = n + 1
 	return nil
 }
@@ -243,7 +253,7 @@ func (s *SeriesStore) Append(ref uint32, ts int64, v float64) error {
 // same size.
 func (s *SeriesStore) growSlot(ref uint32, newCap uint32) {
 	oldOff, oldCap := s.slotOff[ref], s.slotCap[ref]
-	usedBytes := (uint32(s.bitOff[ref]) + 7) / 8
+	usedBytes := (s.bitOff[ref] + 7) / 8
 
 	newOff := s.alloc(newCap)
 	copy(s.arena[newOff:newOff+usedBytes], s.arena[oldOff:oldOff+usedBytes])
