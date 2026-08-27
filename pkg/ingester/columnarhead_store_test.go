@@ -501,6 +501,47 @@ func TestColumnarheadTSDBStoreApplyConfigResizesExemplarCapacity(t *testing.T) {
 	}
 }
 
+// TestColumnarheadCompactRejectsWhenNotActive confirms userTSDB.Compact's new
+// fail-fast wrapping is REAL wiring for a columnar-backed tenant, not just
+// the acquireAppendLock rejection message TestIngesterPushErrorDuringRegular
+// Compaction proves in isolation: forcing u.state away from active (simulating
+// a concurrent forced/idle compaction, or the regular path racing itself)
+// must make Compact() itself fail with the state-machine's own error, rather
+// than silently proceeding into columnarhead.CompactHead regardless of state.
+func TestColumnarheadCompactRejectsWhenNotActive(t *testing.T) {
+	cfg := defaultIngesterTestConfig(t)
+	cfg.BlocksStorageConfig.TSDB.UseColumnarHead = true
+	i, err := prepareIngesterWithBlocksStorage(t, cfg, prometheus.NewRegistry())
+	require.NoError(t, err)
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
+	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
+
+	test.Poll(t, 1*time.Second, ring.ACTIVE, func() any {
+		return i.lifecycler.GetState()
+	})
+
+	ctx := user.InjectOrgID(context.Background(), userID)
+	req, _ := mockWriteRequest(t, seriesLabels("up", "p"), 1, 0)
+	_, err = i.Push(ctx, req)
+	require.NoError(t, err)
+
+	db, err := i.getTSDB(userID)
+	require.NoError(t, err)
+	_, ok := db.db.(*columnarheadTSDBStore)
+	require.True(t, ok, "userTSDB.db is a %T, want *columnarheadTSDBStore", db.db)
+
+	require.True(t, db.casState(active, forceCompacting)) // simulate a concurrent compaction
+	err = db.Compact(context.Background())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "not in active state")
+	require.True(t, db.casState(forceCompacting, active))
+
+	// And a real compaction, once active again, must actually succeed and
+	// leave state back at active - not stuck in regularCompacting.
+	require.NoError(t, db.Compact(context.Background()))
+	require.Equal(t, active, db.state)
+}
+
 // TestIngester_UseColumnarHead is the decisive end-to-end test for the
 // -blocks-storage.tsdb.use-columnar-head flag: a real *Ingester, constructed
 // through its normal createTSDB path with the flag set, must actually wire in a

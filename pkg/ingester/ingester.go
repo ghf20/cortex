@@ -348,11 +348,12 @@ type Shipper interface {
 type tsdbState int
 
 const (
-	active          tsdbState = iota // Pushes are allowed.
-	activeShipping                   // Pushes are allowed. Blocks shipping is in progress.
-	forceCompacting                  // TSDB is being force-compacted.
-	closing                          // Used while closing idle TSDB.
-	closed                           // Used to avoid setting closing back to active in closeAndDeleteIdleUsers method.
+	active            tsdbState = iota // Pushes are allowed.
+	activeShipping                     // Pushes are allowed. Blocks shipping is in progress.
+	forceCompacting                    // TSDB is being force-compacted.
+	regularCompacting                  // Columnar-head-only: the regular (scheduled) compaction path is running - see userTSDB.Compact's own doc comment for why this state exists at all.
+	closing                            // Used while closing idle TSDB.
+	closed                             // Used to avoid setting closing back to active in closeAndDeleteIdleUsers method.
 )
 
 // Describes result of TSDB-close check. String is used as metric label.
@@ -531,7 +532,7 @@ type userTSDB struct {
 	stateMtx       sync.RWMutex
 	state          tsdbState
 	pushesInFlight sync.WaitGroup // Increased with stateMtx read lock held, only if state == active or activeShipping.
-	readInFlight   sync.WaitGroup // Increased with stateMtx read lock held, only if state == active, activeShipping or forceCompacting.
+	readInFlight   sync.WaitGroup // Increased with stateMtx read lock held, only if state == active, activeShipping, forceCompacting or regularCompacting.
 
 	// Used to detect idle TSDBs.
 	lastUpdate atomic.Int64
@@ -614,7 +615,43 @@ func (u *userTSDB) Close() error {
 	return u.db.Close()
 }
 
+// Compact runs the regular (scheduled, non-forced/idle) compaction pass -
+// compactBlocks' "regular" reason in the periodic compactionLoop, called for
+// every active tenant regardless of backend.
+//
+// Only the columnar-head backend gets the fail-fast wrapping below: real
+// *tsdb.DB's own regular Compact() doesn't block appends for its duration
+// (fine-grained per-series locking), so wrapping it here too would be a
+// real, unwanted behavior change for the native (default) backend - a new,
+// periodic push-rejection window that doesn't exist today, not a fix. A
+// columnar-backed tenant's regular Compact() reaches CompactHeadRange ->
+// columnarhead.CompactHead, which holds ALL shard locks for the ENTIRE
+// block-write duration (Head.Querier's own doc comment) - Append needs a
+// shard's write lock, so every push for that tenant HANGS, not fails, for
+// that whole duration, on every scheduled compaction (a real, HIGH-severity
+// gap an external review found: the forced/idle path already has this exact
+// protection via compactHead/casState/pushesInFlight, the regular path had
+// none at all). Matches that existing pattern exactly, just for a new state
+// (regularCompacting, distinct from forceCompacting so acquireAppendLock's
+// error message stays accurate about which kind of compaction is running).
 func (u *userTSDB) Compact(ctx context.Context) error {
+	if _, ok := u.db.(*columnarheadTSDBStore); !ok {
+		return u.db.Compact(ctx)
+	}
+
+	if !u.casState(active, regularCompacting) {
+		return errors.New("TSDB cannot be compacted because it is not in active state (possibly being closed or already compacting)")
+	}
+	defer u.casState(regularCompacting, active)
+
+	// Same reasoning as compactHead's identical wait: an already-in-flight
+	// push that passed acquireAppendLock just before this state transition
+	// would otherwise hang on CompactHeadRange's shard locks anyway - let it
+	// finish (or at least get past its own append) before that lock-heavy
+	// phase begins. New pushes get a fast 503 instead (acquireAppendLock's
+	// regularCompacting case), not a hang.
+	u.pushesInFlight.Wait()
+
 	return u.db.Compact(ctx)
 }
 
@@ -2069,7 +2106,8 @@ func (u *userTSDB) acquireReadLock() error {
 	case active:
 	case activeShipping:
 	case forceCompacting:
-		// Read are allowed.
+	case regularCompacting:
+		// Reads are allowed.
 	case closing:
 		return errors.New("TSDB is closing")
 	default:
@@ -2094,6 +2132,8 @@ func (u *userTSDB) acquireAppendLock() error {
 		// Pushes are allowed.
 	case forceCompacting:
 		return errors.New("forced compaction in progress")
+	case regularCompacting:
+		return errors.New("regular compaction in progress")
 	case closing:
 		return errors.New("TSDB is closing")
 	default:

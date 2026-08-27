@@ -6415,6 +6415,80 @@ func TestIngesterPushErrorDuringForcedCompaction(t *testing.T) {
 	pushSingleSampleWithMetadata(t, i)
 }
 
+// TestIngesterPushErrorDuringRegularCompaction is
+// TestIngesterPushErrorDuringForcedCompaction's counterpart for the new
+// regularCompacting state (a real, previously-missing gap an external review
+// found: the regular/scheduled compaction path had none of this forced path's
+// fail-fast machinery, so a columnar-backed tenant's pushes would HANG rather
+// than fail during every scheduled compaction - see userTSDB.Compact's own
+// doc comment). acquireAppendLock's rejection is backend-agnostic (it only
+// looks at u.state, not which tsdbStore is in use), so this test - like the
+// forced-compaction one above - doesn't need the columnar flag at all to
+// prove the rejection mechanism itself; TestColumnarheadCompactRejectsWhenNotActive
+// separately proves userTSDB.Compact actually reaches this state for a real
+// columnar-backed tenant.
+func TestIngesterPushErrorDuringRegularCompaction(t *testing.T) {
+	i, err := prepareIngesterWithBlocksStorage(t, defaultIngesterTestConfig(t), prometheus.NewRegistry())
+	require.NoError(t, err)
+
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
+	t.Cleanup(func() {
+		_ = services.StopAndAwaitTerminated(context.Background(), i)
+	})
+
+	test.Poll(t, 1*time.Second, ring.ACTIVE, func() any {
+		return i.lifecycler.GetState()
+	})
+
+	pushSingleSampleWithMetadata(t, i)
+
+	db, err := i.getTSDB(userID)
+	require.NoError(t, err)
+	require.NotNil(t, db)
+	require.True(t, db.casState(active, regularCompacting))
+
+	req, _ := mockWriteRequest(t, labels.FromStrings(labels.MetricName, "test"), 0, util.TimeToMillis(time.Now()))
+	ctx := user.InjectOrgID(context.Background(), userID)
+	_, err = i.Push(ctx, req)
+	require.Equal(t, httpgrpc.Errorf(http.StatusServiceUnavailable, "%s", wrapWithUser(errors.New("regular compaction in progress"), userID).Error()), err)
+
+	require.True(t, db.casState(regularCompacting, active))
+	pushSingleSampleWithMetadata(t, i)
+}
+
+// TestUserTSDBCompactNativeBackendIgnoresState confirms userTSDB.Compact's new
+// columnar-only fail-fast wrapping doesn't affect the native (default)
+// backend: real *tsdb.DB's own regular Compact() was never gated by this
+// state machine (fine-grained per-series locking means it doesn't block
+// appends the way columnarhead's CompactHead does) and shouldn't newly be -
+// that would be a real, unwanted behavior change (a new periodic
+// push-rejection window) for the backend every other tenant uses. Forces
+// u.state away from active first: if the gate were accidentally applied to
+// every backend, Compact() would fail here instead of reaching u.db.Compact
+// unaffected.
+func TestUserTSDBCompactNativeBackendIgnoresState(t *testing.T) {
+	i, err := prepareIngesterWithBlocksStorage(t, defaultIngesterTestConfig(t), prometheus.NewRegistry())
+	require.NoError(t, err)
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
+	t.Cleanup(func() {
+		_ = services.StopAndAwaitTerminated(context.Background(), i)
+	})
+
+	test.Poll(t, 1*time.Second, ring.ACTIVE, func() any {
+		return i.lifecycler.GetState()
+	})
+	pushSingleSampleWithMetadata(t, i)
+
+	db, err := i.getTSDB(userID)
+	require.NoError(t, err)
+	_, ok := db.db.(*nativeTSDBStore)
+	require.True(t, ok, "userTSDB.db is a %T, want *nativeTSDBStore", db.db)
+
+	require.True(t, db.casState(active, forceCompacting)) // simulate "not active"
+	require.NoError(t, db.Compact(context.Background()), "native Compact() must ignore u.state entirely, not be gated by it")
+	require.True(t, db.casState(forceCompacting, active))
+}
+
 func TestIngesterNoFlushWithInFlightRequest(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	i, err := prepareIngesterWithBlocksStorage(t, defaultIngesterTestConfig(t), registry)
