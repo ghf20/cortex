@@ -484,6 +484,34 @@ func TestAppenderExemplar(t *testing.T) {
 	}
 }
 
+// TestAppenderExemplarBeforeSeriesStart ports real Prometheus's TestHeadExemplars:
+// an exemplar timestamped well before the series' own sample timestamps is valid -
+// histogram buckets that haven't updated in a while can still export exemplars from
+// an hour ago - and must not be rejected.
+func TestAppenderExemplarBeforeSeriesStart(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	app := h.Appender(context.Background())
+	l := labels.FromStrings(
+		labels.MetricName, "requests_total",
+		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+	)
+	ref, err := app.Append(0, l, 100, 100)
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	traceLabels := labels.FromStrings("trace_id", "123")
+	old := exemplar.Exemplar{Labels: traceLabels, Value: 1, Ts: -1000, HasTs: true}
+	if _, err := app.AppendExemplar(ref, l, old); err != nil {
+		t.Fatalf("AppendExemplar with ts before series start: %v", err)
+	}
+
+	got := h.Exemplars(uint32(ref) - 1)
+	if len(got) != 1 || got[0].ts != -1000 {
+		t.Fatalf("Exemplars(ref) = %+v, want one entry with ts=-1000", got)
+	}
+}
+
 // TestExemplarStorageRingWraps verifies the ring buffer actually overwrites the
 // oldest entry when full, rather than growing unboundedly or silently dropping new
 // writes - the core property that makes it a bounded, real implementation instead of
