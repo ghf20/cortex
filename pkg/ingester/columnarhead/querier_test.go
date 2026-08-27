@@ -292,6 +292,73 @@ func TestQuerierLabelValuesAndNames(t *testing.T) {
 	}
 }
 
+// TestQuerierLabelValuesAndNamesRespectTimeRange ports real Prometheus's
+// TestHeadLabelNamesValuesWithMinMaxRange (tsdb/head_test.go): LabelNames/LabelValues
+// must exclude series whose samples fall entirely outside the querier's [mint, maxt],
+// not just filter by matchers - see seriesHasSampleInRange's doc comment for why this
+// wasn't already true here.
+func TestQuerierLabelValuesAndNamesRespectTimeRange(t *testing.T) {
+	h := NewHead(3, 1, 1)
+	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
+	must := func(ref uint32, err error) uint32 {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("setup: %v", err)
+		}
+		return ref
+	}
+	a := must(h.GetOrCreateSeries(tgt, "metric_a"))
+	b := must(h.GetOrCreateSeries(tgt, "metric_b"))
+	c := must(h.GetOrCreateSeries(tgt, "metric_c"))
+	const (
+		tsA, tsB, tsC = 100, 200, 300
+	)
+	if err := h.Append(a, tsA, 0); err != nil {
+		t.Fatalf("append a: %v", err)
+	}
+	if err := h.Append(b, tsB, 0); err != nil {
+		t.Fatalf("append b: %v", err)
+	}
+	if err := h.Append(c, tsC, 0); err != nil {
+		t.Fatalf("append c: %v", err)
+	}
+
+	labelNamesIn := func(mint, maxt int64) []string {
+		t.Helper()
+		q, err := h.Querier(mint, maxt)
+		if err != nil {
+			t.Fatalf("Querier(%d,%d): %v", mint, maxt, err)
+		}
+		defer q.Close()
+		names, _, err := q.LabelValues(context.Background(), labels.MetricName, nil)
+		if err != nil {
+			t.Fatalf("LabelValues(%d,%d): %v", mint, maxt, err)
+		}
+		return names
+	}
+
+	cases := []struct {
+		name       string
+		mint, maxt int64
+		want       []string
+	}{
+		{"entirely before any sample", math.MinInt64, tsA - 1, nil},
+		{"entirely after any sample", tsC + 1, math.MaxInt64, nil},
+		{"between a and b, touching neither", tsA + 1, tsB - 1, nil},
+		{"covers only a", tsA, tsA, []string{"metric_a"}},
+		{"covers only b", tsB, tsB, []string{"metric_b"}},
+		{"covers everything", math.MinInt64, math.MaxInt64, []string{"metric_a", "metric_b", "metric_c"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := labelNamesIn(tc.mint, tc.maxt)
+			if !stringSliceEqual(got, tc.want) {
+				t.Fatalf("LabelValues(__name__) in [%d,%d] = %v, want %v", tc.mint, tc.maxt, got, tc.want)
+			}
+		})
+	}
+}
+
 func stringSliceEqual(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

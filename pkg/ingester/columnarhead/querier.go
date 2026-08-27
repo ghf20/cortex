@@ -171,6 +171,9 @@ func (q *headQuerier) LabelValues(_ context.Context, name string, _ *storage.Lab
 		if !matchesAll(lbls, matchers) {
 			continue
 		}
+		if !q.seriesHasSampleInRange(ref) {
+			continue
+		}
 		if v := lbls.Get(name); v != "" {
 			seen[v] = struct{}{}
 		}
@@ -188,9 +191,25 @@ func (q *headQuerier) LabelNames(_ context.Context, _ *storage.LabelHints, match
 		if !matchesAll(lbls, matchers) {
 			continue
 		}
+		if !q.seriesHasSampleInRange(ref) {
+			continue
+		}
 		lbls.Range(func(l labels.Label) { seen[l.Name] = struct{}{} })
 	}
 	return sortedKeys(seen), nil, nil
+}
+
+// seriesHasSampleInRange reports whether ref has at least one sample inside
+// [q.mint, q.maxt], matching real tsdb.Head's LabelNames/LabelValues (backed by
+// head.indexRange(mint,maxt) there - see TestHeadLabelNamesValuesWithMinMaxRange in
+// upstream tsdb/head_test.go): a series whose samples fall entirely outside the
+// queried window must not contribute its labels, even though Select's own series
+// membership is intentionally looser (headSeries.Iterator's doc comment). Reuses
+// headSeries.Iterator - the same bounded, mixed-type-aware construction Select
+// already relies on - rather than duplicating its float/histogram/OOO merge logic.
+func (q *headQuerier) seriesHasSampleInRange(ref uint32) bool {
+	it := (&headSeries{h: q.h, ref: ref, mint: q.mint, maxt: q.maxt}).Iterator(nil)
+	return it.Next() != chunkenc.ValNone
 }
 
 func sortedKeys(m map[string]struct{}) []string {
