@@ -244,12 +244,24 @@ func (s *headSeries) Labels() labels.Labels {
 // Iterator returns a chunkenc.Iterator over s's samples, bounded to [s.mint, s.maxt]:
 // an integer-histogram-backed one if this series ever received a Histogram sample, a
 // float-histogram-backed one if it ever received a FloatHistogram sample, a
-// float-backed one otherwise. A series is exactly one of the three, never more than
-// one (matches real Prometheus semantics that a series' sample type doesn't change
-// mid-stream - see HistogramStore's doc comment, and ErrHistogramTypeChanged for the
-// int/float histogram case specifically). The passed-in iterator (for reuse) is
-// ignored; this always allocates fresh, unlike real chunk iterators that support
-// in-place reuse - a real optimization opportunity, not attempted here.
+// float-backed one otherwise. A series is exactly one of the three for iteration
+// purposes - NOT because real Prometheus enforces that (it doesn't: a real series can
+// genuinely mix float and histogram samples over its lifetime, which is exactly why
+// PromQL's resets()/changes() treat a type change as an implicit reset), but because
+// this package stores float samples (SeriesStore) and histogram samples
+// (HistogramStore) in entirely separate stores keyed by the same ref, and this method
+// picks one or the other based on HasHistogram/HasFloatHistogram rather than merging
+// them. A series that receives samples of both kinds - Append and AppendHistogram both
+// accept this unconditionally, no error either way - silently loses whichever kind
+// came first: e.g. 8 float samples then 2 histogram samples on the same series
+// iterates as exactly 2 samples, the float prefix invisible to every reader (queries,
+// resets()/changes()' reset detection, everything). Found via promqltest's
+// `functions.test` (a real upstream test file exercising exactly this shape, `path=
+// "/bar"`'s mixed load block) - see CHECKLIST.md for the characterization; not fixed
+// here, a real fix needs a genuine merged-by-timestamp iterator across both stores,
+// not a patch to this selection logic. The passed-in iterator (for reuse) is ignored;
+// this always allocates fresh, unlike real chunk iterators that support in-place
+// reuse - a real optimization opportunity, not attempted here.
 func (s *headSeries) Iterator(_ chunkenc.Iterator) chunkenc.Iterator {
 	if s.h.HasHistogram(s.ref) {
 		if s.h.HasFloatHistogram(s.ref) {
