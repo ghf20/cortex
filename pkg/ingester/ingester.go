@@ -3314,6 +3314,16 @@ func (i *Ingester) createTSDB(userID string) (*userTSDB, error) {
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to open columnar head TSDB: %s", udir)
 		}
+		// Same postingCache instance userDB itself holds (set above) - gives
+		// columnar blocks the same expanded-postings caching the native
+		// backend's blockChunkQuerierFunc already applies (ChunkQuerier), a
+		// real, previously-missing perf gap (see CHECKLIST.md): columnar
+		// blocks used to bypass the cache entirely, building
+		// tsdb.NewBlockChunkQuerier directly regardless of whether caching
+		// was enabled for this tenant. Same field, same package - set
+		// directly rather than adding another constructor parameter every
+		// call site (including every test) would need to thread through.
+		store.postingCache = postingCache
 		// userTSDB already implements the full 3-method tsdb.SeriesLifecycleCallback
 		// interface (used directly below as the real backend's own
 		// tsdb.Options.SeriesLifecycleCallback), which structurally satisfies

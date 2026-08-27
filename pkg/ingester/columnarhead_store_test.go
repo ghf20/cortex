@@ -20,8 +20,10 @@ import (
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/exemplar"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/middleware"
@@ -497,6 +499,127 @@ func TestColumnarheadBeyondSizeRetention(t *testing.T) {
 			t.Fatalf("deletable = %v, want empty (budget covers everything)", deletable)
 		}
 	})
+}
+
+// fakePostingsCache is a minimal cortex_tsdb.ExpandedPostingsCache that
+// records every PostingsForMatchers call (which block, and how many calls)
+// while delegating to the real tsdb.PostingsForMatchers for the actual
+// result, so a test using it still gets correct query results, not just a
+// "was it called" signal.
+type fakePostingsCache struct {
+	calls    int
+	blockIDs []ulid.ULID
+}
+
+func (f *fakePostingsCache) PostingsForMatchers(ctx context.Context, blockID ulid.ULID, ix tsdb.IndexReader, ms ...*labels.Matcher) (index.Postings, error) {
+	f.calls++
+	f.blockIDs = append(f.blockIDs, blockID)
+	return tsdb.PostingsForMatchers(ctx, ix, ms...)
+}
+func (f *fakePostingsCache) ExpireSeries(labels.Labels) {}
+func (f *fakePostingsCache) PurgeExpiredItems()         {}
+func (f *fakePostingsCache) Clear()                     {}
+func (f *fakePostingsCache) Size() int                  { return 0 }
+
+// TestColumnarheadTSDBStoreChunkQuerierUsesPostingsCache confirms the perf
+// gap CHECKLIST.md tracked is closed: columnar blocks used to bypass Cortex's
+// expanded-postings cache entirely (ChunkQuerier built tsdb.NewBlockChunkQuerier
+// directly, regardless of whether a cache was configured for the tenant).
+// Correctness was never at stake either way - this test is specifically about
+// the cache actually being CONSULTED when available, and NOT consulted for a
+// query whose mint is beyond the store's current data (mirroring real
+// blockChunkQuerierFunc's own identical guard, github.com/cortexproject/cortex/issues/6556).
+func TestColumnarheadTSDBStoreChunkQuerierUsesPostingsCache(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestColumnarheadStore(t, dir, 2*60*60*1000)
+	defer s.Close()
+
+	l := seriesLabels("up", "p")
+	app := s.Appender(context.Background())
+	base := int64(1700000000000)
+	if _, err := app.Append(0, l, base, 1); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := s.CompactHeadRange(context.Background(), s.MinTime(), s.MaxTime()); err != nil {
+		t.Fatalf("CompactHeadRange: %v", err)
+	}
+	blocks := s.Blocks()
+	if len(blocks) != 1 {
+		t.Fatalf("Blocks() = %d, want 1", len(blocks))
+	}
+	// A second sample in the live head, past the compacted block, so a query
+	// exercises both a real block AND the head through the same querier.
+	if _, err := app.Append(0, l, base+1000, 2); err != nil {
+		t.Fatalf("Append (head): %v", err)
+	}
+
+	t.Run("cache unset: falls back to the uncached path", func(t *testing.T) {
+		q, err := s.ChunkQuerier(base, base+2000)
+		if err != nil {
+			t.Fatalf("ChunkQuerier: %v", err)
+		}
+		defer q.Close()
+		got := drainChunkSeries(t, q)
+		if len(got) != 2 {
+			t.Fatalf("got %d samples, want 2", len(got))
+		}
+	})
+
+	fake := &fakePostingsCache{}
+	s.postingCache = fake
+
+	t.Run("cache set, ordinary query: block querier goes through the cache", func(t *testing.T) {
+		q, err := s.ChunkQuerier(base, base+2000)
+		if err != nil {
+			t.Fatalf("ChunkQuerier: %v", err)
+		}
+		defer q.Close()
+		got := drainChunkSeries(t, q)
+		if len(got) != 2 {
+			t.Fatalf("got %d samples, want 2", len(got))
+		}
+		if fake.calls == 0 {
+			t.Fatal("postings cache was never consulted for an ordinary query - the block querier should have gone through it")
+		}
+		if fake.blockIDs[0] != blocks[0].Meta().ULID {
+			t.Fatalf("cache called with block %s, want %s", fake.blockIDs[0], blocks[0].Meta().ULID)
+		}
+	})
+
+	t.Run("cache set, future query (mint beyond MaxTime): NOT consulted", func(t *testing.T) {
+		fake.calls = 0
+		future := s.MaxTime() + 10_000
+		q, err := s.ChunkQuerier(future, future+1000)
+		if err != nil {
+			t.Fatalf("ChunkQuerier: %v", err)
+		}
+		defer q.Close()
+		if fake.calls != 0 {
+			t.Fatalf("postings cache was consulted %d times for a future-mint query, want 0 (issue #6556 safety guard)", fake.calls)
+		}
+	})
+}
+
+// drainChunkSeries collects every (ts, value) pair a ChunkQuerier returns,
+// decoding chunks via a real chunkenc iterator.
+func drainChunkSeries(t *testing.T, q storage.ChunkQuerier) []sample {
+	t.Helper()
+	var got []sample
+	css := q.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "up"))
+	for css.Next() {
+		cs := css.At()
+		it := cs.Iterator(nil)
+		for it.Next() {
+			chk := it.At()
+			cit := chk.Chunk.Iterator(nil)
+			for cit.Next() == chunkenc.ValFloat {
+				ts, v := cit.At()
+				got = append(got, sample{ts, v})
+			}
+		}
+	}
+	require.NoError(t, css.Err())
+	return got
 }
 
 // TestColumnarheadTSDBStoreCompactOOOHeadIsNoOp confirms CompactOOOHead is

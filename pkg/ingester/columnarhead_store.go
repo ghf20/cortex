@@ -23,6 +23,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb/index"
 
 	"github.com/cortexproject/cortex/pkg/ingester/columnarhead"
+	cortex_tsdb "github.com/cortexproject/cortex/pkg/storage/tsdb"
 )
 
 // columnarheadTSDBStore is a tsdbStore implementation backed by
@@ -47,6 +48,17 @@ type columnarheadTSDBStore struct {
 
 	compactor  *tsdb.LeveledCompactor
 	chunkRange int64 // smallest configured block range - what CompactHeadRange writes head blocks at
+
+	// postingCache is the same per-tenant cortex_tsdb.ExpandedPostingsCache
+	// instance the native backend's own blockChunkQuerierFunc closure reads
+	// from userTSDB.postingCache (ingester.go) - passed in at construction
+	// (createTSDB already builds it before branching on UseColumnarHead) since
+	// this type's ChunkQuerier is a plain method, not a callback registered
+	// with a *tsdb.DB the way native's is; no closure indirection needed. nil
+	// when the postings-cache feature isn't enabled for this tenant, in which
+	// case ChunkQuerier falls back to tsdb.NewBlockChunkQuerier per block,
+	// same as before this field existed.
+	postingCache cortex_tsdb.ExpandedPostingsCache
 
 	// maxBytes is the configured size-retention limit (real Cortex has no flag
 	// that sets this today - Config.StorageConfig.TSDBConfig.Retention.Size is
@@ -285,6 +297,22 @@ func (s *columnarheadTSDBStore) Querier(mint, maxt int64) (_ storage.Querier, er
 // mergeFn real *tsdb.DB.ChunkQuerier uses (storage.NewCompactingChunkSeriesMerger
 // over storage.ChainedSeriesMerge), and the same full-construction s.mtx.RLock()
 // scope Querier's own doc comment explains (B1).
+//
+// Per-block queriers go through s.postingCache when available, the same
+// expanded-postings cache the native backend's own blockChunkQuerierFunc
+// (ingester.go) already applies - a real, previously-missing perf gap for
+// columnar blocks, which used to build tsdb.NewBlockChunkQuerier directly
+// regardless of whether caching was enabled for this tenant (CHECKLIST.md).
+// Correctness was never at stake either way - this only changes whether a
+// query benefits from the cache, not what it returns.
+//
+// The mint > s.MaxTime() guard mirrors blockChunkQuerierFunc's own identical
+// check exactly, not a new judgment call: caching expanded postings for a
+// query whose mint is "in the future" relative to the store's current data can
+// cache incorrect results (github.com/cortexproject/cortex/issues/6556,
+// referenced verbatim in blockChunkQuerierFunc's own comment) - real
+// Prometheus's PostingsForMatchers can return invalid data for such a query,
+// and caching that would be worse than not caching at all.
 func (s *columnarheadTSDBStore) ChunkQuerier(mint, maxt int64) (_ storage.ChunkQuerier, err error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
@@ -302,11 +330,18 @@ func (s *columnarheadTSDBStore) ChunkQuerier(mint, maxt int64) (_ storage.ChunkQ
 		}
 	}()
 
+	useCache := s.postingCache != nil && mint <= s.MaxTime()
 	for _, b := range s.blocks {
 		if !b.OverlapsClosedInterval(mint, maxt) {
 			continue
 		}
-		q, err := tsdb.NewBlockChunkQuerier(b, mint, maxt)
+		var q storage.ChunkQuerier
+		var err error
+		if useCache {
+			q, err = cortex_tsdb.NewCachedBlockChunkQuerier(s.postingCache, b, mint, maxt)
+		} else {
+			q, err = tsdb.NewBlockChunkQuerier(b, mint, maxt)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("open chunk querier for block %s: %w", b.Meta().ULID, err)
 		}
