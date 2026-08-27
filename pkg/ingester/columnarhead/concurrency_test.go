@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/prometheus/prometheus/tsdb/tsdbutil"
 )
 
 // TestHeadShardWritesAreIndependent is the decisive test for Phase A's actual
@@ -194,5 +196,68 @@ func TestHeadConcurrentAppendQueryTruncateCompact(t *testing.T) {
 		if count != samplesPerSeries {
 			t.Fatalf("series %d: decoded %d samples after all writers finished, want %d", i, count, samplesPerSeries)
 		}
+	}
+}
+
+// TestHeadAppendHistogramAndCommitConcurrency ports real Prometheus's identically
+// named regression test (prometheus/prometheus#15139): two goroutines race to
+// create AND append the same brand-new series (ref=0, full labels every call) with
+// an identical (ts, histogram) sample. One commit must create the series and store
+// the sample; the other must see it as an exact duplicate and silently no-op -
+// real Prometheus's bug was a corrupted duplicate-check under a race in its
+// double-checked-locking series creation path. columnarhead's GetOrCreateSeries
+// takes a single indexMu.Lock() for its entire create-or-lookup body (no
+// double-checked locking to race), and the subsequent duplicate check
+// (Head.appendable/appendableHistogram) runs under that same series' shard lock -
+// structurally a different design, but worth verifying under -race directly rather
+// than only by inspection.
+func TestHeadAppendHistogramAndCommitConcurrency(t *testing.T) {
+	cases := []struct {
+		name     string
+		appendFn func(app *headAppender, l labels.Labels) error
+	}{
+		{"integer histogram", func(app *headAppender, l labels.Labels) error {
+			_, err := app.AppendHistogram(0, l, 1, tsdbutil.GenerateTestHistogram(1), nil)
+			return err
+		}},
+		{"float histogram", func(app *headAppender, l labels.Labels) error {
+			_, err := app.AppendHistogram(0, l, 1, nil, tsdbutil.GenerateTestFloatHistogram(1))
+			return err
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := NewHead(8, 4, 8)
+			const n = 2000
+			labelsFor := func(i int) labels.Labels {
+				return labels.FromStrings(labels.MetricName, "m",
+					"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+					"serial", strconv.Itoa(i))
+			}
+
+			var wg sync.WaitGroup
+			wg.Add(2)
+			race := func() {
+				defer wg.Done()
+				for i := 0; i < n; i++ {
+					app := h.Appender(context.Background()).(*headAppender)
+					if err := tc.appendFn(app, labelsFor(i)); err != nil {
+						t.Errorf("append %d: %v", i, err)
+						return
+					}
+					if err := app.Commit(); err != nil {
+						t.Errorf("commit %d: %v", i, err)
+						return
+					}
+				}
+			}
+			go race()
+			go race()
+			wg.Wait()
+
+			if got := h.NumSeries(); got != n {
+				t.Fatalf("NumSeries() = %d, want %d - each serial value must resolve to exactly one series across both racing goroutines", got, n)
+			}
+		})
 	}
 }

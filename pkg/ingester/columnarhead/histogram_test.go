@@ -46,18 +46,6 @@ func histEqual(t *testing.T, got, want *histogram.Histogram) {
 	}
 }
 
-func int64SliceEqual(a, b []int64) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 // floatHistEqual: see histEqual's own doc comment for why CounterResetHint is
 // deliberately excluded from this comparison.
 func floatHistEqual(t *testing.T, got, want *histogram.FloatHistogram) {

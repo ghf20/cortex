@@ -2,6 +2,7 @@ package columnarhead
 
 import (
 	"errors"
+	"math"
 
 	"github.com/prometheus/prometheus/model/histogram"
 )
@@ -205,6 +206,87 @@ func (hst *HistogramStore) LastTimestamp(ref uint32) (int64, bool) {
 	// lastSegment's own doc comment: a stored *histoSeries never has zero
 	// segments, so this is never nil here.
 	return s.lastSegment().ts.lastTS, true
+}
+
+// LastEquals reports whether h has the identical value (not just timestamp) as
+// ref's most recently appended integer-count histogram sample - the histogram
+// counterpart of SeriesStore.LastSample's lastBits comparison in Head.appendable,
+// needed by Head.appendableHistogram to allow an exact (ts, value) duplicate as a
+// silent no-op (real Prometheus's own memSeries.appendableHistogram: "we are
+// allowing exact duplicates as we can encounter them in valid cases like
+// federation"), rather than rejecting every same-timestamp append with
+// storage.ErrDuplicateSampleForTimestamp regardless of whether the value actually
+// changed. Compares against the owning segment's own running last-sample state
+// (lastZeroCount/lastCount/lastPosBuckets/lastNegBuckets/sum.lastBits) - already
+// tracked for the cross-sample delta encoding Append itself needs, not
+// recomputed by decoding through HistogramIterator. False for a layout mismatch
+// (sameLayout) or a float-typed series - the caller's ts==lastTS/exact-duplicate
+// path never legitimately reaches those, but a permissive false here just means
+// "not detected as identical," which is still correct (falls through to the
+// error case both here and in real Prometheus's own comparable branches).
+func (hst *HistogramStore) LastEquals(ref uint32, h *histogram.Histogram) bool {
+	s, ok := hst.series[ref]
+	if !ok || s.isFloat {
+		return false
+	}
+	seg := s.lastSegment()
+	if !sameLayout(seg, h) {
+		return false
+	}
+	return h.ZeroCount == seg.lastZeroCount &&
+		h.Count == seg.lastCount &&
+		math.Float64bits(h.Sum) == seg.sum.lastBits &&
+		int64SliceEqual(absoluteBuckets(h.PositiveBuckets), seg.lastPosBuckets) &&
+		int64SliceEqual(absoluteBuckets(h.NegativeBuckets), seg.lastNegBuckets)
+}
+
+// LastEqualsFloat is LastEquals' FloatHistogram counterpart - see its doc comment.
+// Compares against the owning segment's own XOR-tracked last-sample bits
+// (zeroCountVal/countVal/posVal/negVal/sum, each a valueState whose lastBits is
+// already the most recently written value - AppendFloat's own per-value-stream
+// state, not recomputed).
+func (hst *HistogramStore) LastEqualsFloat(ref uint32, h *histogram.FloatHistogram) bool {
+	s, ok := hst.series[ref]
+	if !ok || !s.isFloat {
+		return false
+	}
+	seg := s.lastSegment()
+	if !sameLayoutFloat(seg, h) {
+		return false
+	}
+	if len(h.PositiveBuckets) != len(seg.posVal) || len(h.NegativeBuckets) != len(seg.negVal) {
+		return false
+	}
+	if h.ZeroCount != math.Float64frombits(seg.zeroCountVal.lastBits) ||
+		h.Count != math.Float64frombits(seg.countVal.lastBits) ||
+		math.Float64bits(h.Sum) != seg.sum.lastBits {
+		return false
+	}
+	for i, v := range h.PositiveBuckets {
+		if math.Float64bits(v) != seg.posVal[i].lastBits {
+			return false
+		}
+	}
+	for i, v := range h.NegativeBuckets {
+		if math.Float64bits(v) != seg.negVal[i].lastBits {
+			return false
+		}
+	}
+	return true
+}
+
+// int64SliceEqual is a plain element-wise comparison - avoids pulling in the
+// generic "slices" package for this one call site.
+func int64SliceEqual(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // IsFloat reports whether ref's histogram samples are FloatHistogram-typed (true) or

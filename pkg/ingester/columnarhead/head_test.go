@@ -489,6 +489,104 @@ func TestHeadRejectsHistogramBackwardsTimestamp(t *testing.T) {
 	}
 }
 
+// TestHeadAcceptsExactDuplicateHistogramAsNoOp ports real Prometheus's own
+// allowance in memSeries.appendableHistogram/appendableFloatHistogram: an
+// exact-value duplicate at the same timestamp as the last sample is a silent
+// no-op, not an error (federation/retries produce exact duplicates in valid,
+// non-noteworthy cases) - only a DIFFERENT value at the same timestamp is
+// storage.ErrDuplicateSampleForTimestamp (TestHeadRejectsHistogramBackwardsTimestamp
+// above). Found missing while porting TestHeadAppendHistogramAndCommitConcurrency
+// (concurrency_test.go): HistogramStore had no way to compare an incoming sample
+// against the last stored one, so every same-timestamp append was rejected
+// unconditionally regardless of value - fixed via HistogramStore.LastEquals/
+// LastEqualsFloat, reusing the owning segment's own already-tracked last-sample
+// state (histogram.go).
+func TestHeadAcceptsExactDuplicateHistogramAsNoOp(t *testing.T) {
+	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
+	t.Run("integer histogram", func(t *testing.T) {
+		h := NewHead(1, 1, 1)
+		ref, err := h.GetOrCreateSeries(tgt, "request_latency")
+		if err != nil {
+			t.Fatalf("GetOrCreateSeries: %v", err)
+		}
+		hg := &histogram.Histogram{Schema: 0, Sum: 1, Count: 1}
+		if err := h.AppendHistogram(ref, 2000, hg); err != nil {
+			t.Fatalf("AppendHistogram @2000: %v", err)
+		}
+		// A fresh pointer with the identical value - equality must be by value, not
+		// by pointer identity.
+		dup := &histogram.Histogram{Schema: 0, Sum: 1, Count: 1}
+		if err := h.AppendHistogram(ref, 2000, dup); err != nil {
+			t.Fatalf("AppendHistogram @2000 (exact duplicate) = %v, want nil (silent no-op)", err)
+		}
+		it := h.HistogramIterator(ref)
+		n := 0
+		for it.Next() {
+			n++
+		}
+		if n != 1 {
+			t.Fatalf("HistogramIterator returned %d samples, want exactly 1 - the duplicate must not have been stored as a second sample", n)
+		}
+	})
+	t.Run("float histogram", func(t *testing.T) {
+		h := NewHead(1, 1, 1)
+		ref, err := h.GetOrCreateSeries(tgt, "request_latency")
+		if err != nil {
+			t.Fatalf("GetOrCreateSeries: %v", err)
+		}
+		fh := &histogram.FloatHistogram{Schema: 0, Sum: 1, Count: 1}
+		if err := h.AppendFloatHistogram(ref, 2000, fh); err != nil {
+			t.Fatalf("AppendFloatHistogram @2000: %v", err)
+		}
+		dup := &histogram.FloatHistogram{Schema: 0, Sum: 1, Count: 1}
+		if err := h.AppendFloatHistogram(ref, 2000, dup); err != nil {
+			t.Fatalf("AppendFloatHistogram @2000 (exact duplicate) = %v, want nil (silent no-op)", err)
+		}
+		it := h.HistogramIterator(ref)
+		n := 0
+		for it.Next() {
+			n++
+		}
+		if n != 1 {
+			t.Fatalf("HistogramIterator returned %d samples, want exactly 1 - the duplicate must not have been stored as a second sample", n)
+		}
+	})
+}
+
+// TestHeadRejectsFloatHistogramDifferentValueAtSameTimestamp is
+// TestHeadRejectsHistogramBackwardsTimestamp's float-histogram counterpart: a
+// DIFFERENT value at the same timestamp must still be rejected - the exact-duplicate
+// allowance (TestHeadAcceptsExactDuplicateHistogramAsNoOp) is by value, not a blanket
+// "any same-timestamp append is fine."
+func TestHeadRejectsFloatHistogramDifferentValueAtSameTimestamp(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
+	ref, err := h.GetOrCreateSeries(tgt, "request_latency")
+	if err != nil {
+		t.Fatalf("GetOrCreateSeries: %v", err)
+	}
+	fh1 := &histogram.FloatHistogram{Schema: 0, Sum: 1, Count: 1}
+	if err := h.AppendFloatHistogram(ref, 2000, fh1); err != nil {
+		t.Fatalf("AppendFloatHistogram @2000: %v", err)
+	}
+	fh2 := &histogram.FloatHistogram{Schema: 0, Sum: 2, Count: 2}
+	if err := h.AppendFloatHistogram(ref, 2000, fh2); err != storage.ErrDuplicateSampleForTimestamp {
+		t.Fatalf("AppendFloatHistogram @2000 (different value, same ts) = %v, want ErrDuplicateSampleForTimestamp", err)
+	}
+	it := h.HistogramIterator(ref)
+	n := 0
+	for it.Next() {
+		_, fh := it.AtFloat()
+		if fh.Sum != 1 || fh.Count != 1 {
+			t.Fatalf("sample %d: sum=%v count=%v, want the ORIGINAL @2000 sample unchanged", n, fh.Sum, fh.Count)
+		}
+		n++
+	}
+	if n != 1 {
+		t.Fatalf("HistogramIterator returned %d samples, want exactly 1", n)
+	}
+}
+
 // TestHeadRejectsCrossTypeSameTimestamp is CHECKLIST.md's port of real
 // Prometheus's TestHeadAppender_AppendFloatWithSameTimestampAsPreviousHistogram
 // (tsdb/head_test.go): a single (series, timestamp) slot is exactly one type -
