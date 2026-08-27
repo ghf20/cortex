@@ -1,10 +1,16 @@
 package columnarhead
 
 // targetFields is the number of symbol refs per target: cluster, namespace, pod,
-// container, node, job. See columnar-head-design.md §3.1 - this is the shared label
-// block responsible for the design's core memory claim, a measured 200:1 sharing ratio
-// between series and targets on a realistic k8s workload (§2).
-const targetFields = 6
+// container, node, job, instance. See columnar-head-design.md §3.1 - this is the
+// shared label block responsible for the design's core memory claim, a measured
+// 200:1 sharing ratio between series and targets on a realistic k8s workload (§2).
+// instance was added after the original 6-label design (see CHECKLIST.md's
+// label-shape scope-limit entry): it wasn't considered when the set was first
+// chosen, despite fitting the same "shared per scraped target" sharing pattern as
+// the other six - real Prometheus attaches it to every scraped series
+// automatically, and it's the single most common cause of otherwise-in-shape
+// series being rejected by ErrUnsupportedLabelShape (appender.go).
+const targetFields = 7
 
 // TargetStore is a flat, pointerless slab of target records: targetFields symbol refs
 // per target, into whatever symbol table the caller resolved strings through (Head uses

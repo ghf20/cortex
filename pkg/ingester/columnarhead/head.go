@@ -170,9 +170,9 @@ type Head struct {
 	minTime, maxTime atomic.Int64
 }
 
-// TargetLabels is the fixed 6-label shared block every series belongs to (§3.1).
+// TargetLabels is the fixed 7-label shared block every series belongs to (§3.1).
 type TargetLabels struct {
-	Cluster, Namespace, Pod, Container, Node, Job string
+	Cluster, Namespace, Pod, Container, Node, Job, Instance string
 }
 
 type seriesKey struct {
@@ -346,6 +346,7 @@ func (h *Head) GetOrCreateSeries(target TargetLabels, metricName, localName, loc
 		h.symbols.Intern(target.Container),
 		h.symbols.Intern(target.Node),
 		h.symbols.Intern(target.Job),
+		h.symbols.Intern(target.Instance),
 	}
 	targetID, ok := h.targetIndex[tRefs]
 	if !ok {
@@ -438,6 +439,7 @@ func buildLabels(target TargetLabels, metricName, localName, localLabel string) 
 	addIfNotEmptyLabel(&b, labelContainer, target.Container)
 	addIfNotEmptyLabel(&b, labelNode, target.Node)
 	addIfNotEmptyLabel(&b, labelJob, target.Job)
+	addIfNotEmptyLabel(&b, labelInstance, target.Instance)
 	if localLabel != "" {
 		b.Add(localName, localLabel)
 	}
@@ -473,7 +475,7 @@ func (h *Head) LookupSeriesRef(target TargetLabels, metricName, localName, local
 func (h *Head) lookupTarget(target TargetLabels) ([targetFields]uint32, bool) {
 	var tRefs [targetFields]uint32
 	for i, s := range [targetFields]string{
-		target.Cluster, target.Namespace, target.Pod, target.Container, target.Node, target.Job,
+		target.Cluster, target.Namespace, target.Pod, target.Container, target.Node, target.Job, target.Instance,
 	} {
 		id, ok := h.symbols.Lookup(s)
 		if !ok {
@@ -639,6 +641,7 @@ func (h *Head) SeriesLabels(ref uint32) labels.Labels {
 	addIfNotEmpty(labelContainer, tRefs[3])
 	addIfNotEmpty(labelNode, tRefs[4])
 	addIfNotEmpty(labelJob, tRefs[5])
+	addIfNotEmpty(labelInstance, tRefs[6])
 	if shard.series.HasLocal(localIdx) {
 		b.Add(h.symbols.String(uint32(shard.series.LocalName(localIdx))), h.symbols.String(uint32(shard.series.LocalRef(localIdx))))
 	}
@@ -660,7 +663,7 @@ func (h *Head) SeriesLabelValue(ref uint32, name string) string {
 	switch name {
 	case labels.MetricName:
 		return h.symbols.String(uint32(shard.series.NameID(localIdx)))
-	case labelCluster, labelNamespace, labelPod, labelContainer, labelNode, labelJob:
+	case labelCluster, labelNamespace, labelPod, labelContainer, labelNode, labelJob, labelInstance:
 		tRefs := h.targets.Get(shard.series.TargetID(localIdx))
 		return h.symbols.String(tRefs[targetLabelIndex(name)])
 	default:
@@ -671,9 +674,9 @@ func (h *Head) SeriesLabelValue(ref uint32, name string) string {
 	}
 }
 
-// targetLabelIndex maps one of the six fixed target label names to its position in
+// targetLabelIndex maps one of the seven fixed target label names to its position in
 // TargetStore's [targetFields]uint32 tuple (§3.1's fixed cluster/namespace/pod/
-// container/node/job order). Panics on an unrecognized name - callers (only
+// container/node/job/instance order). Panics on an unrecognized name - callers (only
 // SeriesLabelValue) already gate on the same name set in their switch, so reaching
 // here with anything else is a programming error, not a real-world input to guard.
 func targetLabelIndex(name string) int {
@@ -690,6 +693,8 @@ func targetLabelIndex(name string) int {
 		return 4
 	case labelJob:
 		return 5
+	case labelInstance:
+		return 6
 	}
 	panic("columnarhead: targetLabelIndex called with an unrecognized label name: " + name)
 }

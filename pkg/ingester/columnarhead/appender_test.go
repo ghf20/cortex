@@ -167,6 +167,34 @@ func TestAppenderRejectsUnsupportedShape(t *testing.T) {
 	}
 }
 
+// TestAppenderAcceptsInstanceAsTargetLabel is the real-world shape instance's
+// addition to the target set exists for (see CHECKLIST.md's label-shape
+// scope-limit entry, and targetFields' doc comment in target.go): job + instance +
+// one more label is the standard Prometheus scrape-target shape (instance is
+// attached to every scraped series automatically, by every Prometheus scrape
+// config) - before instance joined the six original target labels, this exact
+// shape had two non-target extra labels (instance, group) and was rejected.
+func TestAppenderAcceptsInstanceAsTargetLabel(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	app := h.Appender(context.Background())
+
+	l := labels.FromStrings(
+		labels.MetricName, "http_requests",
+		"job", "api-server", "instance", "0", "group", "production",
+	)
+	ref, err := app.Append(0, l, 1700000000000, 1)
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	internalRef, ok := toInternalRef(ref, h.NumSeries())
+	if !ok {
+		t.Fatalf("toInternalRef(%d) failed", ref)
+	}
+	if got := h.SeriesLabels(internalRef); !labels.Equal(got, l) {
+		t.Fatalf("SeriesLabels = %v, want %v", got, l)
+	}
+}
+
 func TestAppenderGetRef(t *testing.T) {
 	h := NewHead(1, 1, 1)
 	app := h.Appender(context.Background())

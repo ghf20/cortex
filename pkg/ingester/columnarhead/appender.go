@@ -12,15 +12,18 @@ import (
 )
 
 // ErrUnsupportedLabelShape is returned by Append when the label set doesn't fit the
-// shape this prototype can represent: the six fixed target labels (cluster, namespace,
-// pod, container, node, job) + __name__ + at most one additional label. This mirrors
-// SeriesStore/Head's existing single-localRef-field model (bench/04's original
-// simplification, unchanged through every commit so far) - it was never extended to
-// hold an arbitrary label list, and Append is the first place that limitation meets
-// real, arbitrary-shaped label sets instead of a workload deliberately built to fit it.
-// Rejecting loudly here is a real, current scope limit of this prototype, not a bug to
-// paper over silently - see design doc §9 gap #1 ("the appender is incomplete") and
-// CHECKLIST.md.
+// shape this prototype can represent: the seven fixed target labels (cluster,
+// namespace, pod, container, node, job, instance) + __name__ + at most one additional
+// label. This mirrors SeriesStore/Head's existing single-localRef-field model
+// (bench/04's original simplification, unchanged through every commit so far) - it was
+// never extended to hold an arbitrary label list, and Append is the first place that
+// limitation meets real, arbitrary-shaped label sets instead of a workload
+// deliberately built to fit it. Rejecting loudly here is a real, current scope limit
+// of this prototype, not a bug to paper over silently - see design doc §9 gap #1 ("the
+// appender is incomplete") and CHECKLIST.md. instance was added to the target set
+// after the original six were chosen - see targetFields' doc comment (target.go) for
+// why, and CHECKLIST.md for the measured effect on real workloads and this prototype's
+// own promqltest coverage.
 var ErrUnsupportedLabelShape = errors.New("columnarhead: label set has more than one non-target, non-__name__ label - unsupported by this prototype")
 
 // ErrNotImplemented now guards exactly one remaining gap: AppendHistogramSTZeroSample
@@ -38,6 +41,7 @@ const (
 	labelContainer = "container"
 	labelNode      = "node"
 	labelJob       = "job"
+	labelInstance  = "instance"
 )
 
 // Appender returns a storage.Appender backed by h, matching the exact signature
@@ -93,6 +97,7 @@ func splitLabels(l labels.Labels) (target TargetLabels, metricName, localName, l
 		Container: l.Get(labelContainer),
 		Node:      l.Get(labelNode),
 		Job:       l.Get(labelJob),
+		Instance:  l.Get(labelInstance),
 	}
 
 	knownCount := 1 // __name__
@@ -114,11 +119,14 @@ func splitLabels(l labels.Labels) (target TargetLabels, metricName, localName, l
 	if target.Job != "" {
 		knownCount++
 	}
+	if target.Instance != "" {
+		knownCount++
+	}
 
 	var extra int
 	l.Range(func(lb labels.Label) {
 		switch lb.Name {
-		case labels.MetricName, labelCluster, labelNamespace, labelPod, labelContainer, labelNode, labelJob:
+		case labels.MetricName, labelCluster, labelNamespace, labelPod, labelContainer, labelNode, labelJob, labelInstance:
 			return
 		}
 		extra++
