@@ -3038,11 +3038,9 @@ tsdb:
     [lazy_matcher_complex_cost_ratio: <int> | default = 2]
 
   # [EXPERIMENTAL] Use the columnar head prototype instead of the real TSDB head
-  # for newly created per-tenant TSDBs. NOT for production: only label sets of
-  # __name__ + the target labels (cluster/namespace/pod/container/node/job) + at
-  # most one extra label are accepted, other pushes fail the whole batch; no
-  # size-based block retention; no isolation. Only affects newly opened TSDBs,
-  # not ones already on disk.
+  # for newly created per-tenant TSDBs. NOT for production: no size-based block
+  # retention; no isolation. Only affects newly opened TSDBs, not ones already
+  # on disk.
   # CLI flag: -blocks-storage.tsdb.use-columnar-head
   [use_columnar_head: <boolean> | default = false]
 
