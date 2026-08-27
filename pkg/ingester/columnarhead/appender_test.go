@@ -231,6 +231,35 @@ func TestAppenderAcceptsInstanceAsTargetLabel(t *testing.T) {
 	}
 }
 
+// TestAppenderRejectsDuplicateLabelName is CHECKLIST.md's port of real
+// Prometheus's own TestAddDuplicateLabelName (tsdb/head_test.go) - found
+// missing entirely, not just untested: before ErrDuplicateLabelName existed,
+// this exact shape silently corrupted the stored series (both same-named
+// labels landed as separate entries) instead of being rejected.
+func TestAppenderRejectsDuplicateLabelName(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	app := h.Appender(context.Background())
+
+	cases := map[string]labels.Labels{
+		"name repeated, different values": labels.FromStrings(
+			labels.MetricName, "up", "a", "c", "a", "b",
+		),
+		"name repeated, same value": labels.FromStrings(
+			labels.MetricName, "up", "a", "c", "a", "c",
+		),
+		"extra label repeated (le)": labels.FromStrings(
+			labels.MetricName, "up", "job", "prometheus", "le", "500", "le", "400",
+		),
+	}
+	for name, l := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := app.Append(0, l, 0, 0); err != ErrDuplicateLabelName {
+				t.Fatalf("Append(%v) = %v, want ErrDuplicateLabelName", l, err)
+			}
+		})
+	}
+}
+
 func TestAppenderGetRef(t *testing.T) {
 	h := NewHead(1, 1, 1)
 	app := h.Appender(context.Background())

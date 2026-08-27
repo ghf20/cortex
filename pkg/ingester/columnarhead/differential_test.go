@@ -15,6 +15,7 @@ import (
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/prometheus/prometheus/tsdb/tsdbutil"
 )
 
 // This file is the differential harness design doc §4 calls for ("build it before
@@ -795,6 +796,122 @@ func TestDifferentialFloatHistogramStalenessRealVsColumnar(t *testing.T) {
 		default:
 			t.Fatalf("sample %d: unexpected value type %v", i, r.vt)
 		}
+	}
+}
+
+// TestDifferentialHistogramStaleThenResumeRealVsColumnar is CHECKLIST.md's
+// Phase 6 port of real Prometheus's own TestHistogramStaleSample
+// (vendor/.../tsdb/head_test.go) - adapted to this package's differential
+// harness (real tsdb.Head vs columnarhead.Head, bit-exact) rather than
+// copied verbatim, since the real test also asserts on mmap-chunk-count
+// internals (s.headChunks.len(), s.mmappedChunks) columnarhead has no
+// equivalent of - this ports the behavioral core: a histogram series that
+// goes stale, then RESUMES with real histogram samples afterward, must get
+// CounterResetHint == UnknownCounterReset on the sample immediately after
+// the gap (resuming after staleness can never be confidently called "not a
+// reset").
+func TestDifferentialHistogramStaleThenResumeRealVsColumnar(t *testing.T) {
+	l := labels.FromStrings(
+		labels.MetricName, "request_duration_seconds",
+		"cluster", "eks-prod-1", "namespace", "ns-7", "pod", "payments-api-1",
+		"container", "app", "node", "ip-10-1-2-3", "job", "cadvisor",
+	)
+	base := int64(1700000000000)
+	firstRun := tsdbutil.GenerateTestHistograms(5)
+	secondRun := tsdbutil.GenerateTestHistograms(10)[5:] // continues the counter sequence, matching the real test's own pattern
+
+	appendAll := func(app storage.Appender) {
+		var ref storage.SeriesRef
+		ts := base
+		for _, hg := range firstRun {
+			var err error
+			ref, err = app.AppendHistogram(ref, l, ts, hg, nil)
+			if err != nil {
+				t.Fatalf("AppendHistogram(first run, ts=%d): %v", ts, err)
+			}
+			ts += 15000
+		}
+		var err error
+		ref, err = app.Append(ref, l, ts, math.Float64frombits(value.StaleNaN))
+		if err != nil {
+			t.Fatalf("Append(stale, ts=%d): %v", ts, err)
+		}
+		ts += 15000
+		for _, hg := range secondRun {
+			ref, err = app.AppendHistogram(ref, l, ts, hg, nil)
+			if err != nil {
+				t.Fatalf("AppendHistogram(second run, ts=%d): %v", ts, err)
+			}
+			ts += 15000
+		}
+	}
+
+	realHead := newRealHead(t)
+	realApp := realHead.Appender(context.Background())
+	appendAll(realApp)
+	if err := realApp.Commit(); err != nil {
+		t.Fatalf("real head Commit: %v", err)
+	}
+
+	colHead := NewHead(1, 1, 16)
+	colApp := colHead.Appender(context.Background())
+	appendAll(colApp)
+	if err := colApp.Commit(); err != nil {
+		t.Fatalf("columnar head Commit: %v", err)
+	}
+
+	realQuerier, err := tsdb.NewBlockQuerier(realHead, math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("real head querier: %v", err)
+	}
+	defer realQuerier.Close()
+	colQuerier, err := colHead.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("columnar head querier: %v", err)
+	}
+	defer colQuerier.Close()
+
+	m := labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "request_duration_seconds")
+	realSamples := collectMixedSamples(t, realQuerier.Select(context.Background(), true, nil, m))
+	colSamples := collectMixedSamples(t, colQuerier.Select(context.Background(), true, nil, m))
+
+	wantLen := len(firstRun) + 1 + len(secondRun)
+	if len(realSamples) != wantLen {
+		t.Fatalf("sanity check failed: real head returned %d samples, want %d - the differential test would pass vacuously otherwise", len(realSamples), wantLen)
+	}
+	if len(realSamples) != len(colSamples) {
+		t.Fatalf("real head returned %d samples, columnar returned %d", len(realSamples), len(colSamples))
+	}
+	for i := range realSamples {
+		r, c := realSamples[i], colSamples[i]
+		if r.ts != c.ts {
+			t.Fatalf("sample %d: ts real=%d columnar=%d", i, r.ts, c.ts)
+		}
+		if r.vt != c.vt {
+			t.Fatalf("sample %d (ts=%d): value type real=%v columnar=%v", i, r.ts, r.vt, c.vt)
+		}
+		switch r.vt {
+		case chunkenc.ValFloat:
+			rb, cb := math.Float64bits(r.v), math.Float64bits(c.v)
+			if rb != cb {
+				t.Fatalf("sample %d (ts=%d): value real=%v (bits %x) columnar=%v (bits %x) - not bit-identical", i, r.ts, r.v, rb, c.v, cb)
+			}
+		case chunkenc.ValHistogram:
+			histEqual(t, c.h, r.h)
+		default:
+			t.Fatalf("sample %d: unexpected value type %v", i, r.vt)
+		}
+	}
+
+	// The real behavioral point TestHistogramStaleSample makes - histEqual
+	// deliberately does NOT compare CounterResetHint (its own doc comment),
+	// so this is checked directly, matching that established precedent.
+	resumeIdx := len(firstRun) + 1
+	if got := colSamples[resumeIdx].h.CounterResetHint; got != histogram.UnknownCounterReset {
+		t.Fatalf("first sample after stale gap (index %d, ts=%d): CounterResetHint = %v, want UnknownCounterReset", resumeIdx, colSamples[resumeIdx].ts, got)
+	}
+	if got := realSamples[resumeIdx].h.CounterResetHint; got != histogram.UnknownCounterReset {
+		t.Fatalf("sanity check failed: real head's own first-sample-after-stale hint = %v, want UnknownCounterReset - the test's own expectation is wrong", got)
 	}
 }
 

@@ -25,6 +25,16 @@ import (
 // than 255 extra labels on one series.
 var ErrUnsupportedLabelShape = errors.New("columnarhead: label set doesn't fit this prototype's supported shape")
 
+// ErrDuplicateLabelName is returned by Append when l has the same label name
+// twice - matches real tsdb.Head's own rejection (headAppenderBase.getOrCreate,
+// vendor/.../tsdb/head_append.go: `label name %q is not unique: invalid sample`),
+// found missing here entirely while porting that package's own
+// TestAddDuplicateLabelName (CHECKLIST.md) - without this check, splitLabels'
+// l.Range would silently accept both same-named labels as separate entries in
+// extra, corrupting the stored series with an invalid, ambiguous label set
+// instead of rejecting the write.
+var ErrDuplicateLabelName = errors.New("columnarhead: label set has a duplicate label name")
+
 // ErrNotImplemented now guards exactly one remaining gap: AppendHistogramSTZeroSample
 // (see its own doc comment for why). Exemplars, native histograms (including custom
 // bucket boundaries, schema -53/NHCB - see histoSegment's own doc comment), metadata,
@@ -85,6 +95,13 @@ var _ storage.Appender = (*headAppender)(nil)
 // that build a canonical dedup key from extra (Head.GetOrCreateSeries/lookupSeries)
 // rely on that order directly, without a separate sort.
 func splitLabels(l labels.Labels) (target TargetLabels, metricName string, extra []labels.Label, err error) {
+	// See ErrDuplicateLabelName's own doc comment. HasDuplicateLabelNames is
+	// real Prometheus's own method (checks adjacent pairs, correct because
+	// labels.Labels is always sorted by contract) - reused directly rather
+	// than reimplemented.
+	if _, dup := l.HasDuplicateLabelNames(); dup {
+		return TargetLabels{}, "", nil, ErrDuplicateLabelName
+	}
 	metricName = l.Get(labels.MetricName)
 	if metricName == "" {
 		return TargetLabels{}, "", nil, ErrUnsupportedLabelShape
