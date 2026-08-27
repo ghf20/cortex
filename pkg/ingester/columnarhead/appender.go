@@ -42,16 +42,20 @@ const (
 
 // Appender returns a storage.Appender backed by h, matching the exact signature
 // Cortex's tsdbStore.Appender(ctx context.Context) storage.Appender (pkg/ingester,
-// Phase 1, ingester.go:380) requires - though this is not yet wired into that
-// interface at the ingester level; that integration is separate work. ctx is accepted
-// for signature conformance and currently unused: there is no cancellable work inside
-// Append yet (no WAL, no network I/O) for it to govern.
+// Phase 1, ingester.go:380) requires, and wired into that interface at the ingester
+// level via columnarheadTSDBStore (gated by -blocks-storage.tsdb.use-columnar-head).
+// ctx is accepted for signature conformance and currently unused: there is no
+// cancellable work inside Append yet (no WAL, no network I/O) for it to govern.
 //
 // Transactions are not implemented: every Append takes effect immediately, and Commit/
-// Rollback are no-ops (Rollback cannot actually undo anything already written). This
-// matches design doc §9 gap #1's already-documented list of what the appender omits
-// (WAL buffering, commit/rollback, OOO checks, tombstones, duplicate detection,
-// exemplars, per-tenant limits) - stated plainly here rather than left implicit.
+// Rollback are no-ops (Rollback cannot actually undo anything already written).
+// OOO checks and exemplars ARE implemented (ooo.go/exemplar.go) and per-tenant
+// limits are enforced at the ingester level (Head.SetSeriesLifecycleCallback,
+// wired to userDB in ingester.go's createTSDB) - what design doc §9 gap #1's
+// original list still leaves genuinely missing here is WAL buffering (this
+// package's own durability.go is a separate mechanism, not the appender doing
+// buffered writes), real commit/rollback, tombstones, and duplicate-detection
+// nuances beyond OOO's own dedup.
 //
 // Concurrency: headAppender itself holds no lock - every method below calls straight
 // through to a self-locking Head method (GetOrCreateSeries, Append, LookupSeriesRef,

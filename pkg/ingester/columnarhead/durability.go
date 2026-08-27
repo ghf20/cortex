@@ -722,8 +722,8 @@ type durableShard struct {
 }
 
 // DurableHead wraps a Head with on-disk persistence for its append-only structures.
-// Not wired into the real ingest path - a standalone harness for measuring whether
-// the underlying mechanism (see this file's package-level doc comment) is viable.
+// Wired into the real ingest path via columnarheadTSDBStore (pkg/ingester,
+// gated by -blocks-storage.tsdb.use-columnar-head).
 type DurableHead struct {
 	*Head
 	dir string
