@@ -3629,7 +3629,7 @@
             },
             "use_columnar_head": {
               "default": false,
-              "description": "[EXPERIMENTAL] Use the columnar head prototype instead of the real TSDB head for newly created per-tenant TSDBs. NOT for production: only label sets of __name__ + the target labels (cluster/namespace/pod/container/node/job) + at most one extra label are accepted, other pushes fail the whole batch; no size-based block retention; no isolation; cardinality limits are enforced against ever-created series, not live series, and tighten over time under label churn. Only affects newly opened TSDBs, not ones already on disk.",
+              "description": "[EXPERIMENTAL] Use the columnar head prototype instead of the real TSDB head for newly created per-tenant TSDBs. NOT for production: only label sets of __name__ + the target labels (cluster/namespace/pod/container/node/job) + at most one extra label are accepted, other pushes fail the whole batch; no size-based block retention; no isolation. Only affects newly opened TSDBs, not ones already on disk.",
               "type": "boolean",
               "x-cli-flag": "blocks-storage.tsdb.use-columnar-head"
             },

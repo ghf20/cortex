@@ -3041,9 +3041,8 @@ tsdb:
   # for newly created per-tenant TSDBs. NOT for production: only label sets of
   # __name__ + the target labels (cluster/namespace/pod/container/node/job) + at
   # most one extra label are accepted, other pushes fail the whole batch; no
-  # size-based block retention; no isolation; cardinality limits are enforced
-  # against ever-created series, not live series, and tighten over time under
-  # label churn. Only affects newly opened TSDBs, not ones already on disk.
+  # size-based block retention; no isolation. Only affects newly opened TSDBs,
+  # not ones already on disk.
   # CLI flag: -blocks-storage.tsdb.use-columnar-head
   [use_columnar_head: <boolean> | default = false]
 
