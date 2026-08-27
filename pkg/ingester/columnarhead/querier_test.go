@@ -430,6 +430,79 @@ func TestQuerierSelectFloatHistogramSeries(t *testing.T) {
 	}()
 }
 
+// TestHistogramIteratorCounterResetHintDetectsResetMidSeries is the real shape
+// promqltest's native_histograms.test surfaced (see histogram_reset_hint.go's own
+// doc comment and CHECKLIST.md): a query whose mint lands PAST the series' true
+// start must still correctly detect a counter reset at the window's very first
+// sample - resetState (histogram_reset_hint.go) has to see every sample from the
+// series' true start to compute this correctly, not just the ones inside
+// [mint, maxt], since real chunk boundaries are a write-time property
+// independent of any later query's mint. Getting the ordering of that check wrong
+// was the actual bug found while building this: an earlier version fed
+// resetState only in-window samples, making every window's first sample look
+// like a fresh reset regardless of whether the series genuinely had one there.
+func TestHistogramIteratorCounterResetHintDetectsResetMidSeries(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	app := h.Appender(context.Background())
+	l := labels.FromStrings(
+		labels.MetricName, "mixed",
+		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+	)
+
+	// A monotonically increasing counter run (t=0..4m), then a genuine reset -
+	// count/sum drop back down (t=5m). Real Prometheus's own bucket-comparison
+	// reset detection must see this as a reset regardless of any query window.
+	samples := []*histogram.FloatHistogram{
+		{Schema: 0, Count: 5, Sum: 6, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []float64{5}},
+		{Schema: 0, Count: 8, Sum: 8, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []float64{8}},
+		{Schema: 0, Count: 11, Sum: 10, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []float64{11}},
+		{Schema: 0, Count: 14, Sum: 12, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []float64{14}},
+		{Schema: 0, Count: 17, Sum: 14, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []float64{17}},
+		{Schema: 0, Count: 4, Sum: 4, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []float64{4}}, // reset: count/sum dropped
+	}
+	base := int64(0)
+	step := int64(60000)
+	for i, fh := range samples {
+		if _, err := app.AppendHistogram(0, l, base+int64(i)*step, nil, fh); err != nil {
+			t.Fatalf("AppendHistogram %d: %v", i, err)
+		}
+	}
+
+	// Query a window covering ONLY the last two samples (t=4m, t=5m) - mint lands
+	// well past the series' true start (t=0), the exact shape that broke this.
+	q, err := h.Querier(4*60000, 5*60000)
+	if err != nil {
+		t.Fatalf("Querier: %v", err)
+	}
+	defer q.Close()
+
+	ss := q.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "mixed"))
+	if !ss.Next() {
+		t.Fatal("Select found no series")
+	}
+	it := ss.At().Iterator(nil)
+
+	if vt := it.Next(); vt != chunkenc.ValFloatHistogram {
+		t.Fatalf("Next() (1st in-window sample) = %v, want ValFloatHistogram", vt)
+	}
+	_, fh := it.AtFloatHistogram(nil)
+	if fh.CounterResetHint != histogram.NotCounterReset {
+		t.Fatalf("t=4m CounterResetHint = %v, want NotCounterReset (continues the counter run that started before the query window)", fh.CounterResetHint)
+	}
+
+	if vt := it.Next(); vt != chunkenc.ValFloatHistogram {
+		t.Fatalf("Next() (2nd in-window sample) = %v, want ValFloatHistogram", vt)
+	}
+	_, fh = it.AtFloatHistogram(nil)
+	if fh.CounterResetHint != histogram.UnknownCounterReset {
+		t.Fatalf("t=5m CounterResetHint = %v, want UnknownCounterReset (the real reset boundary - must be detected even though it's the window's FIRST sample)", fh.CounterResetHint)
+	}
+
+	if vt := it.Next(); vt != chunkenc.ValNone {
+		t.Fatalf("Next() past the window = %v, want ValNone", vt)
+	}
+}
+
 func TestFloatIteratorPanicsOnAtHistogram(t *testing.T) {
 	h := NewHead(1, 1, 1)
 	app := h.Appender(context.Background())

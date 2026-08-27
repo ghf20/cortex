@@ -369,7 +369,8 @@ func (fi *floatSampleIterator) AtFloatHistogram(*histogram.FloatHistogram) (int6
 func (fi *floatSampleIterator) Err() error { return nil }
 
 // histogramSampleIterator adapts *HistogramIterator to chunkenc.Iterator, bounded to
-// [mint, maxt] inclusive.
+// [mint, maxt] inclusive. resetState recomputes each sample's real CounterResetHint
+// in Next() - see histogram_reset_hint.go's own doc comment.
 type histogramSampleIterator struct {
 	it         *HistogramIterator
 	mint, maxt int64
@@ -377,23 +378,40 @@ type histogramSampleIterator struct {
 	done       bool
 	curTS      int64
 	curH       *histogram.Histogram
+	resetState histogramResetState
+	err        error
 }
 
 var _ chunkenc.Iterator = (*histogramSampleIterator)(nil)
 
 func (hi *histogramSampleIterator) Next() chunkenc.ValueType {
 	for {
-		if hi.done || !hi.it.Next() {
+		if hi.done || hi.err != nil || !hi.it.Next() {
 			hi.done = true
 			return chunkenc.ValNone
 		}
 		ts, h := hi.it.At()
-		if ts < hi.mint {
-			continue
-		}
 		if ts > hi.maxt {
 			hi.done = true
 			return chunkenc.ValNone
+		}
+		// resetState must see EVERY sample from the series' true start, not just
+		// ones inside [mint, maxt] - real chunk boundaries are a write-time
+		// property of the whole series, computed once, independent of any later
+		// query's mint (a real block's chunks don't move because a query
+		// happens to start mid-chunk). Feeding it only the in-window samples
+		// would make every window's first sample look like a chunk boundary
+		// regardless of whether the real series actually had one there -
+		// exactly the bug a query starting mid-series (rather than at the
+		// series' true start) surfaced (histogram_reset_hint.go's own doc
+		// comment). mint only filters what's YIELDED to the caller, below.
+		if err := hi.resetState.apply(h, ts); err != nil {
+			hi.err = err
+			hi.done = true
+			return chunkenc.ValNone
+		}
+		if ts < hi.mint {
+			continue
 		}
 		hi.started = true
 		hi.curTS, hi.curH = ts, h
@@ -492,7 +510,7 @@ func int64ToFloat64Slice(abs []int64) []float64 {
 }
 
 func (hi *histogramSampleIterator) AtT() int64 { return hi.curTS }
-func (hi *histogramSampleIterator) Err() error { return nil }
+func (hi *histogramSampleIterator) Err() error { return hi.err }
 
 // floatHistogramSampleIterator adapts *HistogramIterator to chunkenc.Iterator for a
 // genuinely float-typed series (HistogramStore.IsFloat true) - the mirror image of
@@ -509,23 +527,32 @@ type floatHistogramSampleIterator struct {
 	done       bool
 	curTS      int64
 	curFH      *histogram.FloatHistogram
+	resetState floatHistogramResetState
+	err        error
 }
 
 var _ chunkenc.Iterator = (*floatHistogramSampleIterator)(nil)
 
 func (hi *floatHistogramSampleIterator) Next() chunkenc.ValueType {
 	for {
-		if hi.done || !hi.it.Next() {
+		if hi.done || hi.err != nil || !hi.it.Next() {
 			hi.done = true
 			return chunkenc.ValNone
 		}
 		ts, fh := hi.it.AtFloat()
-		if ts < hi.mint {
-			continue
-		}
 		if ts > hi.maxt {
 			hi.done = true
 			return chunkenc.ValNone
+		}
+		// See histogramSampleIterator.Next's identical comment: resetState must
+		// see every sample from the series' true start, not just [mint, maxt].
+		if err := hi.resetState.apply(fh, ts); err != nil {
+			hi.err = err
+			hi.done = true
+			return chunkenc.ValNone
+		}
+		if ts < hi.mint {
+			continue
 		}
 		hi.started = true
 		hi.curTS, hi.curFH = ts, fh
@@ -574,4 +601,4 @@ func (hi *floatHistogramSampleIterator) AtFloatHistogram(dst *histogram.FloatHis
 }
 
 func (hi *floatHistogramSampleIterator) AtT() int64 { return hi.curTS }
-func (hi *floatHistogramSampleIterator) Err() error { return nil }
+func (hi *floatHistogramSampleIterator) Err() error { return hi.err }
