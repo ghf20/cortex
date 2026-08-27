@@ -168,6 +168,7 @@ func TestAppenderRejectsUnsupportedShape(t *testing.T) {
 	cases := map[string]labels.Labels{
 		"no __name__":             labels.FromStrings("cluster", "c"),
 		"256 extra labels (>255)": labels.New(tooMany...),
+		"completely empty":        labels.EmptyLabels(),
 	}
 	for name, l := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -175,6 +176,40 @@ func TestAppenderRejectsUnsupportedShape(t *testing.T) {
 				t.Fatalf("Append(%v) = %v, want ErrUnsupportedLabelShape", l, err)
 			}
 		})
+	}
+}
+
+// TestAppenderIgnoresEmptyValueExtraLabel ports real Prometheus's
+// TestAppendEmptyLabelsIgnored (tsdb/db_test.go): an extra label with an empty
+// value must resolve to the SAME series as omitting it entirely, matching real
+// Prometheus's own headAppenderBase.getOrCreate ("ensure no empty labels have
+// gotten through" - labels.Labels.WithoutEmpty()). Found missing via a direct
+// repro before this test existed: splitLabels' l.Range loop appended every extra
+// label unconditionally, including empty-valued ones, so
+// labels.FromStrings("a","b") and labels.FromStrings("a","b","c","") produced
+// two different series instead of one. Fixed with l.WithoutEmpty() at the top
+// of splitLabels (appender.go).
+func TestAppenderIgnoresEmptyValueExtraLabel(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	app := h.Appender(context.Background())
+	base := func(extra ...string) labels.Labels {
+		s := []string{labels.MetricName, "m", "cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j"}
+		s = append(s, extra...)
+		return labels.FromStrings(s...)
+	}
+	ref1, err := app.Append(0, base(), 123, 0)
+	if err != nil {
+		t.Fatalf("append 1: %v", err)
+	}
+	ref2, err := app.Append(0, base("c", ""), 124, 0)
+	if err != nil {
+		t.Fatalf("append 2: %v", err)
+	}
+	if ref1 != ref2 {
+		t.Fatalf("an empty-value extra label must resolve to the same series as omitting it, got refs %v and %v", ref1, ref2)
+	}
+	if h.NumSeries() != 1 {
+		t.Fatalf("NumSeries() = %d, want 1", h.NumSeries())
 	}
 }
 

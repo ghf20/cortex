@@ -95,6 +95,16 @@ var _ storage.Appender = (*headAppender)(nil)
 // that build a canonical dedup key from extra (Head.GetOrCreateSeries/lookupSeries)
 // rely on that order directly, without a separate sort.
 func splitLabels(l labels.Labels) (target TargetLabels, metricName string, extra []labels.Label, err error) {
+	// real Prometheus's own headAppenderBase.getOrCreate calls this before
+	// computing series identity ("ensure no empty labels have gotten
+	// through") - an extra label with an empty value must resolve to the
+	// SAME series as omitting it entirely, not a distinct one. Found via
+	// TestAppendEmptyLabelsIgnored (tsdb/db_test.go): without this,
+	// labels.FromStrings("a","b") and labels.FromStrings("a","b","c","")
+	// created two different series instead of one - direct repro confirmed
+	// before this fix, not assumed.
+	l = l.WithoutEmpty()
+
 	// See ErrDuplicateLabelName's own doc comment. HasDuplicateLabelNames is
 	// real Prometheus's own method (checks adjacent pairs, correct because
 	// labels.Labels is always sorted by contract) - reused directly rather
