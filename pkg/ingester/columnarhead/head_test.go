@@ -587,6 +587,37 @@ func TestHeadRejectsFloatHistogramDifferentValueAtSameTimestamp(t *testing.T) {
 	}
 }
 
+// TestHeadRejectsHistogramSchemaChangeAtSameTimestamp ports real Prometheus's
+// TestAmendHistogramDatapointCausesError (tsdb/db_test.go)'s histogram case: a
+// second histogram at the same timestamp with a DIFFERENT schema is still a
+// conflicting value, not a "start a new segment" case - segment layout changes
+// (histoSegment's own doc comment) only apply going FORWARD in time, never to
+// resolve a same-timestamp collision. Already correctly handled by
+// HistogramStore.LastEquals - sameLayout fails on the schema mismatch, so
+// LastEquals returns false and the sample is rejected - this just adds direct
+// coverage for that specific case rather than relying on it being incidentally
+// covered by LastEquals' other tests.
+func TestHeadRejectsHistogramSchemaChangeAtSameTimestamp(t *testing.T) {
+	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
+	h := NewHead(1, 1, 1)
+	ref, err := h.GetOrCreateSeries(tgt, "m")
+	if err != nil {
+		t.Fatalf("GetOrCreateSeries: %v", err)
+	}
+	hg := &histogram.Histogram{
+		Schema: 3, Count: 52, Sum: 2.7, ZeroThreshold: 0.1, ZeroCount: 42,
+		PositiveSpans:   []histogram.Span{{Offset: 0, Length: 4}, {Offset: 10, Length: 3}},
+		PositiveBuckets: []int64{1, 2, -2, 1, -1, 0, 0},
+	}
+	if err := h.AppendHistogram(ref, 0, hg.Copy()); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	hg.Schema = 2
+	if err := h.AppendHistogram(ref, 0, hg.Copy()); err != storage.ErrDuplicateSampleForTimestamp {
+		t.Fatalf("schema change at same ts = %v, want ErrDuplicateSampleForTimestamp", err)
+	}
+}
+
 // TestHeadRejectsCrossTypeSameTimestamp is CHECKLIST.md's port of real
 // Prometheus's TestHeadAppender_AppendFloatWithSameTimestampAsPreviousHistogram
 // (tsdb/head_test.go): a single (series, timestamp) slot is exactly one type -
