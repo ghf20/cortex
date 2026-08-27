@@ -129,6 +129,16 @@ func (s *headChunkSeries) Labels() labels.Labels {
 	return s.h.SeriesLabels(s.ref)
 }
 
+// Iterator has the SAME mixed-float-and-histogram-series gap headSeries.Iterator
+// (querier.go) had until fixed there: a series that received both float and
+// histogram samples gets only its histogram chunk(s) here, its float samples
+// invisible. Not fixed here too - a real fix on this path means interleaving
+// float-XOR and histogram chunks.Meta in time order (this package's compaction/block
+// path has no equivalent of mixed_iterator.go's sample-level merge), a separate,
+// larger piece of work than the Querier-side fix was; tracked in CHECKLIST.md rather
+// than silently left unmentioned. This path backs Head.ChunkQuerier (compaction into
+// real TSDB blocks), not Head.Querier (PromQL evaluation) - promqltest, which found
+// and drove the Querier-side fix, does not exercise this method at all.
 func (s *headChunkSeries) Iterator(_ chunks.Iterator) chunks.Iterator {
 	if s.h.HasHistogram(s.ref) {
 		if s.h.HasFloatHistogram(s.ref) {

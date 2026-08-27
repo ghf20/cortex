@@ -241,39 +241,61 @@ func (s *headSeries) Labels() labels.Labels {
 	return s.h.SeriesLabels(s.ref)
 }
 
-// Iterator returns a chunkenc.Iterator over s's samples, bounded to [s.mint, s.maxt]:
-// an integer-histogram-backed one if this series ever received a Histogram sample, a
-// float-histogram-backed one if it ever received a FloatHistogram sample, a
-// float-backed one otherwise. A series is exactly one of the three for iteration
-// purposes - NOT because real Prometheus enforces that (it doesn't: a real series can
-// genuinely mix float and histogram samples over its lifetime, which is exactly why
-// PromQL's resets()/changes() treat a type change as an implicit reset), but because
-// this package stores float samples (SeriesStore) and histogram samples
-// (HistogramStore) in entirely separate stores keyed by the same ref, and this method
-// picks one or the other based on HasHistogram/HasFloatHistogram rather than merging
-// them. A series that receives samples of both kinds - Append and AppendHistogram both
-// accept this unconditionally, no error either way - silently loses whichever kind
-// came first: e.g. 8 float samples then 2 histogram samples on the same series
-// iterates as exactly 2 samples, the float prefix invisible to every reader (queries,
-// resets()/changes()' reset detection, everything). Found via promqltest's
-// `functions.test` (a real upstream test file exercising exactly this shape, `path=
-// "/bar"`'s mixed load block) - see CHECKLIST.md for the characterization; not fixed
-// here, a real fix needs a genuine merged-by-timestamp iterator across both stores,
-// not a patch to this selection logic. The passed-in iterator (for reuse) is ignored;
-// this always allocates fresh, unlike real chunk iterators that support in-place
-// reuse - a real optimization opportunity, not attempted here.
+// Iterator returns a chunkenc.Iterator over s's samples, bounded to [s.mint, s.maxt].
+// This package stores float samples (SeriesStore) and histogram samples
+// (HistogramStore) in entirely separate stores keyed by the same ref - real
+// Prometheus keeps no such split (a real series can genuinely mix float and
+// histogram samples over its lifetime, which is exactly why PromQL's
+// resets()/changes()/delta()/idelta()/irate() all treat a type change as an implicit
+// reset or emit a specific warning for it). A series that received samples of only
+// one kind gets that store's iterator directly; one that received both (Append and
+// AppendHistogram both accept either kind on any series unconditionally, no error
+// either way) gets a mixedTypeIterator merging both stores' streams by timestamp -
+// see mixed_iterator.go. Found via promqltest's `functions.test` (a real upstream
+// test file exercising exactly this shape, `path="/bar"`'s mixed load block) - the
+// float prefix used to be silently invisible to every reader (queries,
+// resets()/changes()' reset detection, everything); see CHECKLIST.md for the
+// characterization before this was fixed. The passed-in iterator (for reuse) is
+// ignored; this always allocates fresh, unlike real chunk iterators that support
+// in-place reuse - a real optimization opportunity, not attempted here.
 func (s *headSeries) Iterator(_ chunkenc.Iterator) chunkenc.Iterator {
-	if s.h.HasHistogram(s.ref) {
+	hasHist := s.h.HasHistogram(s.ref)
+	hasFloat := s.h.HasFloat(s.ref)
+
+	var histIt chunkenc.Iterator
+	if hasHist {
 		if s.h.HasFloatHistogram(s.ref) {
-			return &floatHistogramSampleIterator{it: s.h.HistogramIterator(s.ref), mint: s.mint, maxt: s.maxt}
+			histIt = &floatHistogramSampleIterator{it: s.h.HistogramIterator(s.ref), mint: s.mint, maxt: s.maxt}
+		} else {
+			histIt = &histogramSampleIterator{it: s.h.HistogramIterator(s.ref), mint: s.mint, maxt: s.maxt}
 		}
-		return &histogramSampleIterator{it: s.h.HistogramIterator(s.ref), mint: s.mint, maxt: s.maxt}
 	}
-	var src floatSource = s.h.Iterator(s.ref)
-	if ooo := s.h.OOOSamples(s.ref); len(ooo) > 0 {
-		src = newMergedIterator(src, ooo)
+	newFloatIt := func() chunkenc.Iterator {
+		var src floatSource = s.h.Iterator(s.ref)
+		if ooo := s.h.OOOSamples(s.ref); len(ooo) > 0 {
+			src = newMergedIterator(src, ooo)
+		}
+		return &floatSampleIterator{it: src, mint: s.mint, maxt: s.maxt}
 	}
-	return &floatSampleIterator{it: src, mint: s.mint, maxt: s.maxt}
+
+	switch {
+	case hasHist && hasFloat:
+		return newMixedTypeIterator(newFloatIt(), histIt)
+	case hasHist:
+		return histIt
+	default:
+		// Also the "ref exists but has zero samples of either kind yet" case (a
+		// real race window: a series is created, then queried, before its first
+		// Append lands) - s.h.Iterator/floatSampleIterator are always valid, even
+		// empty, so this still returns a usable iterator rather than nil. Losing
+		// this unconditional construction (gating it behind hasFloat like histIt
+		// is gated behind hasHist) is exactly what
+		// TestHeadConcurrentAppendQueryTruncateCompact caught: a nil
+		// chunkenc.Iterator interface value, panicking on the reader's very next
+		// Next() call - found and fixed while building this method, not by
+		// inspection.
+		return newFloatIt()
+	}
 }
 
 // floatSampleIterator adapts a floatSource (this package's raw in-order

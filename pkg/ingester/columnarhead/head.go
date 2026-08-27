@@ -863,6 +863,16 @@ func (h *Head) HasHistogram(ref uint32) bool {
 	return shard.histograms.Has(localIdx)
 }
 
+// HasFloat reports whether ref ever received a plain (non-histogram) float sample,
+// in-order or OOO - the read path's other half of the series-type check alongside
+// HasHistogram (querier.go), needed for a series that received BOTH kinds (see
+// headSeries.Iterator's doc comment on why that case needs a merged iterator, not a
+// choice between the two). Not self-locking - see SeriesLabels.
+func (h *Head) HasFloat(ref uint32) bool {
+	shard, localIdx := h.shardFor(ref)
+	return shard.series.NumSamples(localIdx) > 0 || len(shard.ooo.samples(localIdx)) > 0
+}
+
 // OOOSamples returns ref's current out-of-order float sample buffer, oldest first -
 // nil if ref has none (see ooo.go's oooStore.samples). Not self-locking - see
 // SeriesLabels.
