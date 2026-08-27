@@ -6,10 +6,6 @@ import (
 	"github.com/prometheus/prometheus/model/histogram"
 )
 
-// ErrCustomBucketsUnsupported is returned for schema -53 (custom bucket bounds via
-// CustomValues). Not implemented - see CHECKLIST.md.
-var ErrCustomBucketsUnsupported = errors.New("columnarhead: custom bucket boundaries (schema -53) are not supported by this prototype")
-
 // ErrHistogramLayoutChanged is returned when a layout-changed sample's own bucket
 // count doesn't match its declared spans - a violated assumption (spans are supposed
 // to determine bucket count consistently), not an expected mid-stream event any more.
@@ -76,6 +72,19 @@ type histoSegment struct {
 	zeroThreshold float64
 	posSpans      []histogram.Span
 	negSpans      []histogram.Span
+	// customValues holds the custom (usually upper) bucket bounds for a schema
+	// -53 (histogram.CustomBucketsSchema, "NHCB") segment, nil otherwise. Real
+	// Prometheus semantics: only used when schema is -53, in which case
+	// zeroThreshold/negSpans (and the int/float path's zeroCount/negBuckets
+	// equivalents) are themselves unused - a real NHCB sample always carries
+	// them as their zero value (see vendor's Histogram.Copy(), which explicitly
+	// zeroes them for a custom-bucket histogram rather than copying whatever
+	// was there), so nothing here needs to special-case skipping their own
+	// encode/decode: they just naturally round-trip as zero/nil. posSpans/
+	// posBuckets are reused UNCHANGED from the exponential-schema path - real
+	// NHCB buckets are span+delta-encoded exactly the same way, just with
+	// custom-values-derived boundaries instead of schema-derived ones.
+	customValues []float64
 
 	arena  []byte
 	bitOff uint32
@@ -101,12 +110,15 @@ type histoSegment struct {
 }
 
 // newHistoSegment starts a fresh integer-path segment with the given layout.
-func newHistoSegment(schema int32, zeroThreshold float64, posSpans, negSpans []histogram.Span) *histoSegment {
+// customValues is nil for an exponential-schema segment (see histoSegment's own
+// doc comment for the schema -53/NHCB case).
+func newHistoSegment(schema int32, zeroThreshold float64, posSpans, negSpans []histogram.Span, customValues []float64) *histoSegment {
 	return &histoSegment{
 		schema:        schema,
 		zeroThreshold: zeroThreshold,
 		posSpans:      append([]histogram.Span(nil), posSpans...),
 		negSpans:      append([]histogram.Span(nil), negSpans...),
+		customValues:  append([]float64(nil), customValues...),
 		arena:         make([]byte, histoInitialArenaBytes),
 		sum:           newValueState(),
 	}
@@ -115,8 +127,8 @@ func newHistoSegment(schema int32, zeroThreshold float64, posSpans, negSpans []h
 // newHistoSegmentFloat starts a fresh float-path segment with the given layout and
 // bucket counts (nPos/nNeg) - the per-bucket XOR windows must be sized up front,
 // unlike the integer path's varbit encoding which needs no per-position state.
-func newHistoSegmentFloat(schema int32, zeroThreshold float64, posSpans, negSpans []histogram.Span, nPos, nNeg int) *histoSegment {
-	seg := newHistoSegment(schema, zeroThreshold, posSpans, negSpans)
+func newHistoSegmentFloat(schema int32, zeroThreshold float64, posSpans, negSpans []histogram.Span, customValues []float64, nPos, nNeg int) *histoSegment {
+	seg := newHistoSegment(schema, zeroThreshold, posSpans, negSpans, customValues)
 	seg.zeroCountVal = newValueState()
 	seg.countVal = newValueState()
 	seg.posVal = newValueStates(nPos)
@@ -193,11 +205,11 @@ func (hst *HistogramStore) IsFloat(ref uint32) bool {
 // current segment's layout starts a fresh segment (histoSegment's own doc comment)
 // rather than erroring - only a genuine bucket-count/span mismatch WITHIN a
 // (supposedly) stable layout, or a Histogram/FloatHistogram type switch, still does.
+// Schema -53 (custom bucket boundaries, "NHCB") is accepted like any other schema -
+// its PositiveSpans/PositiveBuckets are span+delta-encoded exactly the same way, the
+// only difference is CustomValues instead of schema-derived bucket boundaries (see
+// histoSegment's own doc comment).
 func (hst *HistogramStore) Append(ref uint32, ts int64, h *histogram.Histogram) error {
-	if histogram.IsCustomBucketsSchema(h.Schema) {
-		return ErrCustomBucketsUnsupported
-	}
-
 	s, ok := hst.series[ref]
 	if !ok {
 		s = &histoSeries{}
@@ -208,7 +220,7 @@ func (hst *HistogramStore) Append(ref uint32, ts int64, h *histogram.Histogram) 
 
 	seg := s.lastSegment()
 	if seg == nil || !sameLayout(seg, h) {
-		seg = newHistoSegment(h.Schema, h.ZeroThreshold, h.PositiveSpans, h.NegativeSpans)
+		seg = newHistoSegment(h.Schema, h.ZeroThreshold, h.PositiveSpans, h.NegativeSpans, h.CustomValues)
 		s.segments = append(s.segments, seg)
 	}
 
@@ -268,12 +280,9 @@ func (hst *HistogramStore) Append(ref uint32, ts int64, h *histogram.Histogram) 
 // Append, see histoSegment's own doc comment for why the encoding scheme genuinely
 // differs (per-bucket gorilla XOR, not per-bucket varbit delta) rather than being a
 // thin parallel path, and for the same start-a-new-segment-on-layout-change
-// behavior Append has.
+// behavior Append has. Schema -53 (NHCB) accepted the same way Append's own doc
+// comment describes.
 func (hst *HistogramStore) AppendFloat(ref uint32, ts int64, h *histogram.FloatHistogram) error {
-	if histogram.IsCustomBucketsSchema(h.Schema) {
-		return ErrCustomBucketsUnsupported
-	}
-
 	s, ok := hst.series[ref]
 	if !ok {
 		s = &histoSeries{isFloat: true}
@@ -284,7 +293,7 @@ func (hst *HistogramStore) AppendFloat(ref uint32, ts int64, h *histogram.FloatH
 
 	seg := s.lastSegment()
 	if seg == nil || !sameLayoutFloat(seg, h) {
-		seg = newHistoSegmentFloat(h.Schema, h.ZeroThreshold, h.PositiveSpans, h.NegativeSpans, len(h.PositiveBuckets), len(h.NegativeBuckets))
+		seg = newHistoSegmentFloat(h.Schema, h.ZeroThreshold, h.PositiveSpans, h.NegativeSpans, h.CustomValues, len(h.PositiveBuckets), len(h.NegativeBuckets))
 		s.segments = append(s.segments, seg)
 	}
 
@@ -341,18 +350,33 @@ func growHistoSeg(seg *histoSegment, needBits uint32) {
 	}
 }
 
+// sameLayout also compares customValues via histogram.CustomBucketBoundsMatch - a
+// harmless no-op for a non-NHCB segment (both sides nil, so it's always true),
+// the real check that catches a genuine custom-bucket-boundary change for an
+// NHCB one (schema -53's own zeroThreshold/negSpans are always their zero value
+// on a well-formed sample - see histoSegment's own doc comment - so the existing
+// checks below already trivially pass for those; CustomValues is the one field
+// that actually distinguishes one NHCB layout from another).
 func sameLayout(seg *histoSegment, h *histogram.Histogram) bool {
 	if seg.schema != h.Schema || seg.zeroThreshold != h.ZeroThreshold {
 		return false
 	}
-	return spansEqual(seg.posSpans, h.PositiveSpans) && spansEqual(seg.negSpans, h.NegativeSpans)
+	if !spansEqual(seg.posSpans, h.PositiveSpans) || !spansEqual(seg.negSpans, h.NegativeSpans) {
+		return false
+	}
+	return histogram.CustomBucketBoundsMatch(seg.customValues, h.CustomValues)
 }
 
+// sameLayoutFloat is sameLayout's FloatHistogram counterpart - see its own doc
+// comment.
 func sameLayoutFloat(seg *histoSegment, h *histogram.FloatHistogram) bool {
 	if seg.schema != h.Schema || seg.zeroThreshold != h.ZeroThreshold {
 		return false
 	}
-	return spansEqual(seg.posSpans, h.PositiveSpans) && spansEqual(seg.negSpans, h.NegativeSpans)
+	if !spansEqual(seg.posSpans, h.PositiveSpans) || !spansEqual(seg.negSpans, h.NegativeSpans) {
+		return false
+	}
+	return histogram.CustomBucketBoundsMatch(seg.customValues, h.CustomValues)
 }
 
 func spansEqual(a, b []histogram.Span) bool {
@@ -546,6 +570,7 @@ func (it *HistogramIterator) nextInt() bool {
 		NegativeSpans:   it.seg.negSpans,
 		PositiveBuckets: deltaEncode(it.posAbs),
 		NegativeBuckets: deltaEncode(it.negAbs),
+		CustomValues:    it.seg.customValues,
 	}
 	it.off = off
 	it.i++
@@ -579,6 +604,7 @@ func (it *HistogramIterator) nextFloat() bool {
 		NegativeSpans:   it.seg.negSpans,
 		PositiveBuckets: append([]float64(nil), it.posF...),
 		NegativeBuckets: append([]float64(nil), it.negF...),
+		CustomValues:    it.seg.customValues,
 	}
 	it.off = off
 	it.i++

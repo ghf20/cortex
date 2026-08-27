@@ -200,6 +200,83 @@ func TestChunkQuerierHistogramSeriesRoundTrip(t *testing.T) {
 	}
 }
 
+// TestChunkQuerierHistogramSeriesCustomBucketsRoundTrip confirms schema -53
+// (NHCB) reaches the real gRPC chunks path correctly - real
+// chunkenc.HistogramAppender.AppendHistogram already handles CustomValues
+// natively (it's real Prometheus code, unmodified here), so this needed no
+// chunk_querier.go changes at all; this test proves that rather than assuming
+// it, the same way the mid-stream-layout-change work verified transparency
+// for that case.
+func TestChunkQuerierHistogramSeriesCustomBucketsRoundTrip(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	app := h.Appender(context.Background())
+	l := labels.FromStrings(
+		labels.MetricName, "request_latency",
+		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+	)
+	base := int64(1700000000000)
+	samples := []*histogram.Histogram{
+		{
+			Schema: histogram.CustomBucketsSchema, Count: 1, Sum: 1,
+			PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{1},
+			CustomValues: []float64{10},
+		},
+		{
+			Schema: histogram.CustomBucketsSchema, Count: 4, Sum: 5,
+			PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{3},
+			CustomValues: []float64{10},
+		},
+	}
+	for i, hg := range samples {
+		if _, err := app.AppendHistogram(0, l, base+int64(i)*15000, hg, nil); err != nil {
+			t.Fatalf("AppendHistogram %d: %v", i, err)
+		}
+	}
+
+	cq, err := h.ChunkQuerier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("ChunkQuerier: %v", err)
+	}
+	defer cq.Close()
+	css := cq.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "request_latency"))
+	if !css.Next() {
+		t.Fatal("Select found no series")
+	}
+	cit := css.At().Iterator(nil)
+	if !cit.Next() {
+		t.Fatalf("chunks.Iterator returned no chunks: %v", cit.Err())
+	}
+	meta := cit.At()
+	if cit.Next() {
+		t.Fatal("expected exactly one chunk for a stable-layout, no-counter-reset sequence")
+	}
+	if err := cit.Err(); err != nil {
+		t.Fatalf("chunks.Iterator error: %v", err)
+	}
+
+	it := meta.Chunk.Iterator(nil)
+	for i, want := range samples {
+		if it.Next() != chunkenc.ValHistogram {
+			t.Fatalf("sample %d: real chunk iterator exhausted early", i)
+		}
+		gotTS, got := it.AtHistogram(nil)
+		wantTS := base + int64(i)*15000
+		if gotTS != wantTS {
+			t.Fatalf("sample %d: ts = %d, want %d", i, gotTS, wantTS)
+		}
+		histEqual(t, got, want)
+		if got.Schema != histogram.CustomBucketsSchema {
+			t.Fatalf("sample %d: Schema = %d, want %d", i, got.Schema, histogram.CustomBucketsSchema)
+		}
+	}
+	if it.Next() != chunkenc.ValNone {
+		t.Fatal("real chunk iterator has more samples than expected")
+	}
+	if it.Err() != nil {
+		t.Fatalf("real chunk iterator error: %v", it.Err())
+	}
+}
+
 // TestChunkQuerierHistogramSeriesCounterResetSplitsChunk confirms the
 // multi-chunk case Head.ChunkQuerier's doc comment describes actually happens:
 // HistogramStore itself never detects or rejects a counter reset (a histogram

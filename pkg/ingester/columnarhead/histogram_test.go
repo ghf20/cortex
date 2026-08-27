@@ -24,6 +24,9 @@ func histEqual(t *testing.T, got, want *histogram.Histogram) {
 	if !int64SliceEqual(got.NegativeBuckets, want.NegativeBuckets) {
 		t.Fatalf("NegativeBuckets: got %v, want %v", got.NegativeBuckets, want.NegativeBuckets)
 	}
+	if !float64SliceEqual(got.CustomValues, want.CustomValues) {
+		t.Fatalf("CustomValues: got %v, want %v", got.CustomValues, want.CustomValues)
+	}
 }
 
 func int64SliceEqual(a, b []int64) bool {
@@ -55,6 +58,9 @@ func floatHistEqual(t *testing.T, got, want *histogram.FloatHistogram) {
 	}
 	if !float64SliceEqual(got.NegativeBuckets, want.NegativeBuckets) {
 		t.Fatalf("NegativeBuckets: got %v, want %v", got.NegativeBuckets, want.NegativeBuckets)
+	}
+	if !float64SliceEqual(got.CustomValues, want.CustomValues) {
+		t.Fatalf("CustomValues: got %v, want %v", got.CustomValues, want.CustomValues)
 	}
 }
 
@@ -203,11 +209,133 @@ func TestHistogramStoreRoundTripFloat_MultipleSamples(t *testing.T) {
 	}
 }
 
-func TestHistogramStoreRejectsCustomBuckets(t *testing.T) {
+// TestHistogramStoreRoundTripCustomBuckets confirms schema -53 (NHCB) round-trips
+// bit-exact, including CustomValues - previously rejected outright
+// (ErrCustomBucketsUnsupported, now retired). PositiveSpans/PositiveBuckets are
+// span+delta-encoded through the exact same path an exponential-schema histogram
+// uses (histoSegment's own doc comment); CustomValues is the one genuinely new
+// piece of state.
+func TestHistogramStoreRoundTripCustomBuckets(t *testing.T) {
 	hst := NewHistogramStore()
-	h := &histogram.Histogram{Schema: histogram.CustomBucketsSchema, CustomValues: []float64{1, 2, 3}}
-	if err := hst.Append(0, 1700000000000, h); err != ErrCustomBucketsUnsupported {
-		t.Fatalf("Append with custom buckets = %v, want ErrCustomBucketsUnsupported", err)
+	samples := []*histogram.Histogram{
+		{
+			Schema: histogram.CustomBucketsSchema, Count: 6, Sum: 12.5,
+			PositiveSpans:   []histogram.Span{{Offset: 0, Length: 3}},
+			PositiveBuckets: []int64{1, 2, 0}, // absolute: 1, 3, 3
+			CustomValues:    []float64{1, 2, 5},
+		},
+		{
+			Schema: histogram.CustomBucketsSchema, Count: 7, Sum: 20,
+			PositiveSpans:   []histogram.Span{{Offset: 0, Length: 3}},
+			PositiveBuckets: []int64{2, 1, -1}, // absolute (cumulative): 2, 3, 2 -> sums to Count 7
+			CustomValues:    []float64{1, 2, 5},
+		},
+	}
+
+	base := int64(1700000000000)
+	for i, h := range samples {
+		if err := hst.Append(0, base+int64(i)*15000, h); err != nil {
+			t.Fatalf("Append %d: %v", i, err)
+		}
+	}
+
+	it := hst.Iterator(0)
+	for i, want := range samples {
+		if !it.Next() {
+			t.Fatalf("sample %d: Next() = false", i)
+		}
+		ts, got := it.At()
+		if ts != base+int64(i)*15000 {
+			t.Fatalf("sample %d: ts = %d, want %d", i, ts, base+int64(i)*15000)
+		}
+		histEqual(t, got, want)
+		if got.Schema != histogram.CustomBucketsSchema {
+			t.Fatalf("sample %d: Schema = %d, want %d (CustomBucketsSchema)", i, got.Schema, histogram.CustomBucketsSchema)
+		}
+	}
+	if it.Next() {
+		t.Fatal("more samples than expected")
+	}
+}
+
+// TestHistogramStoreRoundTripCustomBucketsFloat is
+// TestHistogramStoreRoundTripCustomBuckets's FloatHistogram counterpart.
+func TestHistogramStoreRoundTripCustomBucketsFloat(t *testing.T) {
+	hst := NewHistogramStore()
+	samples := []*histogram.FloatHistogram{
+		{
+			Schema: histogram.CustomBucketsSchema, Count: 6, Sum: 12.5,
+			PositiveSpans:   []histogram.Span{{Offset: 0, Length: 3}},
+			PositiveBuckets: []float64{1, 3, 3},
+			CustomValues:    []float64{1, 2, 5},
+		},
+		{
+			Schema: histogram.CustomBucketsSchema, Count: 7, Sum: 20,
+			PositiveSpans:   []histogram.Span{{Offset: 0, Length: 3}},
+			PositiveBuckets: []float64{2, 3, 2},
+			CustomValues:    []float64{1, 2, 5},
+		},
+	}
+	base := int64(1700000000000)
+	for i, h := range samples {
+		if err := hst.AppendFloat(0, base+int64(i)*15000, h); err != nil {
+			t.Fatalf("AppendFloat %d: %v", i, err)
+		}
+	}
+
+	it := hst.Iterator(0)
+	for i, want := range samples {
+		if !it.Next() {
+			t.Fatalf("sample %d: Next() = false", i)
+		}
+		ts, got := it.AtFloat()
+		if ts != base+int64(i)*15000 {
+			t.Fatalf("sample %d: ts = %d, want %d", i, ts, base+int64(i)*15000)
+		}
+		floatHistEqual(t, got, want)
+	}
+	if it.Next() {
+		t.Fatal("more samples than expected")
+	}
+}
+
+// TestHistogramStoreCustomBucketsBoundaryChangeStartsNewSegment confirms a
+// genuine CustomValues change (same span shape, different boundaries) is
+// detected as a real layout change and starts a new segment - the one thing
+// sameLayout's existing schema/zeroThreshold/span checks alone can't catch for
+// an NHCB series, since those all trivially match across a boundary-only change.
+func TestHistogramStoreCustomBucketsBoundaryChangeStartsNewSegment(t *testing.T) {
+	hst := NewHistogramStore()
+	h1 := &histogram.Histogram{
+		Schema: histogram.CustomBucketsSchema, Count: 1, Sum: 1,
+		PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{1},
+		CustomValues: []float64{10},
+	}
+	h2 := &histogram.Histogram{
+		Schema: histogram.CustomBucketsSchema, Count: 2, Sum: 2,
+		PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{2},
+		CustomValues: []float64{20}, // same span shape, different boundary
+	}
+	if err := hst.Append(0, 1700000000000, h1); err != nil {
+		t.Fatalf("Append h1: %v", err)
+	}
+	if err := hst.Append(0, 1700000015000, h2); err != nil {
+		t.Fatalf("Append h2: %v", err)
+	}
+
+	it := hst.Iterator(0)
+	if !it.Next() {
+		t.Fatal("sample 0: Next() = false")
+	}
+	_, got0 := it.At()
+	histEqual(t, got0, h1)
+	if !it.Next() {
+		t.Fatal("sample 1: Next() = false")
+	}
+	_, got1 := it.At()
+	histEqual(t, got1, h2)
+	if it.Next() {
+		t.Fatal("more samples than expected")
 	}
 }
 

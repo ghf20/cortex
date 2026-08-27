@@ -24,11 +24,11 @@ import (
 var ErrUnsupportedLabelShape = errors.New("columnarhead: label set has more than one non-target, non-__name__ label - unsupported by this prototype")
 
 // ErrNotImplemented now guards exactly one remaining gap: AppendHistogramSTZeroSample
-// (see its own doc comment for why). Exemplars, native histograms (still no custom
-// bucket boundaries - see ErrCustomBucketsUnsupported), metadata, and float
-// start-timestamp zero samples - all originally listed here as missing, per design
-// doc §9 gap #1 - are now implemented; see metadata.go, exemplar.go, histogram.go,
-// and Head.SetSTZeroSample.
+// (see its own doc comment for why). Exemplars, native histograms (including custom
+// bucket boundaries, schema -53/NHCB - see histoSegment's own doc comment), metadata,
+// and float start-timestamp zero samples - all originally listed here as missing, per
+// design doc §9 gap #1 - are now implemented; see metadata.go, exemplar.go,
+// histogram.go, and Head.SetSTZeroSample.
 var ErrNotImplemented = errors.New("columnarhead: not implemented in this prototype")
 
 const (

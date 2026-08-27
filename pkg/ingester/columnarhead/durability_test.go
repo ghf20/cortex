@@ -1248,6 +1248,72 @@ func TestDurableHeadPersistsHistogramLayoutChange(t *testing.T) {
 	}
 }
 
+// TestDurableHeadPersistsCustomBucketsHistogram confirms schema -53 (NHCB)
+// round-trips through a real Flush+reload, including CustomValues - a segment
+// field durability.go had to gain its own encode/decode path for
+// (encodeHistogramStore/decodeHistogramStore's doc comments), not something
+// the pre-existing posSpans/negSpans handling covers for free.
+func TestDurableHeadPersistsCustomBucketsHistogram(t *testing.T) {
+	dir := t.TempDir()
+	dh, err := CreateDurableHead(dir, 2, 1, 8)
+	if err != nil {
+		t.Fatalf("CreateDurableHead: %v", err)
+	}
+
+	l := labels.FromStrings(labels.MetricName, "request_duration_seconds", "cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j")
+	app := dh.Appender(context.Background())
+	base := int64(1700000000000)
+	hists := []*histogram.Histogram{
+		{
+			Schema: histogram.CustomBucketsSchema, Count: 6, Sum: 12.5,
+			PositiveSpans: []histogram.Span{{Offset: 0, Length: 3}}, PositiveBuckets: []int64{1, 2, 0},
+			CustomValues: []float64{1, 2, 5},
+		},
+		{
+			Schema: histogram.CustomBucketsSchema, Count: 7, Sum: 20,
+			PositiveSpans: []histogram.Span{{Offset: 0, Length: 3}}, PositiveBuckets: []int64{2, 1, -1},
+			CustomValues: []float64{1, 2, 5},
+		},
+	}
+	for i, h := range hists {
+		if _, err := app.AppendHistogram(0, l, base+int64(i)*15000, h, nil); err != nil {
+			t.Fatalf("AppendHistogram %d: %v", i, err)
+		}
+	}
+
+	if _, err := dh.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if err := dh.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reloaded, err := LoadDurableHead(dir)
+	if err != nil {
+		t.Fatalf("LoadDurableHead: %v", err)
+	}
+	defer reloaded.Close()
+
+	refs, ok := reloaded.SeriesRefsForName("request_duration_seconds")
+	if !ok || len(refs) != 1 {
+		t.Fatalf("series not found as expected: %v %v", refs, ok)
+	}
+	it := reloaded.HistogramIterator(refs[0])
+	for i, want := range hists {
+		if !it.Next() {
+			t.Fatalf("HistogramIterator.Next() = false at sample %d, want true", i)
+		}
+		gotTS, gotH := it.At()
+		if gotTS != base+int64(i)*15000 {
+			t.Fatalf("sample %d: ts = %d, want %d", i, gotTS, base+int64(i)*15000)
+		}
+		histEqual(t, gotH, want)
+	}
+	if it.Next() {
+		t.Fatal("HistogramIterator has more samples than expected after reload")
+	}
+}
+
 // TestDurableHeadPersistsMinMaxTime confirms Head.MinTime/MaxTime survive a
 // simulated crash and reload (headtimes.bin) - added alongside OOO support,
 // since MinTime/MaxTime are also what OOO's window check depends on. Also

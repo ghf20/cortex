@@ -327,11 +327,12 @@ func decodeExemplarStorage(buf []byte) (*exemplarStorage, error) {
 // trailing(1), then EITHER lastZeroCount(8)+lastCount(8) (isFloat == false) OR
 // zeroCountVal+countVal as two encoded valueStates (isFloat == true - see
 // putValueState), posSpans (count(4) + each Offset(4)+Length(4)), negSpans (same
-// shape), then EITHER lastPosBuckets/lastNegBuckets (count(4) + each int64(8),
-// isFloat == false) OR posVal/negVal (count(4) + each encoded valueState, isFloat
-// == true), then the segment's USED arena prefix (byteLen(4) + that many bytes -
-// not the full backing capacity, matching Compact's tight-packing instinct for the
-// float path).
+// shape), customValues (count(4) + each float64(8) - schema -53/NHCB segments
+// only, always empty otherwise), then EITHER lastPosBuckets/lastNegBuckets
+// (count(4) + each int64(8), isFloat == false) OR posVal/negVal (count(4) + each
+// encoded valueState, isFloat == true), then the segment's USED arena prefix
+// (byteLen(4) + that many bytes - not the full backing capacity, matching
+// Compact's tight-packing instinct for the float path).
 //
 // A previously-latent gap fixed here, found while reworking this for multi-segment
 // layout support (CHECKLIST.md's Phase 3): this format never serialized isFloat or
@@ -354,10 +355,9 @@ func decodeExemplarStorage(buf []byte) (*exemplarStorage, error) {
 // free by a full rewrite (whatever's currently in the map is what gets written,
 // full stop) at the cost of O(total histogram data) per flush instead of
 // O(new data). Native histograms are already this project's largest
-// unfinished item (see CHECKLIST.md's Phase 3) and HistogramStore itself is
-// already a not-fully-finished feature (no custom bucket boundaries yet) -
-// matching that scope here rather than building a second incremental-tracking
-// scheme this early is a deliberate choice, not an oversight.
+// unfinished item (see CHECKLIST.md's Phase 3) - matching that scope here
+// rather than building a second incremental-tracking scheme this early is a
+// deliberate choice, not an oversight.
 func encodeHistogramStore(hst *HistogramStore) []byte {
 	var buf []byte
 	putU32 := func(v uint32) {
@@ -411,6 +411,10 @@ func encodeHistogramStore(hst *HistogramStore) []byte {
 			for _, sp := range seg.negSpans {
 				putU32(uint32(sp.Offset))
 				putU32(sp.Length)
+			}
+			putU32(uint32(len(seg.customValues)))
+			for _, v := range seg.customValues {
+				putU64(math.Float64bits(v))
 			}
 
 			if s.isFloat {
@@ -553,6 +557,24 @@ func decodeHistogramStore(buf []byte) (*HistogramStore, error) {
 		}
 		return out, nil
 	}
+	getFloat64s := func() ([]float64, error) {
+		n, err := getU32()
+		if err != nil {
+			return nil, err
+		}
+		if n == 0 {
+			return nil, nil
+		}
+		out := make([]float64, n)
+		for i := range out {
+			bits, err := getU64()
+			if err != nil {
+				return nil, err
+			}
+			out[i] = math.Float64frombits(bits)
+		}
+		return out, nil
+	}
 
 	for off < len(buf) {
 		ref, err := getU32()
@@ -634,6 +656,10 @@ func decodeHistogramStore(buf []byte) (*HistogramStore, error) {
 				return nil, err
 			}
 			seg.negSpans, err = getSpans()
+			if err != nil {
+				return nil, err
+			}
+			seg.customValues, err = getFloat64s()
 			if err != nil {
 				return nil, err
 			}
