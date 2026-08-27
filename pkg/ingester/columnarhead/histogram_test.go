@@ -1,6 +1,7 @@
 package columnarhead
 
 import (
+	"math"
 	"testing"
 
 	"github.com/prometheus/prometheus/model/histogram"
@@ -17,8 +18,15 @@ import (
 // TestChunkQuerierGaugeHistogramNeverSplitsOnBucketDecrease.
 func histEqual(t *testing.T, got, want *histogram.Histogram) {
 	t.Helper()
-	if got.Schema != want.Schema || got.ZeroThreshold != want.ZeroThreshold ||
-		got.ZeroCount != want.ZeroCount || got.Count != want.Count || got.Sum != want.Sum {
+	// Sum/ZeroThreshold compared by bit pattern, not !=: a staleness marker's
+	// Sum is NaN, and NaN != NaN always, regardless of whether the payload bits
+	// (what actually matters - value.IsStaleNaN checks the exact pattern)
+	// match. Found via TestDifferentialHistogramStalenessRealVsColumnar, this
+	// package's first histogram differential test to exercise a NaN Sum -
+	// matches assertSamplesBitIdentical's own precedent for the plain-float
+	// path.
+	if got.Schema != want.Schema || math.Float64bits(got.ZeroThreshold) != math.Float64bits(want.ZeroThreshold) ||
+		got.ZeroCount != want.ZeroCount || got.Count != want.Count || math.Float64bits(got.Sum) != math.Float64bits(want.Sum) {
 		t.Fatalf("scalar fields: got %+v, want %+v", got, want)
 	}
 	if !spansEqual(got.PositiveSpans, want.PositiveSpans) {
@@ -54,8 +62,12 @@ func int64SliceEqual(a, b []int64) bool {
 // deliberately excluded from this comparison.
 func floatHistEqual(t *testing.T, got, want *histogram.FloatHistogram) {
 	t.Helper()
-	if got.Schema != want.Schema || got.ZeroThreshold != want.ZeroThreshold ||
-		got.ZeroCount != want.ZeroCount || got.Count != want.Count || got.Sum != want.Sum {
+	// Bit-pattern comparison for every float64 scalar field, not !=  - see
+	// histEqual's identical comment (NaN != NaN always, regardless of payload).
+	if got.Schema != want.Schema || math.Float64bits(got.ZeroThreshold) != math.Float64bits(want.ZeroThreshold) ||
+		math.Float64bits(got.ZeroCount) != math.Float64bits(want.ZeroCount) ||
+		math.Float64bits(got.Count) != math.Float64bits(want.Count) ||
+		math.Float64bits(got.Sum) != math.Float64bits(want.Sum) {
 		t.Fatalf("scalar fields: got %+v, want %+v", got, want)
 	}
 	if !spansEqual(got.PositiveSpans, want.PositiveSpans) {

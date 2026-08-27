@@ -9,6 +9,7 @@ import (
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/metadata"
+	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/storage"
 )
 
@@ -123,9 +124,18 @@ func splitLabels(l labels.Labels) (target TargetLabels, metricName string, extra
 // would otherwise collide with that sentinel. Every ref crossing this boundary is
 // offset by 1 (toExternalRef/toInternalRef) specifically to keep 0 reserved; Head and
 // SeriesStore's own internal uint32 refs stay 0-based and untouched everywhere else.
+//
+// A staleness marker (v is StaleNaN) targeting a series already known to be
+// histogram-typed is converted to the equivalent histogram-typed stale sample
+// instead of a plain float append - see appendStaleToHistogramSeries' own doc
+// comment for why (matches real tsdb.Head's own behavior, found missing via
+// TestDifferentialHistogramStalenessRealVsColumnar).
 func (a *headAppender) Append(ref storage.SeriesRef, l labels.Labels, t int64, v float64) (storage.SeriesRef, error) {
 	if ref != 0 {
 		if internalRef, ok := toInternalRef(ref, a.h.NumSeries()); ok {
+			if value.IsStaleNaN(v) && a.h.HasHistogram(internalRef) {
+				return a.appendStaleToHistogramSeries(internalRef, t, v)
+			}
 			if err := a.h.Append(internalRef, t, v); err != nil {
 				return 0, err
 			}
@@ -140,10 +150,42 @@ func (a *headAppender) Append(ref storage.SeriesRef, l labels.Labels, t int64, v
 	if err != nil {
 		return 0, err
 	}
+	if value.IsStaleNaN(v) && a.h.HasHistogram(seriesRef) {
+		return a.appendStaleToHistogramSeries(seriesRef, t, v)
+	}
 	if err := a.h.Append(seriesRef, t, v); err != nil {
 		return 0, err
 	}
 	return toExternalRef(seriesRef), nil
+}
+
+// appendStaleToHistogramSeries converts a plain-float staleness append targeting a
+// series already known to be histogram-typed into the equivalent histogram-typed
+// stale sample - matching real tsdb.Head's own headAppender.Append
+// (vendor/.../tsdb/head_append.go's a.typesInBatch check) in effect, though via a
+// simpler, always-correct GLOBAL signal (Head.HasHistogram) rather than real
+// Prometheus's own per-batch, per-appender heuristic (real Prometheus's own
+// comment there: "not perfect but just an optimization for the more likely case" -
+// a global check is strictly at least as reliable, not a compromise).
+//
+// Found via TestDifferentialHistogramStalenessRealVsColumnar: without this, a
+// stale marker on a histogram series lands as a genuinely mixed-type float
+// sample instead of matching real Prometheus's own converted-to-histogram
+// representation - not wrong in the sense of losing data (mixed_iterator.go
+// already handles either shape correctly), but a real, observable divergence
+// from real behavior: the value TYPE PromQL sees at that timestamp, and the
+// histogram's own zeroed Schema/Count/buckets real Prometheus's conversion
+// produces (&histogram.Histogram{Sum: v}, every other field left at its zero
+// value - matches real Prometheus's own construction exactly).
+func (a *headAppender) appendStaleToHistogramSeries(ref uint32, t int64, v float64) (storage.SeriesRef, error) {
+	if a.h.HasFloatHistogram(ref) {
+		if err := a.h.AppendFloatHistogram(ref, t, &histogram.FloatHistogram{Sum: v}); err != nil {
+			return 0, err
+		}
+	} else if err := a.h.AppendHistogram(ref, t, &histogram.Histogram{Sum: v}); err != nil {
+		return 0, err
+	}
+	return toExternalRef(ref), nil
 }
 
 // GetRef returns lset's series ref if it's already known, without creating anything -

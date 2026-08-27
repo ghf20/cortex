@@ -532,6 +532,272 @@ func TestDifferentialHistogramRealVsColumnar(t *testing.T) {
 	}
 }
 
+// mixedSample is one decoded sample of ANY value type, used where a
+// differential test needs to compare a raw ordered stream spanning
+// float/histogram/float-histogram value types together - e.g. a histogram
+// series ending in a plain-float staleness marker, the actual shape real
+// Prometheus's scrape manager produces (scrape.go always writes a stale
+// marker via the plain float Append path, regardless of the series' real
+// type - vendor/.../scrape/scrape.go:1640). collectSeries/
+// collectHistogramSamples each only handle one value type; this exists
+// alongside them, not as a replacement, since most tests only need one type.
+type mixedSample struct {
+	ts int64
+	vt chunkenc.ValueType
+	v  float64
+	h  *histogram.Histogram
+	fh *histogram.FloatHistogram
+}
+
+// collectMixedSamples drains a single matching series' samples of any value
+// type, in order - see mixedSample's own doc comment.
+func collectMixedSamples(t *testing.T, ss storage.SeriesSet) []mixedSample {
+	t.Helper()
+	if !ss.Next() {
+		t.Fatalf("SeriesSet: no series returned")
+	}
+	series := ss.At()
+	it := series.Iterator(nil)
+	var out []mixedSample
+	for {
+		vt := it.Next()
+		if vt == chunkenc.ValNone {
+			break
+		}
+		switch vt {
+		case chunkenc.ValFloat:
+			ts, v := it.At()
+			out = append(out, mixedSample{ts: ts, vt: vt, v: v})
+		case chunkenc.ValHistogram:
+			ts, h := it.AtHistogram(nil)
+			out = append(out, mixedSample{ts: ts, vt: vt, h: h})
+		case chunkenc.ValFloatHistogram:
+			ts, fh := it.AtFloatHistogram(nil)
+			out = append(out, mixedSample{ts: ts, vt: vt, fh: fh})
+		default:
+			t.Fatalf("unexpected value type %v", vt)
+		}
+	}
+	if err := it.Err(); err != nil {
+		t.Fatalf("iterator error: %v", err)
+	}
+	if ss.Next() {
+		t.Fatalf("SeriesSet: more than one matching series")
+	}
+	if err := ss.Err(); err != nil {
+		t.Fatalf("SeriesSet error: %v", err)
+	}
+	return out
+}
+
+// TestDifferentialHistogramStalenessRealVsColumnar closes CHECKLIST.md's
+// flagged-open staleness gap for the histogram path. Real Prometheus's own
+// staleness mechanism (scrape.go) always writes a stale marker via the PLAIN
+// FLOAT Append path (math.Float64frombits(value.StaleNaN)), regardless of the
+// series' actual type - a histogram series that disappears gets ONE trailing
+// FLOAT StaleNaN sample, not a histogram sample with a StaleNaN Sum. That's
+// exactly the mixed-type-series shape mixed_iterator.go was built for
+// (CHECKLIST.md's label-shape/mixed-type work) - this verifies it against
+// real tsdb.Head bit-for-bit, not just that columnarhead accepts the mixed
+// append without erroring.
+func TestDifferentialHistogramStalenessRealVsColumnar(t *testing.T) {
+	l := labels.FromStrings(
+		labels.MetricName, "request_duration_seconds",
+		"cluster", "eks-prod-1", "namespace", "ns-7", "pod", "payments-api-1",
+		"container", "app", "node", "ip-10-1-2-3", "job", "cadvisor",
+	)
+	base := int64(1700000000000)
+	hists := histDiffWorkload()
+	staleTS := base + int64(len(hists))*15000
+	staleVal := math.Float64frombits(value.StaleNaN)
+
+	realHead := newRealHead(t)
+	realApp := realHead.Appender(context.Background())
+	var ref storage.SeriesRef
+	ts := base
+	for _, hg := range hists {
+		var err error
+		ref, err = realApp.AppendHistogram(ref, l, ts, hg, nil)
+		if err != nil {
+			t.Fatalf("real head AppendHistogram(ts=%d): %v", ts, err)
+		}
+		ts += 15000
+	}
+	if _, err := realApp.Append(ref, l, staleTS, staleVal); err != nil {
+		t.Fatalf("real head Append(stale, ts=%d): %v", staleTS, err)
+	}
+	if err := realApp.Commit(); err != nil {
+		t.Fatalf("real head Commit: %v", err)
+	}
+
+	colHead := NewHead(1, 1, 16)
+	colApp := colHead.Appender(context.Background())
+	var colRef storage.SeriesRef
+	ts = base
+	for _, hg := range hists {
+		var err error
+		colRef, err = colApp.AppendHistogram(colRef, l, ts, hg, nil)
+		if err != nil {
+			t.Fatalf("columnar head AppendHistogram(ts=%d): %v", ts, err)
+		}
+		ts += 15000
+	}
+	if _, err := colApp.Append(colRef, l, staleTS, staleVal); err != nil {
+		t.Fatalf("columnar head Append(stale, ts=%d): %v", staleTS, err)
+	}
+	if err := colApp.Commit(); err != nil {
+		t.Fatalf("columnar head Commit: %v", err)
+	}
+
+	realQuerier, err := tsdb.NewBlockQuerier(realHead, math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("real head querier: %v", err)
+	}
+	defer realQuerier.Close()
+	colQuerier, err := colHead.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("columnar head querier: %v", err)
+	}
+	defer colQuerier.Close()
+
+	m := labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "request_duration_seconds")
+	realSamples := collectMixedSamples(t, realQuerier.Select(context.Background(), true, nil, m))
+	colSamples := collectMixedSamples(t, colQuerier.Select(context.Background(), true, nil, m))
+
+	wantLen := len(hists) + 1
+	if len(realSamples) != wantLen {
+		t.Fatalf("sanity check failed: real head returned %d samples, want %d - the differential test would pass vacuously otherwise", len(realSamples), wantLen)
+	}
+	if len(realSamples) != len(colSamples) {
+		t.Fatalf("real head returned %d samples, columnar returned %d", len(realSamples), len(colSamples))
+	}
+	for i := range realSamples {
+		r, c := realSamples[i], colSamples[i]
+		if r.ts != c.ts {
+			t.Fatalf("sample %d: ts real=%d columnar=%d", i, r.ts, c.ts)
+		}
+		if r.vt != c.vt {
+			t.Fatalf("sample %d (ts=%d): value type real=%v columnar=%v", i, r.ts, r.vt, c.vt)
+		}
+		switch r.vt {
+		case chunkenc.ValFloat:
+			rb, cb := math.Float64bits(r.v), math.Float64bits(c.v)
+			if rb != cb {
+				t.Fatalf("sample %d (ts=%d): value real=%v (bits %x) columnar=%v (bits %x) - not bit-identical", i, r.ts, r.v, rb, c.v, cb)
+			}
+			if !value.IsStaleNaN(c.v) {
+				t.Fatalf("sample %d (ts=%d): expected a stale marker, columnar value %v is not one", i, r.ts, c.v)
+			}
+		case chunkenc.ValHistogram:
+			histEqual(t, c.h, r.h)
+		default:
+			t.Fatalf("sample %d: unexpected value type %v", i, r.vt)
+		}
+	}
+}
+
+// TestDifferentialFloatHistogramStalenessRealVsColumnar is
+// TestDifferentialHistogramStalenessRealVsColumnar's FloatHistogram
+// counterpart - exercises appendStaleToHistogramSeries' OTHER branch
+// (HasFloatHistogram true, real Prometheus's own
+// AppendHistogram(ref, lset, t, nil, &histogram.FloatHistogram{Sum: v})
+// conversion), not just the int-histogram one.
+func TestDifferentialFloatHistogramStalenessRealVsColumnar(t *testing.T) {
+	l := labels.FromStrings(
+		labels.MetricName, "request_duration_seconds",
+		"cluster", "eks-prod-1", "namespace", "ns-7", "pod", "payments-api-1",
+		"container", "app", "node", "ip-10-1-2-3", "job", "cadvisor",
+	)
+	base := int64(1700000000000)
+	hists := floatHistDiffWorkload()
+	staleTS := base + int64(len(hists))*15000
+	staleVal := math.Float64frombits(value.StaleNaN)
+
+	realHead := newRealHead(t)
+	realApp := realHead.Appender(context.Background())
+	var ref storage.SeriesRef
+	ts := base
+	for _, fh := range hists {
+		var err error
+		ref, err = realApp.AppendHistogram(ref, l, ts, nil, fh)
+		if err != nil {
+			t.Fatalf("real head AppendHistogram(ts=%d): %v", ts, err)
+		}
+		ts += 15000
+	}
+	if _, err := realApp.Append(ref, l, staleTS, staleVal); err != nil {
+		t.Fatalf("real head Append(stale, ts=%d): %v", staleTS, err)
+	}
+	if err := realApp.Commit(); err != nil {
+		t.Fatalf("real head Commit: %v", err)
+	}
+
+	colHead := NewHead(1, 1, 16)
+	colApp := colHead.Appender(context.Background())
+	var colRef storage.SeriesRef
+	ts = base
+	for _, fh := range hists {
+		var err error
+		colRef, err = colApp.AppendHistogram(colRef, l, ts, nil, fh)
+		if err != nil {
+			t.Fatalf("columnar head AppendHistogram(ts=%d): %v", ts, err)
+		}
+		ts += 15000
+	}
+	if _, err := colApp.Append(colRef, l, staleTS, staleVal); err != nil {
+		t.Fatalf("columnar head Append(stale, ts=%d): %v", staleTS, err)
+	}
+	if err := colApp.Commit(); err != nil {
+		t.Fatalf("columnar head Commit: %v", err)
+	}
+
+	realQuerier, err := tsdb.NewBlockQuerier(realHead, math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("real head querier: %v", err)
+	}
+	defer realQuerier.Close()
+	colQuerier, err := colHead.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("columnar head querier: %v", err)
+	}
+	defer colQuerier.Close()
+
+	m := labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "request_duration_seconds")
+	realSamples := collectMixedSamples(t, realQuerier.Select(context.Background(), true, nil, m))
+	colSamples := collectMixedSamples(t, colQuerier.Select(context.Background(), true, nil, m))
+
+	wantLen := len(hists) + 1
+	if len(realSamples) != wantLen {
+		t.Fatalf("sanity check failed: real head returned %d samples, want %d - the differential test would pass vacuously otherwise", len(realSamples), wantLen)
+	}
+	if len(realSamples) != len(colSamples) {
+		t.Fatalf("real head returned %d samples, columnar returned %d", len(realSamples), len(colSamples))
+	}
+	for i := range realSamples {
+		r, c := realSamples[i], colSamples[i]
+		if r.ts != c.ts {
+			t.Fatalf("sample %d: ts real=%d columnar=%d", i, r.ts, c.ts)
+		}
+		if r.vt != c.vt {
+			t.Fatalf("sample %d (ts=%d): value type real=%v columnar=%v", i, r.ts, r.vt, c.vt)
+		}
+		switch r.vt {
+		case chunkenc.ValFloat:
+			rb, cb := math.Float64bits(r.v), math.Float64bits(c.v)
+			if rb != cb {
+				t.Fatalf("sample %d (ts=%d): value real=%v (bits %x) columnar=%v (bits %x) - not bit-identical", i, r.ts, r.v, rb, c.v, cb)
+			}
+		case chunkenc.ValFloatHistogram:
+			floatHistEqual(t, c.fh, r.fh)
+			if i == len(realSamples)-1 && !value.IsStaleNaN(c.fh.Sum) {
+				t.Fatalf("sample %d (ts=%d): expected a stale marker, columnar Sum %v is not one", i, r.ts, c.fh.Sum)
+			}
+		default:
+			t.Fatalf("sample %d: unexpected value type %v", i, r.vt)
+		}
+	}
+}
+
 // histLayoutChangeDiffWorkload is histDiffWorkload's mid-stream-layout-change
 // counterpart: two samples on schema 0 (a single positive bucket), then a genuine
 // schema+span change to schema 1 (two positive buckets) for two more - each
@@ -1147,6 +1413,93 @@ func TestDifferentialOOORealVsColumnar(t *testing.T) {
 	}
 	assertSamplesBitIdentical(t, "real vs want", real, want)
 	assertSamplesBitIdentical(t, key, real, col)
+}
+
+// TestDifferentialOOOStalenessRealVsColumnar closes CHECKLIST.md's other
+// flagged-open staleness gap: a staleness marker landing IN the OOO buffer
+// itself (not the in-order stream - diffWorkload's "payments-api-5" series
+// already covers that case via TestDifferentialRealVsColumnar) - the exact
+// StaleNaN bit pattern must survive ooo.go's own storage/merge path too, not
+// just SeriesStore's in-order XOR path.
+func TestDifferentialOOOStalenessRealVsColumnar(t *testing.T) {
+	const window = 60_000
+	l := labels.FromStrings(
+		labels.MetricName, "cpu_seconds_total",
+		"cluster", "eks-prod-1", "namespace", "ns-7", "pod", "payments-api-1",
+		"container", "app", "node", "ip-10-1-2-3", "job", "cadvisor",
+	)
+	base := int64(1700000000000)
+	inOrder := []sample{{base, 1}, {base + 30000, 3}}
+	ooo := sample{base + 15000, math.Float64frombits(value.StaleNaN)} // the OOO sample itself is a stale marker
+	want := []sample{{base, 1}, {base + 15000, math.Float64frombits(value.StaleNaN)}, {base + 30000, 3}}
+
+	realDB := newRealDBWithOOO(t, window)
+	realApp := realDB.Appender(context.Background())
+	var ref storage.SeriesRef
+	for _, sm := range inOrder {
+		var err error
+		ref, err = realApp.Append(ref, l, sm.ts, sm.v)
+		if err != nil {
+			t.Fatalf("real db Append(in-order, ts=%d): %v", sm.ts, err)
+		}
+	}
+	if _, err := realApp.Append(ref, l, ooo.ts, ooo.v); err != nil {
+		t.Fatalf("real db Append(OOO stale, ts=%d): %v", ooo.ts, err)
+	}
+	if err := realApp.Commit(); err != nil {
+		t.Fatalf("real db Commit: %v", err)
+	}
+
+	colHead := NewHead(1, 1, 16)
+	colHead.SetOOOTimeWindow(window)
+	colApp := colHead.Appender(context.Background())
+	var colRef storage.SeriesRef
+	for _, sm := range inOrder {
+		var err error
+		colRef, err = colApp.Append(colRef, l, sm.ts, sm.v)
+		if err != nil {
+			t.Fatalf("columnar head Append(in-order, ts=%d): %v", sm.ts, err)
+		}
+	}
+	if _, err := colApp.Append(colRef, l, ooo.ts, ooo.v); err != nil {
+		t.Fatalf("columnar head Append(OOO stale, ts=%d): %v", ooo.ts, err)
+	}
+	if err := colApp.Commit(); err != nil {
+		t.Fatalf("columnar head Commit: %v", err)
+	}
+
+	realQuerier, err := realDB.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("real db querier: %v", err)
+	}
+	defer realQuerier.Close()
+	colQuerier, err := colHead.Querier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("columnar head querier: %v", err)
+	}
+	defer colQuerier.Close()
+
+	m := labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "cpu_seconds_total")
+	realSeries := collectSeries(t, realQuerier.Select(context.Background(), true, nil, m))
+	colSeries := collectSeries(t, colQuerier.Select(context.Background(), true, nil, m))
+
+	key := l.String()
+	real, ok := realSeries[key]
+	if !ok {
+		t.Fatalf("series missing from real db result: %v", realSeries)
+	}
+	col, ok := colSeries[key]
+	if !ok {
+		t.Fatalf("series missing from columnar head result: %v", colSeries)
+	}
+	if len(real) != len(want) {
+		t.Fatalf("sanity check failed: real db returned %d samples, want %d - the differential test would pass vacuously otherwise", len(real), len(want))
+	}
+	assertSamplesBitIdentical(t, "real vs want", real, want)
+	assertSamplesBitIdentical(t, key, real, col)
+	if !value.IsStaleNaN(col[1].v) {
+		t.Fatalf("merged sample 1 (ts=%d) = %v, want a stale marker", col[1].ts, col[1].v)
+	}
 }
 
 // TestDifferentialExemplarRealVsColumnar is Phase 6's exemplar extension to the
