@@ -697,6 +697,94 @@ func TestChunkQuerierFloatHistogramSeriesLayoutChangeSplitsChunk(t *testing.T) {
 	floatHistEqual(t, metas[1].h, h2)
 }
 
+// TestChunkQuerierMergesFloatThenHistogramChunks is the ChunkQuerier-path
+// counterpart to TestHeadSeriesIteratorMergesFloatThenHistogram
+// (mixed_iterator_test.go): a series that received float samples then
+// histogram samples must produce BOTH a float chunk and histogram chunk(s),
+// in time order - not just the histogram chunk(s), the gap
+// mixed_chunks_iterator.go closes. Decodes each returned chunk's real bytes
+// (chunkenc.Chunk.Iterator) to confirm the actual chunk contents, not just
+// the chunk count/time bounds.
+func TestChunkQuerierMergesFloatThenHistogramChunks(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	app := h.Appender(context.Background())
+	l := labels.FromStrings(
+		labels.MetricName, "request_latency",
+		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+	)
+	base := int64(1700000000000)
+	for i := int64(0); i < 3; i++ {
+		if _, err := app.Append(0, l, base+i*15000, float64(i)); err != nil {
+			t.Fatalf("Append float %d: %v", i, err)
+		}
+	}
+	hists := []*histogram.Histogram{
+		{Schema: 0, Count: 1, Sum: 1, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{1}},
+		{Schema: 0, Count: 3, Sum: 4, PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{3}},
+	}
+	for i, hg := range hists {
+		ts := base + (3+int64(i))*15000
+		if _, err := app.AppendHistogram(0, l, ts, hg, nil); err != nil {
+			t.Fatalf("AppendHistogram %d: %v", i, err)
+		}
+	}
+
+	cq, err := h.ChunkQuerier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("ChunkQuerier: %v", err)
+	}
+	defer cq.Close()
+	css := cq.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "request_latency"))
+	if !css.Next() {
+		t.Fatal("Select found no series")
+	}
+	cit := css.At().Iterator(nil)
+
+	if !cit.Next() {
+		t.Fatalf("chunks.Iterator returned no chunks: %v", cit.Err())
+	}
+	floatMeta := cit.At()
+	if floatMeta.MinTime != base || floatMeta.MaxTime != base+30000 {
+		t.Fatalf("float chunk time range = [%d, %d], want [%d, %d]", floatMeta.MinTime, floatMeta.MaxTime, base, base+30000)
+	}
+	fit := floatMeta.Chunk.Iterator(nil)
+	var floatSamples []sample
+	for fit.Next() == chunkenc.ValFloat {
+		ts, v := fit.At()
+		floatSamples = append(floatSamples, sample{ts, v})
+	}
+	assertSamplesEqual(t, floatSamples, []sample{{base, 0}, {base + 15000, 1}, {base + 30000, 2}})
+
+	if !cit.Next() {
+		t.Fatalf("chunks.Iterator returned only 1 chunk, want 2 (float then histogram): %v", cit.Err())
+	}
+	histMeta := cit.At()
+	if histMeta.MinTime != base+45000 || histMeta.MaxTime != base+60000 {
+		t.Fatalf("histogram chunk time range = [%d, %d], want [%d, %d]", histMeta.MinTime, histMeta.MaxTime, base+45000, base+60000)
+	}
+	hit := histMeta.Chunk.Iterator(nil)
+	i := 0
+	for hit.Next() == chunkenc.ValHistogram {
+		ts, hg := hit.AtHistogram(nil)
+		wantTS := base + (3+int64(i))*15000
+		if ts != wantTS {
+			t.Fatalf("histogram sample %d: ts = %d, want %d", i, ts, wantTS)
+		}
+		histEqual(t, hg, hists[i])
+		i++
+	}
+	if i != len(hists) {
+		t.Fatalf("histogram chunk decoded %d samples, want %d", i, len(hists))
+	}
+
+	if cit.Next() {
+		t.Fatalf("chunks.Iterator returned a 3rd chunk, want exactly 2: %+v", cit.At())
+	}
+	if err := cit.Err(); err != nil {
+		t.Fatalf("chunks.Iterator error: %v", err)
+	}
+}
+
 func TestChunkQuerierLabelValuesAndNames(t *testing.T) {
 	h := buildQueryHead(t)
 	cq, err := h.ChunkQuerier(math.MinInt64, math.MaxInt64)

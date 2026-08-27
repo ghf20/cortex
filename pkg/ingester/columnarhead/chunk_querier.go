@@ -129,24 +129,40 @@ func (s *headChunkSeries) Labels() labels.Labels {
 	return s.h.SeriesLabels(s.ref)
 }
 
-// Iterator has the SAME mixed-float-and-histogram-series gap headSeries.Iterator
+// Iterator had the SAME mixed-float-and-histogram-series gap headSeries.Iterator
 // (querier.go) had until fixed there: a series that received both float and
-// histogram samples gets only its histogram chunk(s) here, its float samples
-// invisible. Not fixed here too - a real fix on this path means interleaving
-// float-XOR and histogram chunks.Meta in time order (this package's compaction/block
-// path has no equivalent of mixed_iterator.go's sample-level merge), a separate,
-// larger piece of work than the Querier-side fix was; tracked in CHECKLIST.md rather
-// than silently left unmentioned. This path backs Head.ChunkQuerier (compaction into
-// real TSDB blocks), not Head.Querier (PromQL evaluation) - promqltest, which found
-// and drove the Querier-side fix, does not exercise this method at all.
+// histogram samples used to get only its histogram chunk(s) here, its float
+// samples invisible. Fixed the same way, adapted to this path's shape
+// (chunks.Meta, not decoded samples) - see mixed_chunks_iterator.go. This path
+// backs Head.ChunkQuerier (compaction into real TSDB blocks), not Head.Querier
+// (PromQL evaluation) - promqltest, which found and drove the Querier-side fix,
+// doesn't exercise this method at all; found instead while closing out the gap
+// this comment used to leave open (CHECKLIST.md).
 func (s *headChunkSeries) Iterator(_ chunks.Iterator) chunks.Iterator {
-	if s.h.HasHistogram(s.ref) {
+	hasHist := s.h.HasHistogram(s.ref)
+
+	var histIt chunkMetaIterator
+	if hasHist {
 		if s.h.HasFloatHistogram(s.ref) {
-			return newFloatHistogramChunksIterator(s.h, s.ref, s.mint, s.maxt)
+			histIt = newFloatHistogramChunksIterator(s.h, s.ref, s.mint, s.maxt)
+		} else {
+			histIt = newHistogramChunksIterator(s.h, s.ref, s.mint, s.maxt)
 		}
-		return newHistogramChunksIterator(s.h, s.ref, s.mint, s.maxt)
 	}
-	return newSingleChunkIterator(s.h, s.ref, s.mint, s.maxt)
+
+	switch {
+	case hasHist:
+		// newSingleChunkIterator is always valid (even zero-chunk) - see its own
+		// doc comment - so this always merges, whether or not the series
+		// currently has any float samples, matching headSeries.Iterator's own
+		// fix (querier.go) and the exact race that broke an earlier version of
+		// that fix: a series can gain float or histogram samples between this
+		// check and the read below, and either way this must never return a
+		// bare nil chunks.Iterator.
+		return newMixedChunksIterator(newSingleChunkIterator(s.h, s.ref, s.mint, s.maxt), histIt)
+	default:
+		return newSingleChunkIterator(s.h, s.ref, s.mint, s.maxt)
+	}
 }
 
 // singleChunkIterator yields exactly one chunks.Meta (or none, if the series has no
