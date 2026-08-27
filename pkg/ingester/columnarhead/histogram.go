@@ -616,11 +616,11 @@ func (it *HistogramIterator) nextInt() bool {
 		ZeroCount:        it.zeroCount,
 		Count:            it.count,
 		Sum:              sum,
-		PositiveSpans:    it.seg.posSpans,
-		NegativeSpans:    it.seg.negSpans,
+		PositiveSpans:    append([]histogram.Span(nil), it.seg.posSpans...),
+		NegativeSpans:    append([]histogram.Span(nil), it.seg.negSpans...),
 		PositiveBuckets:  deltaEncode(it.posAbs),
 		NegativeBuckets:  deltaEncode(it.negAbs),
-		CustomValues:     it.seg.customValues,
+		CustomValues:     append([]float64(nil), it.seg.customValues...),
 	}
 	it.off = off
 	it.i++
@@ -652,11 +652,11 @@ func (it *HistogramIterator) nextFloat() bool {
 		ZeroCount:        it.zeroCountF,
 		Count:            it.countF,
 		Sum:              sum,
-		PositiveSpans:    it.seg.posSpans,
-		NegativeSpans:    it.seg.negSpans,
+		PositiveSpans:    append([]histogram.Span(nil), it.seg.posSpans...),
+		NegativeSpans:    append([]histogram.Span(nil), it.seg.negSpans...),
 		PositiveBuckets:  append([]float64(nil), it.posF...),
 		NegativeBuckets:  append([]float64(nil), it.negF...),
-		CustomValues:     it.seg.customValues,
+		CustomValues:     append([]float64(nil), it.seg.customValues...),
 	}
 	it.off = off
 	it.i++
