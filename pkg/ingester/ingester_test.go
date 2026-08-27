@@ -7758,6 +7758,40 @@ func TestIngester_UserTSDB_BlocksToDelete(t *testing.T) {
 		require.Contains(t, blocksToDelete, block3.Meta().ULID)
 		require.Contains(t, blocksToDelete, block4.Meta().ULID)
 	})
+
+	t.Run("columnar backend: age-based deletion still applies when size retention is unconfigured", func(t *testing.T) {
+		// The regression this specifically guards: BeyondSizeRetention returns
+		// a nil map whenever maxBytes is unset (the common case - see
+		// columnarheadTSDBStore.ApplyConfig's own doc comment on why real
+		// Cortex never configures this today) - merging that nil map into
+		// deletable, then having the age-based loop below write into the same
+		// map, must not panic on a nil-map write.
+		colDir := t.TempDir()
+		colStore, err := newColumnarheadTSDBStore(colDir, 8, 4, 32, 60*1000, 60*1000, nil, promslog.NewNopLogger(), nil)
+		require.NoError(t, err)
+		defer colStore.Close()
+
+		currentTime := time.Now()
+		oldTS := currentTime.Add(-3 * time.Hour).UnixMilli()
+		app := colStore.Appender(context.Background())
+		l := labels.FromStrings(labels.MetricName, "up", "cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j")
+		_, err = app.Append(0, l, oldTS, 1)
+		require.NoError(t, err)
+		require.NoError(t, colStore.CompactHeadRange(context.Background(), oldTS, oldTS+60*1000-1))
+
+		blocks := colStore.Blocks()
+		require.Len(t, blocks, 1)
+
+		userDB := &userTSDB{
+			db:                   colStore,
+			blockRetentionPeriod: 2 * time.Hour.Milliseconds(),
+		}
+
+		require.NotPanics(t, func() {
+			blocksToDelete := userDB.blocksToDelete(blocks)
+			require.Contains(t, blocksToDelete, blocks[0].Meta().ULID)
+		})
+	})
 }
 
 func TestIngester_UpdateLabelSetMetrics(t *testing.T) {

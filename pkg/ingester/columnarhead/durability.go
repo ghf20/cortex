@@ -1492,3 +1492,29 @@ func (dh *DurableHead) Close() error {
 	}
 	return err
 }
+
+// Size returns the total on-disk bytes of dh's own durable files (blob,
+// offsets, targets, metadata, exemplars, head-times, and every shard's arena/
+// meta/histograms/local-labels files) - NOT the ULID-named block subdirectories
+// that live alongside them in the same directory (a caller doing block-level
+// retention accounting sums those separately, via each *tsdb.Block's own
+// Size()). The real tsdb.Head.Size() counterpart (WAL + WBL + chunk-disk-mapper
+// bytes there - vendor/.../tsdb/head.go): this package's durability model is
+// arena-flush, not a WAL (Phase 5), so the specific files differ, but the
+// purpose is identical - a live head's own on-disk footprint counts toward
+// size-based retention alongside every block's, not just the blocks'.
+func (dh *DurableHead) Size() (int64, error) {
+	files := []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.metadataFile, dh.exemplarsFile, dh.headTimesFile}
+	for _, ds := range dh.shards {
+		files = append(files, ds.arenaFile, ds.metaFile, ds.histogramsFile, ds.localLabelsFile)
+	}
+	var total int64
+	for _, f := range files {
+		info, err := f.Stat()
+		if err != nil {
+			return 0, err
+		}
+		total += info.Size()
+	}
+	return total, nil
+}

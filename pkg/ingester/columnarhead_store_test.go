@@ -415,6 +415,90 @@ func TestColumnarheadTSDBStorePrunesDeletableBlocks(t *testing.T) {
 	}
 }
 
+// TestColumnarheadBeyondSizeRetention ports real Prometheus's
+// BeyondSizeRetention (tsdb/db.go), for parity with the native backend's own
+// currently-unreachable capability - see columnarheadTSDBStore.ApplyConfig's
+// own doc comment on why real Cortex never actually configures this on either
+// backend today. Same algorithm: sort blocks newest-to-oldest, accumulate the
+// live head's own on-disk size plus each block's, and once the running total
+// crosses maxBytes, that block and every older one are deletable.
+func TestColumnarheadBeyondSizeRetention(t *testing.T) {
+	const blockDuration = 60 * 1000
+	dir := t.TempDir()
+	s, err := newColumnarheadTSDBStore(dir, 8, 4, 32, blockDuration, blockDuration, nil, promslog.NewNopLogger(), nil)
+	require.NoError(t, err)
+	defer s.Close()
+
+	l := seriesLabels("up", "p")
+	app := s.Appender(context.Background())
+	base := int64(1700000000000)
+	for block := 0; block < 3; block++ {
+		blockStart := base + int64(block)*blockDuration
+		for i := 0; i < 20; i++ {
+			ts := blockStart + int64(i)*1000
+			if _, err := app.Append(0, l, ts, float64(block*100+i)); err != nil {
+				t.Fatalf("Append: %v", err)
+			}
+		}
+		if err := s.CompactHeadRange(context.Background(), blockStart, blockStart+blockDuration-1); err != nil {
+			t.Fatalf("CompactHeadRange(block %d): %v", block, err)
+		}
+	}
+	blocks := s.Blocks()
+	if len(blocks) != 3 {
+		t.Fatalf("Blocks() = %d, want 3", len(blocks))
+	}
+	// Blocks() isn't guaranteed sorted descending by MaxTime - sort a copy the
+	// same way BeyondSizeRetention does, so this test's own "newest"/"oldest"
+	// bookkeeping matches what the function under test actually operates on.
+	sorted := append([]*tsdb.Block(nil), blocks...)
+	for i := range sorted {
+		for j := i + 1; j < len(sorted); j++ {
+			if sorted[j].Meta().MaxTime > sorted[i].Meta().MaxTime {
+				sorted[i], sorted[j] = sorted[j], sorted[i]
+			}
+		}
+	}
+
+	headSize, err := s.head.Size()
+	require.NoError(t, err)
+
+	t.Run("maxBytes unset disables size retention", func(t *testing.T) {
+		deletable := s.BeyondSizeRetention(blocks)
+		if len(deletable) != 0 {
+			t.Fatalf("BeyondSizeRetention with maxBytes unset = %v, want empty", deletable)
+		}
+	})
+
+	t.Run("budget covering head + newest block only keeps the newest", func(t *testing.T) {
+		s.maxBytes.Store(headSize + sorted[0].Size())
+		deletable := s.BeyondSizeRetention(blocks)
+		if len(deletable) != 2 {
+			t.Fatalf("deletable = %v, want the 2 older blocks", deletable)
+		}
+		for _, want := range sorted[1:] {
+			if _, ok := deletable[want.Meta().ULID]; !ok {
+				t.Fatalf("block %s (older) not marked deletable: %v", want.Meta().ULID, deletable)
+			}
+		}
+		if _, ok := deletable[sorted[0].Meta().ULID]; ok {
+			t.Fatalf("newest block %s incorrectly marked deletable", sorted[0].Meta().ULID)
+		}
+	})
+
+	t.Run("budget covering everything keeps everything", func(t *testing.T) {
+		total := headSize
+		for _, b := range blocks {
+			total += b.Size()
+		}
+		s.maxBytes.Store(total)
+		deletable := s.BeyondSizeRetention(blocks)
+		if len(deletable) != 0 {
+			t.Fatalf("deletable = %v, want empty (budget covers everything)", deletable)
+		}
+	})
+}
+
 // TestColumnarheadTSDBStoreCompactOOOHeadIsNoOp confirms CompactOOOHead is
 // callable and harmless - the real behavior (OOO samples already included in
 // every compacted block) is proven in columnarhead's own
@@ -498,6 +582,43 @@ func TestColumnarheadTSDBStoreApplyConfigResizesExemplarCapacity(t *testing.T) {
 	got := s.head.Exemplars(internalRef)
 	if len(got) != 2 {
 		t.Fatalf("Exemplars after ApplyConfig(MaxExemplars: 2) = %d, want 2", len(got))
+	}
+}
+
+// TestColumnarheadTSDBStoreApplyConfigSetsMaxBytes confirms ApplyConfig's
+// Retention.Size field reaches s.maxBytes (BeyondSizeRetention's own input),
+// mirroring real *tsdb.DB.ApplyConfig's identical nil-guards (vendor/.../tsdb/
+// db.go): only a POSITIVE value updates it, and only when TSDBConfig/Retention
+// are both non-nil - a zero or negative value, or a nil Retention, leaves
+// whatever was configured before untouched rather than disabling retention.
+func TestColumnarheadTSDBStoreApplyConfigSetsMaxBytes(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestColumnarheadStore(t, dir, 2*60*60*1000)
+	defer s.Close()
+
+	if got := s.maxBytes.Load(); got != 0 {
+		t.Fatalf("maxBytes before ApplyConfig = %d, want 0", got)
+	}
+
+	if err := s.ApplyConfig(&config.Config{StorageConfig: config.StorageConfig{
+		TSDBConfig: &config.TSDBConfig{Retention: &config.TSDBRetentionConfig{Size: 1024}},
+	}}); err != nil {
+		t.Fatalf("ApplyConfig: %v", err)
+	}
+	if got := s.maxBytes.Load(); got != 1024 {
+		t.Fatalf("maxBytes after ApplyConfig(Retention.Size: 1024) = %d, want 1024", got)
+	}
+
+	// A zero/unset Retention.Size on a later call must NOT reset maxBytes back
+	// to 0 - matches real tsdb.DB.ApplyConfig's own documented reconfiguration
+	// semantics exactly (only a positive value updates it).
+	if err := s.ApplyConfig(&config.Config{StorageConfig: config.StorageConfig{
+		TSDBConfig: &config.TSDBConfig{Retention: &config.TSDBRetentionConfig{}},
+	}}); err != nil {
+		t.Fatalf("ApplyConfig (zero Retention.Size): %v", err)
+	}
+	if got := s.maxBytes.Load(); got != 1024 {
+		t.Fatalf("maxBytes after a zero-Retention.Size ApplyConfig = %d, want unchanged 1024", got)
 	}
 }
 

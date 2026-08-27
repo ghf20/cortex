@@ -790,14 +790,27 @@ func (u *userTSDB) blocksToDelete(blocks []*tsdb.Block) map[ulid.ULID]struct{} {
 		return nil
 	}
 	deletable := map[ulid.ULID]struct{}{}
-	// tsdb.DefaultBlocksToDelete's retention-duration/max-bytes policy is
-	// vendored and needs the concrete *tsdb.DB, so only the real backend gets
-	// it - a columnarhead-backed store has no size-based retention built yet
-	// (a real, stated gap, see columnarheadTSDBStore.ApplyConfig's own doc
-	// comment), not silently skipped. The age-based/shipped-block policy below
-	// is backend-agnostic and still applies to both.
-	if store, ok := u.db.(*nativeTSDBStore); ok {
+	// tsdb.DefaultBlocksToDelete's retention-duration/max-bytes policy needs
+	// the concrete *tsdb.DB and is vendored, so the native backend uses it
+	// directly; the columnar backend has its own ported equivalent
+	// (columnarheadTSDBStore.BeyondSizeRetention - see its own doc comment,
+	// including why this is parity with a currently-unreachable native
+	// capability rather than a gap Cortex exercises today). Either way the
+	// age-based/shipped-block policy below is backend-agnostic and still
+	// applies to both.
+	switch store := u.db.(type) {
+	case *nativeTSDBStore:
 		deletable = tsdb.DefaultBlocksToDelete(store.db)(blocks)
+	case *columnarheadTSDBStore:
+		// Merged into deletable rather than assigned directly - unlike
+		// tsdb.DefaultBlocksToDelete (which always returns a non-nil map, see
+		// deletableBlocks), BeyondSizeRetention returns nil whenever
+		// size-based retention is disabled, and the age-based loop below
+		// writes into deletable unconditionally - assigning a possibly-nil
+		// map here would make that a nil-map write panic.
+		for id := range store.BeyondSizeRetention(blocks) {
+			deletable[id] = struct{}{}
+		}
 	}
 
 	now := time.Now().UnixMilli()

@@ -9,7 +9,9 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/client_golang/prometheus"
@@ -45,6 +47,17 @@ type columnarheadTSDBStore struct {
 
 	compactor  *tsdb.LeveledCompactor
 	chunkRange int64 // smallest configured block range - what CompactHeadRange writes head blocks at
+
+	// maxBytes is the configured size-retention limit (real Cortex has no flag
+	// that sets this today - Config.StorageConfig.TSDBConfig.Retention.Size is
+	// never wired up on either backend, confirmed by grepping the whole tree
+	// before adding this - see BeyondSizeRetention's own doc comment), mirroring
+	// real tsdb.Options.MaxBytes/DB.getMaxBytes: 0 means size-based retention is
+	// disabled, matching real Prometheus's own convention. Set via ApplyConfig,
+	// the same path OutOfOrderTimeWindow already uses. atomic, not mtx-guarded -
+	// read by BeyondSizeRetention, which itself only needs mtx for the blocks
+	// snapshot, not for this scalar.
+	maxBytes atomic.Int64
 
 	// blocksToDelete decides which currently-loaded blocks are safe to remove
 	// (shipped + past retention, or superseded by a merge) - the same shape
@@ -364,18 +377,24 @@ func (s *columnarheadTSDBStore) PostingsForMatchers(ctx context.Context, ms ...*
 
 // ApplyConfig wires the live-reconfigurable knobs that have a real columnarhead
 // equivalent so far - OutOfOrderTimeWindow (Head.SetOOOTimeWindow, built in
-// Phase 4) and MaxExemplars (Head.SetExemplarCapacity) - matching real
-// *tsdb.DB.ApplyConfig's own field paths (vendor/.../tsdb/db.go: OOO window and
+// Phase 4), MaxExemplars (Head.SetExemplarCapacity), and Retention.Size
+// (s.maxBytes, read by BeyondSizeRetention) - matching real *tsdb.DB.ApplyConfig's
+// own field paths (vendor/.../tsdb/db.go: OOO window, MaxBytes, and
 // ce.Resize(cfg.StorageConfig.ExemplarsConfig.MaxExemplars)). ingester.go's
 // updateUserTSDBConfigs calls this on every tenant on a periodic ticker
 // regardless of backend, so both fields must be handled here even though this
 // method is also called once at construction with only the OOO window set (see
-// createTSDB) - MaxExemplars defaulting to 0 on that first call is fine, since
-// the very next updateUserTSDBConfigs tick corrects it, same as it already does
-// for the native backend. Retention/MaxBytes reconfiguration, real *tsdb.DB's
-// other ApplyConfig responsibility, has no columnarhead equivalent yet (no
-// size-based retention has been built for this backend at all) - a stated gap,
-// not a silent one.
+// createTSDB) - MaxExemplars/maxBytes defaulting to 0 on that first call is
+// fine, since the very next updateUserTSDBConfigs tick corrects it, same as it
+// already does for the native backend.
+//
+// Retention.Size is never actually set by real Cortex today for EITHER backend
+// (grepped the whole tree: no flag feeds StorageConfig.TSDBConfig.Retention at
+// all - Cortex's only retention knob is -blocks-storage.tsdb.retention-period,
+// a duration) - real tsdb.DefaultBlocksToDelete's size-based half is dead code
+// on the native backend too, in practice. This is wired for PARITY with that
+// real (if currently unreachable) native capability, not because it closes a
+// gap Cortex actually exercises today - see CHECKLIST.md.
 func (s *columnarheadTSDBStore) ApplyConfig(conf *config.Config) error {
 	oooTimeWindow := int64(0)
 	if conf.StorageConfig.TSDBConfig != nil {
@@ -386,12 +405,76 @@ func (s *columnarheadTSDBStore) ApplyConfig(conf *config.Config) error {
 	}
 	s.head.SetOOOTimeWindow(oooTimeWindow)
 
+	// Mirrors real *tsdb.DB.ApplyConfig's own nil-guards exactly (vendor/.../
+	// tsdb/db.go): only a POSITIVE Retention.Size updates maxBytes - a zero or
+	// unset value leaves whatever was configured before in place, it does not
+	// reset retention to "disabled" (real Prometheus's own documented
+	// reconfiguration semantics, not a shortcut taken here).
+	if conf.StorageConfig.TSDBConfig != nil && conf.StorageConfig.TSDBConfig.Retention != nil {
+		if sz := int64(conf.StorageConfig.TSDBConfig.Retention.Size); sz > 0 {
+			s.maxBytes.Store(sz)
+		}
+	}
+
 	maxExemplars := int64(0)
 	if conf.StorageConfig.ExemplarsConfig != nil {
 		maxExemplars = conf.StorageConfig.ExemplarsConfig.MaxExemplars
 	}
 	s.head.SetExemplarCapacity(int(maxExemplars))
 	return nil
+}
+
+// BeyondSizeRetention is real tsdb.BeyondSizeRetention's columnar counterpart
+// (vendor/.../tsdb/db.go) - same algorithm, ported rather than reimplemented
+// from scratch: sort blocks newest-to-oldest by MaxTime, accumulate the live
+// head's own on-disk footprint (DurableHead.Size(), the counterpart to real
+// tsdb.Head.Size() there) plus each block's Size(), and once the running total
+// exceeds maxBytes, that block and every older one are deletable. maxBytes <= 0
+// (s.maxBytes' zero value, ApplyConfig's own doc comment on why this is always
+// 0 in real Cortex today) means size-based retention is disabled, matching real
+// Prometheus's own convention exactly.
+//
+// blocks is the caller's own snapshot (userTSDB.blocksToDelete takes s.mtx.RLock
+// before calling this, same as it does before calling
+// tsdb.DefaultBlocksToDelete for the native backend) - not re-read from s.blocks
+// here, so this function doesn't need its own locking.
+func (s *columnarheadTSDBStore) BeyondSizeRetention(blocks []*tsdb.Block) map[ulid.ULID]struct{} {
+	maxBytes := s.maxBytes.Load()
+	if len(blocks) == 0 || maxBytes <= 0 {
+		return nil
+	}
+
+	sorted := append([]*tsdb.Block(nil), blocks...)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Meta().MaxTime > sorted[j].Meta().MaxTime
+	})
+
+	headSize, err := s.head.Size()
+	if err != nil {
+		// Matches real tsdb.BeyondSizeRetention's own posture: an accounting
+		// error here means retention can't be safely evaluated this round, not
+		// that it's safe to guess - real Prometheus's db.Head().Size() has no
+		// error return to even consider skipping, but this package's
+		// file-based Size() genuinely can fail (Stat on a closed/missing
+		// handle), and silently treating that as "0 bytes used" would let
+		// retention systematically under-delete. Skip this round; the next
+		// periodic call tries again.
+		s.logger.Warn("beyond size retention: failed to compute durable head size, skipping this round", "err", err)
+		return nil
+	}
+
+	deletable := make(map[ulid.ULID]struct{})
+	total := headSize
+	for i, b := range sorted {
+		total += b.Size()
+		if total > maxBytes {
+			for _, rest := range sorted[i:] {
+				deletable[rest.Meta().ULID] = struct{}{}
+			}
+			break
+		}
+	}
+	return deletable
 }
 
 // CompactHeadRange compacts [mint, maxt] into a new durable block (reusing
