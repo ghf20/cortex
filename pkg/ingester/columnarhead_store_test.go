@@ -761,3 +761,62 @@ func httpStatusIndicatesLimit(err error) bool {
 	httpResp, ok := httpgrpc.HTTPResponseFromError(err)
 	return ok && httpResp.Code == http.StatusBadRequest
 }
+
+// TestIngester_UseColumnarHead_LimitFreesUpAfterDeletion extends
+// TestIngester_UseColumnarHead_EnforcesPerMetricLimit with the OTHER half of
+// the real gap a second review pass found: PostDeletion never fired for a
+// columnar tenant (Truncate never removed anything from the head's indexes at
+// all), so the counters PreCreation checks against only ever grew - a tenant
+// with label churn would eventually have every new series rejected
+// regardless of how much churned-out cardinality had actually gone quiet.
+// Proves the fix through the real ingester Push path end to end: a rejected
+// push must SUCCEED once the series occupying the limit's one slot ages out
+// and Truncate logically removes it.
+func TestIngester_UseColumnarHead_LimitFreesUpAfterDeletion(t *testing.T) {
+	limits := defaultLimitsTestConfig()
+	limits.MaxLocalSeriesPerMetric = 1
+
+	cfg := defaultIngesterTestConfig(t)
+	cfg.BlocksStorageConfig.TSDB.UseColumnarHead = true
+
+	i, err := prepareIngesterWithBlocksStorageAndLimits(t, cfg, limits, nil, "", prometheus.NewRegistry())
+	require.NoError(t, err)
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), i))
+	defer services.StopAndAwaitTerminated(context.Background(), i) //nolint:errcheck
+
+	test.Poll(t, 1*time.Second, ring.ACTIVE, func() any {
+		return i.lifecycler.GetState()
+	})
+
+	ctx := user.InjectOrgID(context.Background(), userID)
+	lbls1 := labels.FromStrings(labels.MetricName, "testmetric", "pod", "p1")
+	lbls2 := labels.FromStrings(labels.MetricName, "testmetric", "pod", "p2")
+	base := int64(1700000000000)
+
+	req1, _ := mockWriteRequest(t, lbls1, 1, base)
+	_, err = i.Push(ctx, req1)
+	require.NoError(t, err)
+
+	db, err := i.getTSDB(userID)
+	require.NoError(t, err)
+	store, ok := db.db.(*columnarheadTSDBStore)
+	require.True(t, ok, "userTSDB.db is a %T, want *columnarheadTSDBStore", db.db)
+
+	req2, _ := mockWriteRequest(t, lbls2, 2, base+1)
+	_, err = i.Push(ctx, req2)
+	require.Error(t, err, "the second series must still be rejected before anything ages out")
+
+	// Age lbls1's only sample out and let Truncate logically remove it - the
+	// real mechanism a scheduled compaction drives in production, invoked
+	// directly here for a deterministic test rather than waiting on a timer.
+	store.head.Truncate(base + 1)
+	require.Equal(t, uint64(0), db.NumSeries(), "the aged-out series must be gone from the live count")
+
+	// The SAME second series must now succeed - the limit's one slot is free
+	// again, proving PostDeletion actually decremented seriesInMetric rather
+	// than it only ever growing.
+	req3, _ := mockWriteRequest(t, lbls2, 3, base+2)
+	_, err = i.Push(ctx, req3)
+	require.NoError(t, err, "push must succeed once the limit's slot has genuinely freed up")
+	require.Equal(t, uint64(1), db.NumSeries())
+}

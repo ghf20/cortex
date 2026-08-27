@@ -134,8 +134,18 @@ func (q *headQuerier) candidateRefs(matchers []*labels.Matcher) (candidates []ui
 		rest = append(rest, matchers[i+1:]...)
 		return refs, rest
 	}
-	// No exact __name__ matcher - full scan fallback.
-	all := make([]uint32, q.h.NumSeries())
+	// No exact __name__ matcher - full scan fallback. Reads h.nextRef directly,
+	// NOT the self-locking Head.NumSeries() - q already holds indexMu.RLock()
+	// for its whole lifetime (Head.Querier's own doc comment), and Go's
+	// sync.RWMutex explicitly warns recursive RLock() can deadlock once a
+	// Lock() call is pending elsewhere: confirmed the hard way (a real,
+	// previously-latent hazard TestHeadConcurrentAppendQueryTruncateCompact
+	// caught the moment Truncate started taking indexMu.Lock() too - nothing
+	// contended for the write lock before that, so the recursive read was
+	// harmless until then). Matches every other Head read method here
+	// (SeriesLabels, SeriesRefsForName, etc.) already assuming the caller
+	// holds the lock, rather than re-acquiring it.
+	all := make([]uint32, q.h.nextRef)
 	for i := range all {
 		all[i] = uint32(i)
 	}
@@ -153,7 +163,9 @@ func matchesAll(lbls labels.Labels, matchers []*labels.Matcher) bool {
 
 func (q *headQuerier) LabelValues(_ context.Context, name string, _ *storage.LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
 	seen := make(map[string]struct{})
-	n := uint32(q.h.NumSeries())
+	// h.nextRef directly, not Head.NumSeries() - see candidateRefs' identical
+	// note on why the self-locking accessor deadlocks here.
+	n := q.h.nextRef
 	for ref := uint32(0); ref < n; ref++ {
 		lbls := q.h.SeriesLabels(ref)
 		if !matchesAll(lbls, matchers) {
@@ -168,7 +180,9 @@ func (q *headQuerier) LabelValues(_ context.Context, name string, _ *storage.Lab
 
 func (q *headQuerier) LabelNames(_ context.Context, _ *storage.LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
 	seen := make(map[string]struct{})
-	n := uint32(q.h.NumSeries())
+	// h.nextRef directly, not Head.NumSeries() - see candidateRefs' identical
+	// note on why the self-locking accessor deadlocks here.
+	n := q.h.nextRef
 	for ref := uint32(0); ref < n; ref++ {
 		lbls := q.h.SeriesLabels(ref)
 		if !matchesAll(lbls, matchers) {

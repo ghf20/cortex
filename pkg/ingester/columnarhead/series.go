@@ -189,6 +189,11 @@ func (s *SeriesStore) LocalName(ref uint32) uint16 { return s.localName[ref] }
 func (s *SeriesStore) LocalRef(ref uint32) uint16  { return s.localRef[ref] }
 func (s *SeriesStore) HasLocal(ref uint32) bool    { return s.hasLocal[ref] }
 
+// NumSamples returns ref's current retained float sample count - Head.Truncate's way
+// of telling whether a series has any float data left after truncation, without
+// reaching past this store's field boundary into ts/val's internal shape.
+func (s *SeriesStore) NumSamples(ref uint32) uint16 { return s.nSamples[ref] }
+
 // LastSample returns ref's most recently appended timestamp and the raw bit
 // pattern of its most recently appended value (matching valueState.lastBits'
 // own representation - no float round-trip needed for a bit-exact duplicate

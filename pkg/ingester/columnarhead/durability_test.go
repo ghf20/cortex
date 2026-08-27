@@ -290,6 +290,73 @@ func TestDurableHeadTruncateThenFlush(t *testing.T) {
 	assertSamplesEqual(t, got, want)
 }
 
+// TestDurableHeadReloadDoesNotResurrectDeletedSeries confirms a series
+// Truncate logically removed (Head.Truncate's own doc comment: no retained
+// float/histogram/OOO data left) does NOT come back as discoverable after a
+// Flush+reload, even though its SeriesStore array slot is still on disk
+// (refs are never reused/compacted away). Without decodeHistogramStore/the
+// reload loop's own NumSamples/Has filter, the blind "every ref 0..nextRef is
+// live" reconstruction would resurrect it - silently undoing PostDeletion's
+// counter decrements the moment the process restarts, the exact drift this
+// mechanism exists to prevent.
+func TestDurableHeadReloadDoesNotResurrectDeletedSeries(t *testing.T) {
+	dir := t.TempDir()
+	dh, err := CreateDurableHead(dir, 2, 1, 8)
+	if err != nil {
+		t.Fatalf("CreateDurableHead: %v", err)
+	}
+
+	l := labels.FromStrings(labels.MetricName, "up", "cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j")
+	app := dh.Appender(context.Background())
+	base := int64(1700000000000)
+	oldRef, err := app.Append(0, l, base, 1)
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if _, err := dh.Flush(); err != nil {
+		t.Fatalf("first Flush: %v", err)
+	}
+
+	dh.Truncate(base + 1) // ages out the only sample - the series should be deleted
+	if got := dh.NumLiveSeries(); got != 0 {
+		t.Fatalf("NumLiveSeries() after Truncate = %d, want 0", got)
+	}
+	if _, err := dh.Flush(); err != nil {
+		t.Fatalf("post-truncate Flush: %v", err)
+	}
+	if err := dh.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reloaded, err := LoadDurableHead(dir)
+	if err != nil {
+		t.Fatalf("LoadDurableHead: %v", err)
+	}
+	defer reloaded.Close()
+
+	if got := reloaded.NumLiveSeries(); got != 0 {
+		t.Fatalf("NumLiveSeries() after reload = %d, want 0 (the deleted series must not be resurrected)", got)
+	}
+	if refs, ok := reloaded.SeriesRefsForName("up"); ok && len(refs) != 0 {
+		t.Fatalf("SeriesRefsForName(\"up\") after reload = %v, want empty or not-found", refs)
+	}
+
+	// A new sample for the same target/metric after reload must get a
+	// genuinely new ref, not resurrect the old (still on-disk, but
+	// deliberately orphaned) one.
+	app2 := reloaded.Appender(context.Background())
+	newRef, err := app2.Append(0, l, base+30000, 2)
+	if err != nil {
+		t.Fatalf("Append after reload: %v", err)
+	}
+	if newRef == oldRef {
+		t.Fatalf("Append after reload reused the old (deleted) ref %d instead of allocating a new one", oldRef)
+	}
+	if got := reloaded.NumLiveSeries(); got != 1 {
+		t.Fatalf("NumLiveSeries() after re-appending = %d, want 1", got)
+	}
+}
+
 // TestDurableHeadSurvivesCrossSeriesReuse confirms per-series flush tracking
 // (flushedSlotOff/flushedBytes/flushedGeneration) makes free-list reuse safe for
 // durability on its own, without disabling reuse (see durability.go's package doc

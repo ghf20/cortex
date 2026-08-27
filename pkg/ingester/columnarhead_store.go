@@ -331,8 +331,13 @@ func (s *columnarheadTSDBStore) Dir() string {
 	return s.dir
 }
 
+// NumSeries reports the LIVE series count (columnarhead.Head.NumLiveSeries, not
+// Head.NumSeries - see the latter's own doc comment for why the two differ): this
+// is what flows into tenant cardinality limit enforcement (PreCreation's
+// AssertMaxSeriesPerUser via userDB.NumSeries), matching real *tsdb.Head.NumSeries's
+// own always-live semantics.
 func (s *columnarheadTSDBStore) NumSeries() uint64 {
-	return uint64(s.head.NumSeries())
+	return uint64(s.head.NumLiveSeries())
 }
 
 func (s *columnarheadTSDBStore) MinTime() int64 {

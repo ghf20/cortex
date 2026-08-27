@@ -8,16 +8,18 @@ import (
 
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/tsdb/chunks"
 )
 
-// mockLifecycleCallback records every PreCreation/PostCreation call it sees, and
-// can be configured to reject a specific metric name - just enough to test
+// mockLifecycleCallback records every PreCreation/PostCreation/PostDeletion call it
+// sees, and can be configured to reject a specific metric name - just enough to test
 // SetSeriesLifecycleCallback's contract without depending on Cortex's own
 // userTSDB (a real, separate package).
 type mockLifecycleCallback struct {
-	reject    map[string]error
-	preCalls  []labels.Labels
-	postCalls []labels.Labels
+	reject      map[string]error
+	preCalls    []labels.Labels
+	postCalls   []labels.Labels
+	deleteCalls []map[chunks.HeadSeriesRef]labels.Labels
 }
 
 func (m *mockLifecycleCallback) PreCreation(l labels.Labels) error {
@@ -30,6 +32,10 @@ func (m *mockLifecycleCallback) PreCreation(l labels.Labels) error {
 
 func (m *mockLifecycleCallback) PostCreation(l labels.Labels) {
 	m.postCalls = append(m.postCalls, l)
+}
+
+func (m *mockLifecycleCallback) PostDeletion(deleted map[chunks.HeadSeriesRef]labels.Labels) {
+	m.deleteCalls = append(m.deleteCalls, deleted)
 }
 
 // TestHeadSeriesLifecycleCallback is the decisive test for
@@ -111,6 +117,148 @@ func TestHeadNoLifecycleCallbackIsSafeDefault(t *testing.T) {
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
 	if _, err := h.GetOrCreateSeries(tgt, "up", "", ""); err != nil {
 		t.Fatalf("GetOrCreateSeries with no callback set: %v", err)
+	}
+}
+
+// TestHeadTruncateRemovesEmptySeries is the decisive test for series removal
+// (external review, "cardinality accounting only ever grows"): a series
+// Truncate empties completely must become fully undiscoverable - gone from
+// NumLiveSeries, gone from a name-based lookup, and PostDeletion must fire with
+// its labels - not just have its arena bytes reclaimed while staying
+// permanently "live" in every index.
+func TestHeadTruncateRemovesEmptySeries(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	cb := &mockLifecycleCallback{}
+	h.SetSeriesLifecycleCallback(cb)
+	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
+
+	ref, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	if err != nil {
+		t.Fatalf("GetOrCreateSeries: %v", err)
+	}
+	// PostCreation already fired once for this - reset so this test only
+	// asserts on what happens around the deletion itself.
+	cb.postCalls = nil
+
+	if err := h.Append(ref, 1700000000000, 1); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if got := h.NumLiveSeries(); got != 1 {
+		t.Fatalf("NumLiveSeries() before Truncate = %d, want 1", got)
+	}
+
+	h.Truncate(1700000000001) // ages out the only sample
+
+	if got := h.NumLiveSeries(); got != 0 {
+		t.Fatalf("NumLiveSeries() after Truncate = %d, want 0 (the series should be gone)", got)
+	}
+	if refs, ok := h.SeriesRefsForName("up"); ok && len(refs) != 0 {
+		t.Fatalf("SeriesRefsForName(\"up\") after Truncate = %v, want empty or not-found", refs)
+	}
+	if len(cb.deleteCalls) != 1 {
+		t.Fatalf("PostDeletion called %d times, want 1", len(cb.deleteCalls))
+	}
+	deleted := cb.deleteCalls[0]
+	if len(deleted) != 1 {
+		t.Fatalf("PostDeletion's map has %d entries, want 1", len(deleted))
+	}
+	wantLbls := labels.FromStrings(labels.MetricName, "up", "cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j")
+	for _, got := range deleted {
+		if !labels.Equal(got, wantLbls) {
+			t.Fatalf("PostDeletion labels = %v, want %v", got, wantLbls)
+		}
+	}
+
+	// The same target/metric reappearing must get a genuinely NEW ref, not
+	// resurrect the deleted one - GetOrCreateSeries' dedup key is gone.
+	newRef, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	if err != nil {
+		t.Fatalf("GetOrCreateSeries after deletion: %v", err)
+	}
+	if newRef == ref {
+		t.Fatalf("GetOrCreateSeries after deletion reused the old ref %d instead of allocating a new one", ref)
+	}
+	if got := h.NumLiveSeries(); got != 1 {
+		t.Fatalf("NumLiveSeries() after re-creation = %d, want 1", got)
+	}
+}
+
+// TestHeadTruncateKeepsPartiallyRetainedSeries confirms a series with SOME
+// samples still inside the retained range is NOT removed - only a series with
+// NOTHING left (float, histogram, and OOO all empty) qualifies.
+func TestHeadTruncateKeepsPartiallyRetainedSeries(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	cb := &mockLifecycleCallback{}
+	h.SetSeriesLifecycleCallback(cb)
+	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
+
+	ref, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	if err != nil {
+		t.Fatalf("GetOrCreateSeries: %v", err)
+	}
+	base := int64(1700000000000)
+	if err := h.Append(ref, base, 1); err != nil {
+		t.Fatalf("Append 0: %v", err)
+	}
+	if err := h.Append(ref, base+30000, 2); err != nil {
+		t.Fatalf("Append 1: %v", err)
+	}
+
+	h.Truncate(base + 15000) // drops the first sample, keeps the second
+
+	if got := h.NumLiveSeries(); got != 1 {
+		t.Fatalf("NumLiveSeries() after partial Truncate = %d, want 1 (series has a retained sample)", got)
+	}
+	if len(cb.deleteCalls) != 0 {
+		t.Fatalf("PostDeletion called %d times, want 0", len(cb.deleteCalls))
+	}
+	refs, ok := h.SeriesRefsForName("up")
+	if !ok || len(refs) != 1 || refs[0] != ref {
+		t.Fatalf("SeriesRefsForName(\"up\") = %v, %v, want [%d], true", refs, ok, ref)
+	}
+}
+
+// TestHeadTruncateNoLifecycleCallbackIsSafeDefault confirms removal still
+// happens with no callback set (the nil default) - PostDeletion is optional,
+// the removal itself is not conditioned on having one.
+func TestHeadTruncateNoLifecycleCallbackIsSafeDefault(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
+	ref, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	if err != nil {
+		t.Fatalf("GetOrCreateSeries: %v", err)
+	}
+	if err := h.Append(ref, 1700000000000, 1); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	h.Truncate(1700000000001)
+	if got := h.NumLiveSeries(); got != 0 {
+		t.Fatalf("NumLiveSeries() = %d, want 0", got)
+	}
+}
+
+// TestHeadNumSeriesStaysAllocatedCountAfterDeletion confirms NumSeries (the
+// array-bounds count querier.go/appender.go rely on) is UNCHANGED by
+// deletion - only NumLiveSeries shrinks. Getting this wrong would silently
+// break full-scan queries/LabelValues/LabelNames for any ref numerically past
+// a shrunk live count (see NumSeries' own doc comment).
+func TestHeadNumSeriesStaysAllocatedCountAfterDeletion(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
+	ref, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	if err != nil {
+		t.Fatalf("GetOrCreateSeries: %v", err)
+	}
+	if err := h.Append(ref, 1700000000000, 1); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	before := h.NumSeries()
+	h.Truncate(1700000000001)
+	if got := h.NumSeries(); got != before {
+		t.Fatalf("NumSeries() after deletion = %d, want unchanged %d", got, before)
+	}
+	if got := h.NumLiveSeries(); got != 0 {
+		t.Fatalf("NumLiveSeries() after deletion = %d, want 0", got)
 	}
 }
 

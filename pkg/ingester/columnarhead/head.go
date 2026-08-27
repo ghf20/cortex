@@ -12,6 +12,7 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/metadata"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/tsdb/index"
 )
 
@@ -70,9 +71,9 @@ type seriesShard struct {
 // Head ties a live symbol interner, a target slab, and sharded per-series storage
 // into an actual ingest path: given raw label strings for a sample, resolve or
 // create its target and series, then append. This is the first thing in this
-// package that looks like something storage.Appender.Append could call - it is NOT
-// wired into Cortex's tsdbStore interface (pkg/ingester's Phase 1 work) yet; that
-// integration is separate, later work.
+// package that looks like something storage.Appender.Append could call - wired
+// into Cortex's tsdbStore interface via columnarheadTSDBStore (pkg/ingester,
+// gated by -blocks-storage.tsdb.use-columnar-head, see CHECKLIST.md's Phase 7).
 //
 // Live lookup goes through plain Go maps (targetIndex, seriesIndex, and liveInterner's
 // internal index), not the static MPHF/SymbolTable built earlier in this package - see
@@ -246,26 +247,25 @@ func (h *Head) SetOOOTimeWindow(w int64) {
 	h.oooTimeWindow.Store(w)
 }
 
-// SeriesLifecycleCallback mirrors real tsdb.SeriesLifecycleCallback's PreCreation/
-// PostCreation shape (vendor/.../tsdb/head.go) - a real, previously-missing hook
-// found by an external review of Phase 7's ingester wiring: without it, a
-// columnarhead-backed tenant's per-metric-name limit, per-label-set limits, active-
-// series tracker, and MaxInMemorySeries/memory_series_created_total accounting all
-// silently no-op, since nothing ever called into them (Cortex's userTSDB implements
-// the real 3-method interface and is passed as tsdb.Options.SeriesLifecycleCallback
+// SeriesLifecycleCallback mirrors real tsdb.SeriesLifecycleCallback's exact 3-method
+// shape (vendor/.../tsdb/head.go), including PostDeletion - a real, previously-
+// missing hook found by an external review of Phase 7's ingester wiring: without
+// PreCreation/PostCreation, a columnarhead-backed tenant's per-metric-name limit,
+// per-label-set limits, active-series tracker, and MaxInMemorySeries/
+// memory_series_created_total accounting all silently no-op (Cortex's userTSDB
+// implements the real interface and is passed as tsdb.Options.SeriesLifecycleCallback
 // for the real backend, but the columnar path had no equivalent hook at all).
+// PostDeletion was ADDED LATER (a second review pass): without it, the counters it
+// decrements only ever grew, since nothing ever called it even after Truncate later
+// gained the ability to logically remove a fully-emptied series (see its own doc
+// comment) - a tenant with label churn would eventually have every new series
+// rejected regardless of how much churned-out cardinality had actually gone quiet.
 //
-// PostDeletion is deliberately NOT part of this interface: columnarhead never
-// removes a series from its indexes at all, even after Truncate empties every
-// sample it has (Head.Truncate's own doc comment states this explicitly) - there is
-// no "series deleted" event to ever fire PostDeletion for. A real, stated
-// consequence, not silently glossed over: counters PostDeletion would normally
-// decrement (seriesInMetric, labelSetCounter, trackerCounter, instanceSeriesCount)
-// only ever GROW for a columnar-backed tenant while its TSDB stays open, unlike the
-// real backend where per-series GC keeps them accurate over time - they only reset
-// when the whole tenant's TSDB is closed. A caller (e.g. Cortex's userTSDB) that
-// already implements the full 3-method tsdb.SeriesLifecycleCallback interface
-// satisfies this narrower one for free, no adapter needed.
+// PostDeletion's signature matches real tsdb.SeriesLifecycleCallback's exactly
+// (map[chunks.HeadSeriesRef]labels.Labels, even though this package's own uint32
+// refs aren't really HeadSeriesRefs) specifically so a caller already implementing
+// the full real interface - Cortex's userTSDB - satisfies this one structurally too,
+// no adapter needed, matching PreCreation/PostCreation's own established pattern.
 type SeriesLifecycleCallback interface {
 	// PreCreation is called before a genuinely new series is created (never on a
 	// dedup hit against an existing one) - returning an error rejects the
@@ -273,6 +273,11 @@ type SeriesLifecycleCallback interface {
 	PreCreation(labels.Labels) error
 	// PostCreation is called after a genuinely new series has been created.
 	PostCreation(labels.Labels)
+	// PostDeletion is called once per Truncate call that logically removed one or
+	// more fully-emptied series, with the labels of every one removed by that
+	// call - never called with an empty map (Truncate only calls this when it
+	// actually removed something).
+	PostDeletion(map[chunks.HeadSeriesRef]labels.Labels)
 }
 
 // SetSeriesLifecycleCallback installs cb, invoked around every genuinely new
@@ -923,31 +928,84 @@ func (h *Head) PostingsForMatchers(_ context.Context, ms ...*labels.Matcher) (in
 // per-series memChunk object references directly, this format has no seek/cut point -
 // each series is one continuous cross-sample-encoded stream, so truncating means
 // fully decoding and re-encoding the retained range (see SeriesStore.Truncate/
-// HistogramStore.Truncate's doc comments).
+// HistogramStore.Truncate's doc comments). Also trims each shard's OOO buffer to the
+// same boundary (shard.ooo.trim) - previously only ever trimmed reactively, from a
+// LATER append to the SAME series (Append's own oooTimeWindow-driven trim call), so a
+// series that goes quiet kept its stale OOO samples until process restart; folded in
+// here since this pass already needs each series' OOO state to decide emptiness
+// (below), not a separate change.
 //
-// No series is ever removed from the head's indexes here: refs are permanent for the
-// process's life (targetIndex/seriesIndex/namePostings all key on them directly), so a
-// series truncated down to zero remaining samples just stays allocated and empty -
-// exactly the already-supported "matcher hits, zero samples in range" case Querier's
-// doc comment describes, not a new kind of state. That means this reclaims arena
-// bytes for aged-out sample data (real, bounded memory reclaim) but NOT the
-// O(1)-per-series index/postings/full-scan cost of series nobody will ever query
-// again - full removal of wholly-empty series from those structures is a further,
-// not-yet-built step.
+// A series left with NO retained data at all - float, histogram, AND OOO - is
+// logically removed: dropped from seriesIndex/namePostings (GetOrCreateSeries/
+// PostingsForMatchers/SeriesRefsForName/NumLiveSeries no longer see it), and
+// lifecycleCallback.PostDeletion (if set) fires once for the whole batch this call
+// removes - the real fix for a previously-documented, review-found gap: without it,
+// the counters PostCreation increments (instanceSeriesCount, seriesInMetric,
+// labelSetCounter, trackerCounter) only ever grew, so a tenant with label churn
+// would eventually have every new series rejected regardless of how much churned-out
+// cardinality had actually gone quiet. Matches real tsdb.Head's own gc()-driven
+// PostDeletion contract in effect, not in mechanism (real Prometheus also frees
+// chunk memory and considers isolation/appendID bookkeeping this package doesn't
+// have).
 //
-// Self-locking: takes every shard's write lock in ascending order (the same fixed
-// order Querier/ChunkQuerier use, so this can never deadlock against a concurrent
-// query) - a real entry point for concurrent use, since a real compaction goroutine
-// calling this runs concurrently with live append/query traffic. Does NOT take
-// indexMu - Truncate only touches shard-local series data, never symbols/targets/
-// dedup indexes.
+// Deliberately NOT reclaimed: a removed series' own SeriesStore/HistogramStore
+// storage slot (its position in the per-shard parallel arrays/map) - refs are never
+// reused here, matching real Prometheus's own HeadSeriesRef space (real tsdb.Head
+// doesn't reuse ref values after gc() either). This is the same "partial reclaim"
+// tradeoff SeriesStore's own arena free-list already documents, extended to
+// whole-series granularity: real, stated, not silently glossed over. If the same
+// underlying target/metric reappears later, GetOrCreateSeries allocates a genuinely
+// new ref (its old seriesIndex entry is gone), leaving the old slot permanently
+// orphaned - functionally harmless (Head.NumSeries, the array-bounds/full-scan
+// count everything else here relies on, is UNCHANGED by this: see its own doc
+// comment on why it must stay the allocated count, not the live one).
+//
+// Self-locking: takes indexMu for the WHOLE call now (needed to mutate seriesIndex/
+// namePostings, and because SeriesLabels - used to build PostDeletion's labels -
+// itself requires it), plus every shard's write lock in ascending order while
+// indexMu is held - the same fixed order GetOrCreateSeries already uses (indexMu
+// outer, shard inner), so this can't deadlock against it or against a concurrent
+// Querier/ChunkQuerier (identical order: indexMu first, then every shard, as read
+// locks) - unlike a version of this method NOT hold indexMu, it did before this,
+// touching only shard-local data; that changed because there's now real head-wide
+// index state to mutate here too, not because of any newly discovered concurrency
+// hazard.
 func (h *Head) Truncate(mint int64) {
-	for _, shard := range h.shards {
+	h.indexMu.Lock()
+	defer h.indexMu.Unlock()
+
+	numShards := uint32(len(h.shards))
+	var deleted map[chunks.HeadSeriesRef]labels.Labels
+	for shardIdx, shard := range h.shards {
 		shard.mu.Lock()
 		n := uint32(shard.series.NumSeries())
-		for ref := uint32(0); ref < n; ref++ {
-			shard.series.Truncate(ref, mint)
-			shard.histograms.Truncate(ref, mint)
+		for localIdx := uint32(0); localIdx < n; localIdx++ {
+			shard.series.Truncate(localIdx, mint)
+			shard.histograms.Truncate(localIdx, mint)
+			shard.ooo.trim(localIdx, mint)
+
+			if shard.series.NumSamples(localIdx) > 0 || shard.histograms.Has(localIdx) || len(shard.ooo.samples(localIdx)) > 0 {
+				continue
+			}
+			key := seriesKey{
+				targetID:  shard.series.TargetID(localIdx),
+				nameID:    shard.series.NameID(localIdx),
+				localName: shard.series.LocalName(localIdx),
+				localRef:  shard.series.LocalRef(localIdx),
+				hasLocal:  shard.series.HasLocal(localIdx),
+			}
+			if _, ok := h.seriesIndex[key]; !ok {
+				// Already removed by an earlier Truncate call, nothing appended
+				// since - nothing to do.
+				continue
+			}
+			globalRef := localIdx*numShards + uint32(shardIdx)
+			if deleted == nil {
+				deleted = make(map[chunks.HeadSeriesRef]labels.Labels)
+			}
+			deleted[chunks.HeadSeriesRef(globalRef)] = h.SeriesLabels(globalRef)
+			delete(h.seriesIndex, key)
+			h.namePostings[key.nameID] = removeRef(h.namePostings[key.nameID], globalRef)
 		}
 		shard.mu.Unlock()
 	}
@@ -968,16 +1026,55 @@ func (h *Head) Truncate(mint int64) {
 			break
 		}
 	}
+
+	if h.lifecycleCallback != nil && len(deleted) > 0 {
+		h.lifecycleCallback.PostDeletion(deleted)
+	}
 }
 
-// NumSeries, NumTargets, NumSymbols report the head's current cardinality.
-// NumSeries self-locks indexMu briefly (nextRef lives there); NumTargets/NumSymbols
-// are NOT self-locking - callers must already hold indexMu (matches how these were
-// already used before sharding).
+// removeRef removes the first occurrence of ref from refs (swap-with-last - order
+// isn't semantically load-bearing anywhere refs is read, see SeriesRefsForName/
+// namePostings' own doc comment) and returns the shortened slice - a no-op returning
+// refs unchanged if ref isn't present.
+func removeRef(refs []uint32, ref uint32) []uint32 {
+	for i, r := range refs {
+		if r == ref {
+			refs[i] = refs[len(refs)-1]
+			return refs[:len(refs)-1]
+		}
+	}
+	return refs
+}
+
+// NumSeries reports the head's total ALLOCATED series count - every ref ever
+// created, live or since logically removed by Truncate. This is deliberately NOT
+// the live count: querier.go's full-scan fallback and LabelValues/LabelNames
+// iterate ref in [0, NumSeries()), and appender.go's toInternalRef bounds-checks a
+// caller-supplied external ref against it - both need the true array-bounds upper
+// limit, not how many of those slots are still logically live, or a still-valid,
+// still-allocated ref numerically past a shrunk live count would be wrongly treated
+// as out of range. NumLiveSeries is the counterpart real tenant-cardinality
+// reporting needs instead - see its own doc comment for why the two must stay
+// separate. Self-locks indexMu briefly (nextRef lives there).
 func (h *Head) NumSeries() int {
 	h.indexMu.RLock()
 	defer h.indexMu.RUnlock()
 	return int(h.nextRef)
 }
+
+// NumLiveSeries reports how many series are currently discoverable (have a live
+// seriesIndex entry) - unlike NumSeries (the allocated-ever count, see its own doc
+// comment for why the two differ), this shrinks when Truncate logically removes a
+// series with no retained data. This is what columnarheadTSDBStore.NumSeries
+// exposes externally: real tsdb.Head.NumSeries() is always the live count (its own
+// gc() actively shrinks it), and tenant cardinality limits (PreCreation's
+// AssertMaxSeriesPerUser) need to compare against it, not the ever-growing
+// allocated count. Self-locks indexMu briefly.
+func (h *Head) NumLiveSeries() int {
+	h.indexMu.RLock()
+	defer h.indexMu.RUnlock()
+	return len(h.seriesIndex)
+}
+
 func (h *Head) NumTargets() int { return h.targets.NumTargets() }
 func (h *Head) NumSymbols() int { return h.symbols.NumSymbols() }

@@ -1031,6 +1031,25 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 	for ref := uint32(0); ref < h.nextRef; ref++ {
 		shard, localIdx := h.shardFor(ref)
 		ss := shard.series
+		// A ref with no retained float samples AND no histogram samples is
+		// either a series Truncate logically removed before the last Flush
+		// (its arrays stay on disk - see Head.Truncate's own doc comment on
+		// why refs are never reused - but it must NOT come back as
+		// discoverable on reload) or, in a narrow pre-existing edge case
+		// unrelated to that (a Create durably flushed a beat before its
+		// first Append), a series that was never given a sample at all -
+		// either way, resurrecting its seriesIndex/namePostings entry would
+		// be wrong: for the Truncate case specifically, it would silently
+		// undo PostDeletion's own counter decrements the moment the process
+		// restarts, the exact drift this mechanism exists to prevent.
+		// OOO buffers are never durable at all (see this function's own
+		// note below) so aren't and can't be part of this check - consistent
+		// with Head.Truncate's own removal criterion only being STRICTER
+		// (requiring OOO emptiness too) than what's checkable here, never
+		// laxer, so nothing this skips could have been kept live in memory.
+		if ss.NumSamples(localIdx) == 0 && !shard.histograms.Has(localIdx) {
+			continue
+		}
 		key := seriesKey{
 			targetID:  ss.TargetID(localIdx),
 			nameID:    ss.NameID(localIdx),
