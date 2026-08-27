@@ -200,6 +200,87 @@ func TestChunkQuerierHistogramSeriesRoundTrip(t *testing.T) {
 	}
 }
 
+// TestChunkQuerierGaugeHistogramNeverSplitsOnBucketDecrease is the decisive
+// test for CounterResetHint propagation (CHECKLIST.md's Phase 3 "counter-reset
+// hints" item): a bucket DECREASE between samples would look exactly like a
+// counter reset to real chunkenc.HistogramAppender's own bucket-comparison
+// detection (TestChunkQuerierHistogramSeriesCounterResetSplitsChunk forces
+// exactly this for a COUNTER histogram, on purpose, and confirms it DOES
+// split) - but for a GAUGE histogram, a decrease is completely ordinary and
+// must NOT trigger a split. Real AppendHistogram branches on
+// h.CounterResetHint == GaugeType before it ever looks at bucket values
+// (vendor/.../tsdb/chunkenc/histogram.go), so this only works end to end if
+// columnarhead's own read path correctly reports GaugeType here - the one
+// CounterResetHint value this format commits to preserving (see
+// decodedCounterResetHint's own doc comment).
+func TestChunkQuerierGaugeHistogramNeverSplitsOnBucketDecrease(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	app := h.Appender(context.Background())
+	l := labels.FromStrings(
+		labels.MetricName, "queue_depth",
+		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+	)
+	base := int64(1700000000000)
+	big := &histogram.Histogram{
+		CounterResetHint: histogram.GaugeType,
+		Schema:           0, Count: 100, Sum: 500,
+		PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{100},
+	}
+	// A real bucket DECREASE - if this were misclassified as a counter
+	// histogram, real AppendHistogram's own reset detection would force a
+	// new chunk here (exactly as TestChunkQuerierHistogramSeriesCounter
+	// ResetSplitsChunk proves for that case).
+	small := &histogram.Histogram{
+		CounterResetHint: histogram.GaugeType,
+		Schema:           0, Count: 1, Sum: 2,
+		PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{1},
+	}
+
+	if _, err := app.AppendHistogram(0, l, base, big, nil); err != nil {
+		t.Fatalf("AppendHistogram(big): %v", err)
+	}
+	if _, err := app.AppendHistogram(0, l, base+15000, small, nil); err != nil {
+		t.Fatalf("AppendHistogram(small): %v", err)
+	}
+
+	cq, err := h.ChunkQuerier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("ChunkQuerier: %v", err)
+	}
+	defer cq.Close()
+	css := cq.Select(context.Background(), false, nil, labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "queue_depth"))
+	if !css.Next() {
+		t.Fatal("Select found no series")
+	}
+	cit := css.At().Iterator(nil)
+	if !cit.Next() {
+		t.Fatalf("chunks.Iterator returned no chunks: %v", cit.Err())
+	}
+	meta := cit.At()
+	if cit.Next() {
+		t.Fatal("a gauge histogram's bucket decrease must NOT split into a new chunk")
+	}
+	if err := cit.Err(); err != nil {
+		t.Fatalf("chunks.Iterator error: %v", err)
+	}
+
+	it := meta.Chunk.Iterator(nil)
+	for i, want := range []*histogram.Histogram{big, small} {
+		if it.Next() != chunkenc.ValHistogram {
+			t.Fatalf("sample %d: real chunk iterator exhausted early", i)
+		}
+		gotTS, got := it.AtHistogram(nil)
+		wantTS := base + int64(i)*15000
+		if gotTS != wantTS {
+			t.Fatalf("sample %d: ts = %d, want %d", i, gotTS, wantTS)
+		}
+		histEqual(t, got, want)
+	}
+	if it.Next() != chunkenc.ValNone {
+		t.Fatal("real chunk iterator has more samples than expected")
+	}
+}
+
 // TestChunkQuerierHistogramSeriesCustomBucketsRoundTrip confirms schema -53
 // (NHCB) reaches the real gRPC chunks path correctly - real
 // chunkenc.HistogramAppender.AppendHistogram already handles CustomValues

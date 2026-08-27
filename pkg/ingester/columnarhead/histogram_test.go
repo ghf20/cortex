@@ -6,6 +6,15 @@ import (
 	"github.com/prometheus/prometheus/model/histogram"
 )
 
+// histEqual deliberately does NOT compare CounterResetHint: real Prometheus's
+// own chunk-level readback recomputes it from chunk position
+// (chunkenc/histogram_meta.go's counterResetHint(header, numRead)), not by
+// echoing back whatever was appended - so a chunk-path test's "got" (from a
+// real chunkenc.HistogramAppender-built chunk) and its own literal input
+// fixture's "want" can legitimately differ here without either being wrong.
+// Tests that care about CounterResetHint specifically assert on it directly
+// - see TestHistogramStoreRoundTripGaugeHistogram and
+// TestChunkQuerierGaugeHistogramNeverSplitsOnBucketDecrease.
 func histEqual(t *testing.T, got, want *histogram.Histogram) {
 	t.Helper()
 	if got.Schema != want.Schema || got.ZeroThreshold != want.ZeroThreshold ||
@@ -41,6 +50,8 @@ func int64SliceEqual(a, b []int64) bool {
 	return true
 }
 
+// floatHistEqual: see histEqual's own doc comment for why CounterResetHint is
+// deliberately excluded from this comparison.
 func floatHistEqual(t *testing.T, got, want *histogram.FloatHistogram) {
 	t.Helper()
 	if got.Schema != want.Schema || got.ZeroThreshold != want.ZeroThreshold ||
@@ -336,6 +347,87 @@ func TestHistogramStoreCustomBucketsBoundaryChangeStartsNewSegment(t *testing.T)
 	histEqual(t, got1, h2)
 	if it.Next() {
 		t.Fatal("more samples than expected")
+	}
+}
+
+// TestHistogramStoreRoundTripGaugeHistogram confirms CounterResetHint ==
+// GaugeType survives Append -> HistogramIterator.At round-trip - the one
+// CounterResetHint distinction this format commits to preserving (see
+// decodedCounterResetHint's own doc comment for why the other three values
+// deliberately do NOT round-trip literally).
+func TestHistogramStoreRoundTripGaugeHistogram(t *testing.T) {
+	hst := NewHistogramStore()
+	h := &histogram.Histogram{
+		CounterResetHint: histogram.GaugeType,
+		Schema:           0, Count: 5, Sum: 10,
+		PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{5},
+	}
+	if err := hst.Append(0, 1700000000000, h); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	it := hst.Iterator(0)
+	if !it.Next() {
+		t.Fatal("Next() = false")
+	}
+	_, got := it.At()
+	if got.CounterResetHint != histogram.GaugeType {
+		t.Fatalf("CounterResetHint = %v, want GaugeType", got.CounterResetHint)
+	}
+}
+
+// TestHistogramStoreCounterResetHintCollapsesToUnknown confirms the three
+// non-Gauge CounterResetHint values (Unknown/CounterReset/NotCounterReset) all
+// come back as UnknownCounterReset, not a literal echo of what was appended -
+// deliberate, not a bug: see decodedCounterResetHint's own doc comment for why
+// only GaugeType is safely preservable through a direct (non-real-chunk) read.
+func TestHistogramStoreCounterResetHintCollapsesToUnknown(t *testing.T) {
+	cases := map[string]histogram.CounterResetHint{
+		"unknown":           histogram.UnknownCounterReset,
+		"counter reset":     histogram.CounterReset,
+		"not counter reset": histogram.NotCounterReset,
+	}
+	for name, hint := range cases {
+		t.Run(name, func(t *testing.T) {
+			hst := NewHistogramStore()
+			h := &histogram.Histogram{
+				CounterResetHint: hint,
+				Schema:           0, Count: 1, Sum: 1,
+				PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{1},
+			}
+			if err := hst.Append(0, 1700000000000, h); err != nil {
+				t.Fatalf("Append: %v", err)
+			}
+			it := hst.Iterator(0)
+			if !it.Next() {
+				t.Fatal("Next() = false")
+			}
+			_, got := it.At()
+			if got.CounterResetHint != histogram.UnknownCounterReset {
+				t.Fatalf("CounterResetHint = %v, want UnknownCounterReset", got.CounterResetHint)
+			}
+		})
+	}
+}
+
+// TestHistogramStoreRoundTripGaugeHistogramFloat is
+// TestHistogramStoreRoundTripGaugeHistogram's FloatHistogram counterpart.
+func TestHistogramStoreRoundTripGaugeHistogramFloat(t *testing.T) {
+	hst := NewHistogramStore()
+	h := &histogram.FloatHistogram{
+		CounterResetHint: histogram.GaugeType,
+		Schema:           0, Count: 5, Sum: 10,
+		PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []float64{5},
+	}
+	if err := hst.AppendFloat(0, 1700000000000, h); err != nil {
+		t.Fatalf("AppendFloat: %v", err)
+	}
+	it := hst.Iterator(0)
+	if !it.Next() {
+		t.Fatal("Next() = false")
+	}
+	_, got := it.AtFloat()
+	if got.CounterResetHint != histogram.GaugeType {
+		t.Fatalf("CounterResetHint = %v, want GaugeType", got.CounterResetHint)
 	}
 }
 

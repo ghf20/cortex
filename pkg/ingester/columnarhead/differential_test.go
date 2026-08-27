@@ -692,6 +692,91 @@ func TestDifferentialHistogramCustomBucketsRealVsColumnar(t *testing.T) {
 	}
 }
 
+// TestDifferentialGaugeHistogramChunkCountRealVsColumnar confirms real
+// Prometheus's OWN chunk-splitting behavior for a gauge histogram matches
+// what TestChunkQuerierGaugeHistogramNeverSplitsOnBucketDecrease asserts by
+// itself: a bucket DECREASE (which would force a split for a COUNTER
+// histogram - see TestDifferentialHistogramRealVsColumnar's sibling tests)
+// must NOT split a GAUGE histogram into a second chunk, on EITHER backend.
+// Unlike the other differential tests here, this compares CHUNK COUNT, not
+// sample values (histEqual deliberately excludes CounterResetHint - see its
+// own doc comment for why bucket-value comparison alone can't observe this
+// feature) - the one place this session's own "verify against real
+// Prometheus, don't just assume" discipline applies to a behavioral property
+// instead of stored data.
+func TestDifferentialGaugeHistogramChunkCountRealVsColumnar(t *testing.T) {
+	l := labels.FromStrings(
+		labels.MetricName, "queue_depth",
+		"cluster", "eks-prod-1", "namespace", "ns-7", "pod", "payments-api-1",
+		"container", "app", "node", "ip-10-1-2-3", "job", "cadvisor",
+	)
+	base := int64(1700000000000)
+	workload := []*histogram.Histogram{
+		{
+			CounterResetHint: histogram.GaugeType,
+			Schema:           0, Count: 100, Sum: 500,
+			PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{100},
+		},
+		{
+			CounterResetHint: histogram.GaugeType,
+			Schema:           0, Count: 1, Sum: 2, // a real bucket decrease
+			PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{1},
+		},
+	}
+
+	realHead := newRealHead(t)
+	appendHistogramsToReal(t, realHead, l, base, workload)
+	colHead := NewHead(1, 1, 16)
+	appendHistogramsToColumnar(t, colHead, l, base, workload)
+
+	realCQ, err := tsdb.NewBlockChunkQuerier(realHead, math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("real head chunk querier: %v", err)
+	}
+	defer realCQ.Close()
+	colCQ, err := colHead.ChunkQuerier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("columnar head chunk querier: %v", err)
+	}
+	defer colCQ.Close()
+
+	m := labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "queue_depth")
+	realChunks := countChunks(t, realCQ.Select(context.Background(), true, nil, m))
+	colChunks := countChunks(t, colCQ.Select(context.Background(), true, nil, m))
+
+	if realChunks != 1 {
+		t.Fatalf("real tsdb.Head produced %d chunks for a gauge histogram with a bucket decrease, want 1 (sanity check: real Prometheus itself must not split here either)", realChunks)
+	}
+	if colChunks != realChunks {
+		t.Fatalf("columnar head produced %d chunks, want %d (matching real tsdb.Head)", colChunks, realChunks)
+	}
+}
+
+// countChunks drains ss (expecting exactly one matching series) and returns
+// how many chunks its real chunks.Iterator produced.
+func countChunks(t *testing.T, ss storage.ChunkSeriesSet) int {
+	t.Helper()
+	if !ss.Next() {
+		t.Fatalf("ChunkSeriesSet: no series returned")
+	}
+	series := ss.At()
+	it := series.Iterator(nil)
+	n := 0
+	for it.Next() {
+		n++
+	}
+	if err := it.Err(); err != nil {
+		t.Fatalf("chunks.Iterator error: %v", err)
+	}
+	if ss.Next() {
+		t.Fatalf("ChunkSeriesSet: more than one matching series")
+	}
+	if err := ss.Err(); err != nil {
+		t.Fatalf("ChunkSeriesSet error: %v", err)
+	}
+	return n
+}
+
 // floatHistDiffWorkload is histDiffWorkload's FloatHistogram counterpart -
 // same shape and same scope note (stable layout, no counter reset), buckets
 // given as absolute values directly since FloatHistogram's own representation

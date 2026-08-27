@@ -416,11 +416,20 @@ func (hi *histogramSampleIterator) AtHistogram(dst *histogram.Histogram) (int64,
 // this was re-derived carefully against real Histogram.ToFloat while building
 // native FloatHistogram storage. Fixed here; see
 // TestHistogramSampleIteratorAtFloatHistogramBucketsAreAbsolute.
+//
+// CustomValues and CounterResetHint were ALSO silently dropped here until
+// found while scoping the counter-reset-hint work - real Histogram.ToFloat
+// copies both (vendor/.../model/histogram/histogram.go:
+// "fh.CounterResetHint = h.CounterResetHint", "fh.CustomValues =
+// h.CustomValues" for the custom-buckets case) - another real, latent gap the
+// only existing test never exercised (built before NHCB support existed at
+// all).
 func (hi *histogramSampleIterator) AtFloatHistogram(fh *histogram.FloatHistogram) (int64, *histogram.FloatHistogram) {
 	if fh == nil {
 		fh = &histogram.FloatHistogram{}
 	}
 	h := hi.curH
+	fh.CounterResetHint = h.CounterResetHint
 	fh.Schema = h.Schema
 	fh.ZeroThreshold = h.ZeroThreshold
 	fh.ZeroCount = float64(h.ZeroCount)
@@ -430,6 +439,7 @@ func (hi *histogramSampleIterator) AtFloatHistogram(fh *histogram.FloatHistogram
 	fh.NegativeSpans = h.NegativeSpans
 	fh.PositiveBuckets = int64ToFloat64Slice(hi.it.posAbs)
 	fh.NegativeBuckets = int64ToFloat64Slice(hi.it.negAbs)
+	fh.CustomValues = h.CustomValues
 	return hi.curTS, fh
 }
 

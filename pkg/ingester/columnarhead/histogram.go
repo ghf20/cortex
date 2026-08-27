@@ -236,16 +236,26 @@ func (hst *HistogramStore) Append(ref uint32, ts int64, h *histogram.Histogram) 
 
 	// Conservative but real upper bound on bits this sample needs, so the growth loop
 	// below is provably sufficient rather than tuned to a workload: ts (68 worst
-	// case) + sum (77, matching series.go's own value worst-case) + zeroCount+count
-	// (136: two varbit fields, 68 worst case each, covers both the first-sample-raw-64
-	// and subsequent-delta-varbit cases since 68 > 64) + one varbit (68 worst case)
-	// per bucket.
-	needBits := uint32(68+77+136) + uint32(len(posAbs)+len(negAbs))*68
+	// case) + sum (77, matching series.go's own value worst-case) + counterResetHint
+	// (2, fixed-width raw) + zeroCount+count (136: two varbit fields, 68 worst case
+	// each, covers both the first-sample-raw-64 and subsequent-delta-varbit cases
+	// since 68 > 64) + one varbit (68 worst case) per bucket.
+	needBits := uint32(68+77+2+136) + uint32(len(posAbs)+len(negAbs))*68
 	growHistoSeg(seg, needBits)
 
 	n := seg.nSamples
 	seg.bitOff = writeTimestamp(seg.arena, 0, seg.bitOff, ts, &seg.ts, n)
 	seg.bitOff = writeValue(seg.arena, 0, seg.bitOff, h.Sum, &seg.sum, n == 0)
+	// CounterResetHint is raw per-sample state, not delta/XOR-encoded like
+	// everything else here - it's a real, independent signal per sample (real
+	// Prometheus semantics: GaugeType/CounterReset must be explicitly honored
+	// by AppendHistogram regardless of what the bucket-comparison heuristic
+	// alone would conclude - vendor/.../tsdb/chunkenc/histogram.go's own
+	// AppendHistogram), not a value with any useful cross-sample structure to
+	// exploit. 2 bits covers all 4 real values (Unknown/CounterReset/
+	// NotCounterReset/Gauge - histogram.CounterResetHint is a byte with only
+	// those defined).
+	seg.bitOff = writeBits(seg.arena, 0, seg.bitOff, uint64(h.CounterResetHint), 2)
 
 	if n == 0 {
 		seg.bitOff = writeBits(seg.arena, 0, seg.bitOff, h.ZeroCount, 64)
@@ -306,14 +316,17 @@ func (hst *HistogramStore) AppendFloat(ref uint32, ts int64, h *histogram.FloatH
 	// Worst case per XOR-encoded value is 77 bits (1+1+5+6+64 - a "new window"
 	// write; see valenc.go/writeValue and series.go's own identical comment for
 	// the sum field), applied here to sum, zeroCount, count, and every bucket -
-	// all genuinely independent value-streams under this scheme.
-	needBits := uint32(68+77*3) + uint32(len(h.PositiveBuckets)+len(h.NegativeBuckets))*77
+	// all genuinely independent value-streams under this scheme. +2 for
+	// CounterResetHint (raw, not XOR-encoded - see Append's identical field for
+	// why).
+	needBits := uint32(68+77*3+2) + uint32(len(h.PositiveBuckets)+len(h.NegativeBuckets))*77
 	growHistoSeg(seg, needBits)
 
 	n := seg.nSamples
 	first := n == 0
 	seg.bitOff = writeTimestamp(seg.arena, 0, seg.bitOff, ts, &seg.ts, n)
 	seg.bitOff = writeValue(seg.arena, 0, seg.bitOff, h.Sum, &seg.sum, first)
+	seg.bitOff = writeBits(seg.arena, 0, seg.bitOff, uint64(h.CounterResetHint), 2)
 	seg.bitOff = writeValue(seg.arena, 0, seg.bitOff, h.ZeroCount, &seg.zeroCountVal, first)
 	seg.bitOff = writeValue(seg.arena, 0, seg.bitOff, h.Count, &seg.countVal, first)
 	for i, v := range h.PositiveBuckets {
@@ -423,6 +436,40 @@ func deltaEncode(abs []int64) []int64 {
 	return out
 }
 
+// decodedCounterResetHint converts a decoded 2-bit raw CounterResetHint value
+// into what a reader should actually see: GaugeType passes through unchanged,
+// everything else (Unknown/CounterReset/NotCounterReset, all raw-stored as
+// written - see Append/AppendFloat) collapses to UnknownCounterReset.
+//
+// This is deliberately NOT a literal echo of whatever was appended, even
+// though the bits ARE stored verbatim. Real Prometheus's own chunk-level
+// readback does not echo the appended hint either: it recomputes one from
+// chunk position (chunkenc/histogram_meta.go's counterResetHint(header,
+// numRead) - GaugeType if the chunk is gauge-typed, NotCounterReset for any
+// sample after the chunk's first, UnknownCounterReset otherwise, even when the
+// chunk's own header says CounterReset - "we have to return unknown... even
+// if we know", its own comment says, since a reader can't trust two chunks
+// are truly consecutive). columnarhead's histoSegment boundaries don't track
+// counter-reset boundaries at all (HistogramStore's own doc comment: it never
+// models or rejects a counter reset - only chunk_querier.go's real
+// chunkenc.HistogramAppender does that, from bucket comparison, independent
+// of whatever hint it's handed - already verified correct without this field
+// existing at all, see TestChunkQuerierHistogramSeriesCounterResetSplitsChunk),
+// so there is no position-based signal here to reproduce faithfully for the
+// Counter-type cases. GaugeType is different: it's a genuinely stable,
+// series-level property real AppendHistogram branches on immediately (its
+// very first check), not something bucket comparison can infer after the
+// fact - dropping it would make a real gauge histogram get chunk-encoded as
+// if it were a counter, causing spurious reset-driven chunk splits on
+// ordinary gauge fluctuation. That's the one distinction this format commits
+// to actually preserving.
+func decodedCounterResetHint(raw uint64) histogram.CounterResetHint {
+	if histogram.CounterResetHint(raw) == histogram.GaugeType {
+		return histogram.GaugeType
+	}
+	return histogram.UnknownCounterReset
+}
+
 // HistogramIterator replays a histogram series' encoded samples in order, across
 // every layout segment in turn (see histoSegment's own doc comment) - either
 // integer- or float-typed for the whole series (see HistogramStore.IsFloat), never
@@ -527,6 +574,8 @@ func (it *HistogramIterator) nextInt() bool {
 	ts, off := readTimestamp(it.seg.arena, 0, it.off, &it.ts, it.i)
 	sum, off2 := readValue(it.seg.arena, 0, off, &it.sum, it.i == 0)
 	off = off2
+	hintBits, off3 := readBits(it.seg.arena, 0, off, 2)
+	off = off3
 
 	if it.i == 0 {
 		zc, o := readBits(it.seg.arena, 0, off, 64)
@@ -561,16 +610,17 @@ func (it *HistogramIterator) nextInt() bool {
 
 	it.curTS = ts
 	it.curH = &histogram.Histogram{
-		Schema:          it.seg.schema,
-		ZeroThreshold:   it.seg.zeroThreshold,
-		ZeroCount:       it.zeroCount,
-		Count:           it.count,
-		Sum:             sum,
-		PositiveSpans:   it.seg.posSpans,
-		NegativeSpans:   it.seg.negSpans,
-		PositiveBuckets: deltaEncode(it.posAbs),
-		NegativeBuckets: deltaEncode(it.negAbs),
-		CustomValues:    it.seg.customValues,
+		CounterResetHint: decodedCounterResetHint(hintBits),
+		Schema:           it.seg.schema,
+		ZeroThreshold:    it.seg.zeroThreshold,
+		ZeroCount:        it.zeroCount,
+		Count:            it.count,
+		Sum:              sum,
+		PositiveSpans:    it.seg.posSpans,
+		NegativeSpans:    it.seg.negSpans,
+		PositiveBuckets:  deltaEncode(it.posAbs),
+		NegativeBuckets:  deltaEncode(it.negAbs),
+		CustomValues:     it.seg.customValues,
 	}
 	it.off = off
 	it.i++
@@ -581,6 +631,7 @@ func (it *HistogramIterator) nextFloat() bool {
 	first := it.i == 0
 	ts, off := readTimestamp(it.seg.arena, 0, it.off, &it.ts, it.i)
 	sum, off := readValue(it.seg.arena, 0, off, &it.sum, first)
+	hintBits, off := readBits(it.seg.arena, 0, off, 2)
 	zc, off := readValue(it.seg.arena, 0, off, &it.zeroCountVal, first)
 	c, off := readValue(it.seg.arena, 0, off, &it.countVal, first)
 	it.zeroCountF, it.countF = zc, c
@@ -595,16 +646,17 @@ func (it *HistogramIterator) nextFloat() bool {
 
 	it.curTS = ts
 	it.curFH = &histogram.FloatHistogram{
-		Schema:          it.seg.schema,
-		ZeroThreshold:   it.seg.zeroThreshold,
-		ZeroCount:       it.zeroCountF,
-		Count:           it.countF,
-		Sum:             sum,
-		PositiveSpans:   it.seg.posSpans,
-		NegativeSpans:   it.seg.negSpans,
-		PositiveBuckets: append([]float64(nil), it.posF...),
-		NegativeBuckets: append([]float64(nil), it.negF...),
-		CustomValues:    it.seg.customValues,
+		CounterResetHint: decodedCounterResetHint(hintBits),
+		Schema:           it.seg.schema,
+		ZeroThreshold:    it.seg.zeroThreshold,
+		ZeroCount:        it.zeroCountF,
+		Count:            it.countF,
+		Sum:              sum,
+		PositiveSpans:    it.seg.posSpans,
+		NegativeSpans:    it.seg.negSpans,
+		PositiveBuckets:  append([]float64(nil), it.posF...),
+		NegativeBuckets:  append([]float64(nil), it.negF...),
+		CustomValues:     it.seg.customValues,
 	}
 	it.off = off
 	it.i++

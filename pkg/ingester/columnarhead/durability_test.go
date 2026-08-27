@@ -1314,6 +1314,58 @@ func TestDurableHeadPersistsCustomBucketsHistogram(t *testing.T) {
 	}
 }
 
+// TestDurableHeadPersistsGaugeHistogramCounterResetHint confirms
+// CounterResetHint == GaugeType survives a real Flush+reload - the 2-bit
+// per-sample field lives inside the arena bytes encodeHistogramStore already
+// copies wholesale, so this should work with no durability.go changes at all
+// (unlike CustomValues, which needed a new segment-level field); verified
+// rather than assumed.
+func TestDurableHeadPersistsGaugeHistogramCounterResetHint(t *testing.T) {
+	dir := t.TempDir()
+	dh, err := CreateDurableHead(dir, 2, 1, 8)
+	if err != nil {
+		t.Fatalf("CreateDurableHead: %v", err)
+	}
+
+	l := labels.FromStrings(labels.MetricName, "queue_depth", "cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j")
+	app := dh.Appender(context.Background())
+	base := int64(1700000000000)
+	h := &histogram.Histogram{
+		CounterResetHint: histogram.GaugeType,
+		Schema:           0, Count: 5, Sum: 10,
+		PositiveSpans: []histogram.Span{{Offset: 0, Length: 1}}, PositiveBuckets: []int64{5},
+	}
+	if _, err := app.AppendHistogram(0, l, base, h, nil); err != nil {
+		t.Fatalf("AppendHistogram: %v", err)
+	}
+
+	if _, err := dh.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if err := dh.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reloaded, err := LoadDurableHead(dir)
+	if err != nil {
+		t.Fatalf("LoadDurableHead: %v", err)
+	}
+	defer reloaded.Close()
+
+	refs, ok := reloaded.SeriesRefsForName("queue_depth")
+	if !ok || len(refs) != 1 {
+		t.Fatalf("series not found as expected: %v %v", refs, ok)
+	}
+	it := reloaded.HistogramIterator(refs[0])
+	if !it.Next() {
+		t.Fatal("HistogramIterator.Next() = false, want true")
+	}
+	_, got := it.At()
+	if got.CounterResetHint != histogram.GaugeType {
+		t.Fatalf("CounterResetHint after reload = %v, want GaugeType", got.CounterResetHint)
+	}
+}
+
 // TestDurableHeadPersistsMinMaxTime confirms Head.MinTime/MaxTime survive a
 // simulated crash and reload (headtimes.bin) - added alongside OOO support,
 // since MinTime/MaxTime are also what OOO's window check depends on. Also
