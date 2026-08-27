@@ -2,8 +2,10 @@ package columnarhead
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"path/filepath"
+	"sort"
 	"testing"
 
 	"github.com/prometheus/prometheus/model/histogram"
@@ -354,6 +356,157 @@ func TestQuerierLabelValuesAndNamesRespectTimeRange(t *testing.T) {
 			got := labelNamesIn(tc.mint, tc.maxt)
 			if !stringSliceEqual(got, tc.want) {
 				t.Fatalf("LabelValues(__name__) in [%d,%d] = %v, want %v", tc.mint, tc.maxt, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestQuerierLabelValuesWithMatchers ports real Prometheus's
+// TestHeadLabelValuesWithMatchers (tsdb/head_test.go): LabelValues must apply the
+// passed-in matchers (equal, regexp, not-equal-as-presence-check, multiple combined),
+// not just return every value for the name.
+func TestQuerierLabelValuesWithMatchers(t *testing.T) {
+	h := NewHead(4, 2, 100)
+	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
+	for i := range 100 {
+		ref, err := h.GetOrCreateSeries(tgt, "m",
+			labels.Label{Name: "tens", Value: fmt.Sprintf("value%d", i/10)},
+			labels.Label{Name: "unique", Value: fmt.Sprintf("value%d", i)})
+		if err != nil {
+			t.Fatalf("setup: %v", err)
+		}
+		if err := h.Append(ref, 100, 0); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+
+	var uniqueWithout30s []string
+	for i := range 100 {
+		if i/10 != 3 {
+			uniqueWithout30s = append(uniqueWithout30s, fmt.Sprintf("value%d", i))
+		}
+	}
+	sort.Strings(uniqueWithout30s)
+
+	cases := []struct {
+		name      string
+		labelName string
+		matchers  []*labels.Matcher
+		want      []string
+	}{
+		{"get tens based on unique id", "tens",
+			[]*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "unique", "value35")},
+			[]string{"value3"}},
+		{"get unique ids based on a ten", "unique",
+			[]*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "tens", "value1")},
+			[]string{"value10", "value11", "value12", "value13", "value14", "value15", "value16", "value17", "value18", "value19"}},
+		{"get tens by pattern matching on unique id", "tens",
+			[]*labels.Matcher{labels.MustNewMatcher(labels.MatchRegexp, "unique", "value[5-7]5")},
+			[]string{"value5", "value6", "value7"}},
+		{"get tens by matching for presence of unique label", "tens",
+			[]*labels.Matcher{labels.MustNewMatcher(labels.MatchNotEqual, "unique", "")},
+			[]string{"value0", "value1", "value2", "value3", "value4", "value5", "value6", "value7", "value8", "value9"}},
+		{"get unique IDs based on tens not being equal to a certain value, while not empty", "unique",
+			[]*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchNotEqual, "tens", "value3"),
+				labels.MustNewMatcher(labels.MatchNotEqual, "tens", ""),
+			},
+			uniqueWithout30s},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			q, err := h.Querier(math.MinInt64, math.MaxInt64)
+			if err != nil {
+				t.Fatalf("Querier: %v", err)
+			}
+			defer q.Close()
+			got, _, err := q.LabelValues(context.Background(), tc.labelName, nil, tc.matchers...)
+			if err != nil {
+				t.Fatalf("LabelValues: %v", err)
+			}
+			sort.Strings(got)
+			if !stringSliceEqual(got, tc.want) {
+				t.Fatalf("LabelValues(%s) = %v, want %v", tc.labelName, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestQuerierLabelNamesWithMatchers ports real Prometheus's
+// TestHeadLabelNamesWithMatchers (tsdb/head_test.go): LabelNames must apply the
+// passed-in matchers before unioning the surviving series' label names, not union
+// every series' names unconditionally.
+func TestQuerierLabelNamesWithMatchers(t *testing.T) {
+	h := NewHead(4, 2, 100)
+	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
+	must := func(ref uint32, err error) uint32 {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("setup: %v", err)
+		}
+		return ref
+	}
+	for i := range 100 {
+		if err := h.Append(must(h.GetOrCreateSeries(tgt, "m",
+			labels.Label{Name: "unique", Value: fmt.Sprintf("value%d", i)})), 100, 0); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+		if i%10 == 0 {
+			if err := h.Append(must(h.GetOrCreateSeries(tgt, "m10",
+				labels.Label{Name: "tens", Value: fmt.Sprintf("value%d", i/10)},
+				labels.Label{Name: "unique", Value: fmt.Sprintf("value%d", i)})), 100, 0); err != nil {
+				t.Fatalf("append: %v", err)
+			}
+		}
+		if i%20 == 0 {
+			if err := h.Append(must(h.GetOrCreateSeries(tgt, "m20",
+				labels.Label{Name: "tens", Value: fmt.Sprintf("value%d", i/10)},
+				labels.Label{Name: "twenties", Value: fmt.Sprintf("value%d", i/20)},
+				labels.Label{Name: "unique", Value: fmt.Sprintf("value%d", i)})), 100, 0); err != nil {
+				t.Fatalf("append: %v", err)
+			}
+		}
+	}
+
+	// Every columnarhead series also carries its fixed target labels
+	// (cluster/container/job/namespace/node/pod), unlike real Prometheus's bare
+	// test labels - included in each "want" below alongside the real test's own
+	// expected set.
+	target := []string{"cluster", "container", "job", "namespace", "node", "pod"}
+	cases := []struct {
+		name     string
+		matchers []*labels.Matcher
+		want     []string
+	}{
+		{"get with non-empty unique: all",
+			[]*labels.Matcher{labels.MustNewMatcher(labels.MatchNotEqual, "unique", "")},
+			append(append([]string{"__name__"}, target...), "tens", "twenties", "unique")},
+		{"get with unique ending in 1: only unique + name",
+			[]*labels.Matcher{labels.MustNewMatcher(labels.MatchRegexp, "unique", "value.*1")},
+			append(append([]string{"__name__"}, target...), "unique")},
+		{"get with unique = value20: all",
+			[]*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "unique", "value20")},
+			append(append([]string{"__name__"}, target...), "tens", "twenties", "unique")},
+		{"get tens = 1: unique, tens, name",
+			[]*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "tens", "value1")},
+			append(append([]string{"__name__"}, target...), "tens", "unique")},
+	}
+	for i := range cases {
+		sort.Strings(cases[i].want)
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			q, err := h.Querier(math.MinInt64, math.MaxInt64)
+			if err != nil {
+				t.Fatalf("Querier: %v", err)
+			}
+			defer q.Close()
+			got, _, err := q.LabelNames(context.Background(), nil, tc.matchers...)
+			if err != nil {
+				t.Fatalf("LabelNames: %v", err)
+			}
+			if !stringSliceEqual(got, tc.want) {
+				t.Fatalf("LabelNames() = %v, want %v", got, tc.want)
 			}
 		})
 	}
