@@ -16,15 +16,15 @@ func TestPostingsForMatchers(t *testing.T) {
 	h := NewHead(8, 1, 8)
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
 
-	refUp, err := h.GetOrCreateSeries(tgt, "up", "le", "0.1")
+	refUp, err := h.GetOrCreateSeries(tgt, "up", labels.Label{Name: "le", Value: "0.1"})
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries(up): %v", err)
 	}
-	refDown, err := h.GetOrCreateSeries(tgt, "down", "le", "0.1")
+	refDown, err := h.GetOrCreateSeries(tgt, "down", labels.Label{Name: "le", Value: "0.1"})
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries(down): %v", err)
 	}
-	refUp2, err := h.GetOrCreateSeries(tgt, "up", "le", "0.5")
+	refUp2, err := h.GetOrCreateSeries(tgt, "up", labels.Label{Name: "le", Value: "0.5"})
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries(up 0.5): %v", err)
 	}

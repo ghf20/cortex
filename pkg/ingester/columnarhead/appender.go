@@ -3,6 +3,7 @@ package columnarhead
 import (
 	"context"
 	"errors"
+	"math"
 
 	"github.com/prometheus/prometheus/model/exemplar"
 	"github.com/prometheus/prometheus/model/histogram"
@@ -12,19 +13,16 @@ import (
 )
 
 // ErrUnsupportedLabelShape is returned by Append when the label set doesn't fit the
-// shape this prototype can represent: the seven fixed target labels (cluster,
-// namespace, pod, container, node, job, instance) + __name__ + at most one additional
-// label. This mirrors SeriesStore/Head's existing single-localRef-field model
-// (bench/04's original simplification, unchanged through every commit so far) - it was
-// never extended to hold an arbitrary label list, and Append is the first place that
-// limitation meets real, arbitrary-shaped label sets instead of a workload
-// deliberately built to fit it. Rejecting loudly here is a real, current scope limit
-// of this prototype, not a bug to paper over silently - see design doc §9 gap #1 ("the
-// appender is incomplete") and CHECKLIST.md. instance was added to the target set
-// after the original six were chosen - see targetFields' doc comment (target.go) for
-// why, and CHECKLIST.md for the measured effect on real workloads and this prototype's
-// own promqltest coverage.
-var ErrUnsupportedLabelShape = errors.New("columnarhead: label set has more than one non-target, non-__name__ label - unsupported by this prototype")
+// shape this prototype can represent: __name__, the seven fixed target labels
+// (cluster, namespace, pod, container, node, job, instance), and any number of
+// additional labels up to 255 (SeriesStore.localCount's width - see series.go).
+// Originally capped extra labels at exactly one (SeriesStore's single-localRef-field
+// model, bench/04's original simplification) - lifted after bench/06_variable_labels
+// measured a variable-length local-label scheme as CHEAPER, not more expensive, on a
+// real workload-shaped label-count distribution (CHECKLIST.md). What remains
+// unsupported: no __name__ at all, or (astronomically unlikely in practice) more
+// than 255 extra labels on one series.
+var ErrUnsupportedLabelShape = errors.New("columnarhead: label set doesn't fit this prototype's supported shape")
 
 // ErrNotImplemented now guards exactly one remaining gap: AppendHistogramSTZeroSample
 // (see its own doc comment for why). Exemplars, native histograms (including custom
@@ -78,17 +76,17 @@ type headAppender struct {
 
 var _ storage.Appender = (*headAppender)(nil)
 
-// splitLabels extracts the target block, metric name, and at most one extra
-// (name, value) label pair from l. Returns ErrUnsupportedLabelShape if l doesn't fit
-// that shape - see the type's doc comment on ErrUnsupportedLabelShape for why this
-// limit exists. Returns the extra label's NAME as well as its value - not just the
-// value, which was a real gap (fixed while building the Querier: reconstructing a
-// series' full labels on the read path needs the name, e.g. to tell "le" from
-// "quantile," not just "0.1").
-func splitLabels(l labels.Labels) (target TargetLabels, metricName, localName, localValue string, err error) {
+// splitLabels extracts the target block, metric name, and every extra (non-target,
+// non-__name__) label from l. Returns ErrUnsupportedLabelShape if l has no __name__
+// or more than 255 extra labels - see ErrUnsupportedLabelShape's doc comment.
+// extra's labels come out in l's own order, which - like every labels.Labels this
+// package receives - is already sorted by name (Prometheus's own invariant): callers
+// that build a canonical dedup key from extra (Head.GetOrCreateSeries/lookupSeries)
+// rely on that order directly, without a separate sort.
+func splitLabels(l labels.Labels) (target TargetLabels, metricName string, extra []labels.Label, err error) {
 	metricName = l.Get(labels.MetricName)
 	if metricName == "" {
-		return TargetLabels{}, "", "", "", ErrUnsupportedLabelShape
+		return TargetLabels{}, "", nil, ErrUnsupportedLabelShape
 	}
 	target = TargetLabels{
 		Cluster:   l.Get(labelCluster),
@@ -100,42 +98,17 @@ func splitLabels(l labels.Labels) (target TargetLabels, metricName, localName, l
 		Instance:  l.Get(labelInstance),
 	}
 
-	knownCount := 1 // __name__
-	if target.Cluster != "" {
-		knownCount++
-	}
-	if target.Namespace != "" {
-		knownCount++
-	}
-	if target.Pod != "" {
-		knownCount++
-	}
-	if target.Container != "" {
-		knownCount++
-	}
-	if target.Node != "" {
-		knownCount++
-	}
-	if target.Job != "" {
-		knownCount++
-	}
-	if target.Instance != "" {
-		knownCount++
-	}
-
-	var extra int
 	l.Range(func(lb labels.Label) {
 		switch lb.Name {
 		case labels.MetricName, labelCluster, labelNamespace, labelPod, labelContainer, labelNode, labelJob, labelInstance:
 			return
 		}
-		extra++
-		localName, localValue = lb.Name, lb.Value
+		extra = append(extra, lb)
 	})
-	if extra > 1 || l.Len() != knownCount+extra {
-		return TargetLabels{}, "", "", "", ErrUnsupportedLabelShape
+	if len(extra) > math.MaxUint8 {
+		return TargetLabels{}, "", nil, ErrUnsupportedLabelShape
 	}
-	return target, metricName, localName, localValue, nil
+	return target, metricName, extra, nil
 }
 
 // Append resolves l to a series and records (t, v). If ref is non-zero and refers to
@@ -159,11 +132,11 @@ func (a *headAppender) Append(ref storage.SeriesRef, l labels.Labels, t int64, v
 			return ref, nil
 		}
 	}
-	target, metricName, localName, localLabel, err := splitLabels(l)
+	target, metricName, extra, err := splitLabels(l)
 	if err != nil {
 		return 0, err
 	}
-	seriesRef, err := a.h.GetOrCreateSeries(target, metricName, localName, localLabel)
+	seriesRef, err := a.h.GetOrCreateSeries(target, metricName, extra...)
 	if err != nil {
 		return 0, err
 	}
@@ -178,11 +151,11 @@ func (a *headAppender) Append(ref storage.SeriesRef, l labels.Labels, t int64, v
 // interface conformance but unused: Head's dedup keys off the resolved
 // (targetID, nameID, localRef) tuple, not a label hash.
 func (a *headAppender) GetRef(lset labels.Labels, _ uint64) (storage.SeriesRef, labels.Labels) {
-	target, metricName, localName, localLabel, err := splitLabels(lset)
+	target, metricName, extra, err := splitLabels(lset)
 	if err != nil {
 		return 0, labels.EmptyLabels()
 	}
-	ref, ok := a.h.LookupSeriesRef(target, metricName, localName, localLabel)
+	ref, ok := a.h.LookupSeriesRef(target, metricName, extra...)
 	if !ok {
 		return 0, labels.EmptyLabels()
 	}
@@ -231,11 +204,11 @@ func (a *headAppender) AppendExemplar(ref storage.SeriesRef, l labels.Labels, e 
 			return ref, nil
 		}
 	}
-	target, metricName, localName, localLabel, err := splitLabels(l)
+	target, metricName, extra, err := splitLabels(l)
 	if err != nil {
 		return 0, err
 	}
-	internalRef, ok := a.h.LookupSeriesRef(target, metricName, localName, localLabel)
+	internalRef, ok := a.h.LookupSeriesRef(target, metricName, extra...)
 	if !ok {
 		return 0, ErrSeriesNotFound
 	}
@@ -261,11 +234,11 @@ func (a *headAppender) AppendHistogram(ref storage.SeriesRef, l labels.Labels, t
 				return ref, nil
 			}
 		}
-		target, metricName, localName, localLabel, err := splitLabels(l)
+		target, metricName, extra, err := splitLabels(l)
 		if err != nil {
 			return 0, err
 		}
-		seriesRef, err := a.h.GetOrCreateSeries(target, metricName, localName, localLabel)
+		seriesRef, err := a.h.GetOrCreateSeries(target, metricName, extra...)
 		if err != nil {
 			return 0, err
 		}
@@ -283,11 +256,11 @@ func (a *headAppender) AppendHistogram(ref storage.SeriesRef, l labels.Labels, t
 			return ref, nil
 		}
 	}
-	target, metricName, localName, localLabel, err := splitLabels(l)
+	target, metricName, extra, err := splitLabels(l)
 	if err != nil {
 		return 0, err
 	}
-	seriesRef, err := a.h.GetOrCreateSeries(target, metricName, localName, localLabel)
+	seriesRef, err := a.h.GetOrCreateSeries(target, metricName, extra...)
 	if err != nil {
 		return 0, err
 	}
@@ -323,11 +296,11 @@ func (a *headAppender) UpdateMetadata(ref storage.SeriesRef, l labels.Labels, m 
 			return ref, nil
 		}
 	}
-	target, metricName, localName, localLabel, err := splitLabels(l)
+	target, metricName, extra, err := splitLabels(l)
 	if err != nil {
 		return 0, err
 	}
-	internalRef, ok := a.h.LookupSeriesRef(target, metricName, localName, localLabel)
+	internalRef, ok := a.h.LookupSeriesRef(target, metricName, extra...)
 	if !ok {
 		return 0, ErrSeriesNotFound
 	}
@@ -350,11 +323,11 @@ func (a *headAppender) AppendSTZeroSample(ref storage.SeriesRef, l labels.Labels
 			return ref, nil
 		}
 	}
-	target, metricName, localName, localLabel, err := splitLabels(l)
+	target, metricName, extra, err := splitLabels(l)
 	if err != nil {
 		return 0, err
 	}
-	seriesRef, err := a.h.GetOrCreateSeries(target, metricName, localName, localLabel)
+	seriesRef, err := a.h.GetOrCreateSeries(target, metricName, extra...)
 	if err != nil {
 		return 0, err
 	}

@@ -25,7 +25,7 @@ func TestCompactHeadRoundTrip(t *testing.T) {
 	h := NewHead(2, 2, 2)
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
 
-	upRef, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	upRef, err := h.GetOrCreateSeries(tgt, "up")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries(up): %v", err)
 	}
@@ -36,7 +36,7 @@ func TestCompactHeadRoundTrip(t *testing.T) {
 		}
 	}
 
-	bucketRef, err := h.GetOrCreateSeries(tgt, "request_duration_bucket", "le", "0.1")
+	bucketRef, err := h.GetOrCreateSeries(tgt, "request_duration_bucket", labels.Label{Name: "le", Value: "0.1"})
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries(bucket): %v", err)
 	}
@@ -112,7 +112,7 @@ func TestCompactHeadIncludesOOOSamples(t *testing.T) {
 	h := NewHead(1, 1, 1)
 	h.SetOOOTimeWindow(60_000)
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
-	ref, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	ref, err := h.GetOrCreateSeries(tgt, "up")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestCompactHeadIncludesOOOSamples(t *testing.T) {
 func TestCompactHeadRespectsTimeRange(t *testing.T) {
 	h := NewHead(1, 1, 1)
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
-	ref, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	ref, err := h.GetOrCreateSeries(tgt, "up")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
@@ -240,7 +240,7 @@ func TestCompactHeadToleratesUnsortedInput(t *testing.T) {
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
 	names := []string{"zzz_metric", "yyy_metric", "mmm_metric", "aaa_metric"}
 	for _, name := range names {
-		ref, err := h.GetOrCreateSeries(tgt, name, "", "")
+		ref, err := h.GetOrCreateSeries(tgt, name)
 		if err != nil {
 			t.Fatalf("GetOrCreateSeries(%s): %v", name, err)
 		}
@@ -303,7 +303,7 @@ func TestCompactHeadToleratesUnsortedInput(t *testing.T) {
 func TestCompactHeadEmptyRangeReturnsEmptyString(t *testing.T) {
 	h := NewHead(1, 1, 1)
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
-	ref, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	ref, err := h.GetOrCreateSeries(tgt, "up")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestCompactHeadEmptyRangeReturnsEmptyString(t *testing.T) {
 func TestCompactHeadThenTruncateClosesTheLoop(t *testing.T) {
 	h := NewHead(1, 1, 1)
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
-	ref, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	ref, err := h.GetOrCreateSeries(tgt, "up")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}

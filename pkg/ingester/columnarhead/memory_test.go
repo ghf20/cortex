@@ -27,7 +27,7 @@ func TestMemoryPerSeries(t *testing.T) {
 	s := NewSeriesStore(n)
 	refs := make([]uint32, n)
 	for i := 0; i < n; i++ {
-		refs[i] = s.Create(uint32(i/seriesPerTgt), uint16(i%400), 0, uint16(i%12), false)
+		refs[i] = s.Create(uint32(i/seriesPerTgt), uint16(i%400), nil)
 	}
 
 	ts := int64(1700000000000)
@@ -113,7 +113,7 @@ func TestMemoryPerSeries_Staggered(t *testing.T) {
 	for wave := 0; wave < waves; wave++ {
 		for w := 0; w < perWave; w++ {
 			i := wave*perWave + w
-			ref := s.Create(uint32(i/seriesPerTgt), uint16(i%400), 0, uint16(i%12), false)
+			ref := s.Create(uint32(i/seriesPerTgt), uint16(i%400), nil)
 			refs = append(refs, ref)
 		}
 		// Every series alive so far gets appended to this wave, same as real ingestion
@@ -211,7 +211,7 @@ func measureShardedStaggered(t *testing.T, numShards int) {
 			// series, not incidental dedup hits) without needing a local label -
 			// which would need 100k distinct symbol strings and overflow
 			// SeriesStore's uint16 localRef field (see ErrTooManySymbols).
-			ref, err := h.GetOrCreateSeries(tgtFor(i), fmt.Sprintf("metric_%d", i%400), "", "")
+			ref, err := h.GetOrCreateSeries(tgtFor(i), fmt.Sprintf("metric_%d", i%400))
 			if err != nil {
 				t.Fatalf("wave %d, series %d: GetOrCreateSeries: %v", wave, w, err)
 			}

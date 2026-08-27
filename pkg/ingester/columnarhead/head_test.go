@@ -50,7 +50,7 @@ func TestHeadSeriesLifecycleCallback(t *testing.T) {
 
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
 
-	ref1, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	ref1, err := h.GetOrCreateSeries(tgt, "up")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries(up): %v", err)
 	}
@@ -60,7 +60,7 @@ func TestHeadSeriesLifecycleCallback(t *testing.T) {
 
 	// A dedup hit (same target+metric+no local label) must NOT fire either
 	// callback again.
-	ref1Again, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	ref1Again, err := h.GetOrCreateSeries(tgt, "up")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries(up) again: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestHeadSeriesLifecycleCallback(t *testing.T) {
 	// A rejected PreCreation must block creation entirely - no series created,
 	// no PostCreation call, the error propagated verbatim.
 	before := h.NumSeries()
-	_, err = h.GetOrCreateSeries(tgt, "blocked_metric", "", "")
+	_, err = h.GetOrCreateSeries(tgt, "blocked_metric")
 	if err == nil || err.Error() != "rejected by limiter" {
 		t.Fatalf("GetOrCreateSeries(blocked_metric) = %v, want the PreCreation rejection error", err)
 	}
@@ -87,7 +87,7 @@ func TestHeadSeriesLifecycleCallback(t *testing.T) {
 
 	// A second, genuinely different series must fire both callbacks again,
 	// with the correct reconstructed labels (see buildLabels).
-	ref2, err := h.GetOrCreateSeries(tgt, "down", "", "")
+	ref2, err := h.GetOrCreateSeries(tgt, "down")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries(down): %v", err)
 	}
@@ -115,7 +115,7 @@ func TestHeadSeriesLifecycleCallback(t *testing.T) {
 func TestHeadNoLifecycleCallbackIsSafeDefault(t *testing.T) {
 	h := NewHead(1, 1, 1)
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
-	if _, err := h.GetOrCreateSeries(tgt, "up", "", ""); err != nil {
+	if _, err := h.GetOrCreateSeries(tgt, "up"); err != nil {
 		t.Fatalf("GetOrCreateSeries with no callback set: %v", err)
 	}
 }
@@ -132,7 +132,7 @@ func TestHeadTruncateRemovesEmptySeries(t *testing.T) {
 	h.SetSeriesLifecycleCallback(cb)
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
 
-	ref, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	ref, err := h.GetOrCreateSeries(tgt, "up")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestHeadTruncateRemovesEmptySeries(t *testing.T) {
 
 	// The same target/metric reappearing must get a genuinely NEW ref, not
 	// resurrect the deleted one - GetOrCreateSeries' dedup key is gone.
-	newRef, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	newRef, err := h.GetOrCreateSeries(tgt, "up")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries after deletion: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestHeadTruncateKeepsPartiallyRetainedSeries(t *testing.T) {
 	h.SetSeriesLifecycleCallback(cb)
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
 
-	ref, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	ref, err := h.GetOrCreateSeries(tgt, "up")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
@@ -224,7 +224,7 @@ func TestHeadTruncateKeepsPartiallyRetainedSeries(t *testing.T) {
 func TestHeadTruncateNoLifecycleCallbackIsSafeDefault(t *testing.T) {
 	h := NewHead(1, 1, 1)
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
-	ref, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	ref, err := h.GetOrCreateSeries(tgt, "up")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestHeadTruncateNoLifecycleCallbackIsSafeDefault(t *testing.T) {
 func TestHeadNumSeriesStaysAllocatedCountAfterDeletion(t *testing.T) {
 	h := NewHead(1, 1, 1)
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
-	ref, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	ref, err := h.GetOrCreateSeries(tgt, "up")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
@@ -269,11 +269,11 @@ func TestHeadDedupesTargetsAndSeries(t *testing.T) {
 		Container: "app", Node: "ip-10-1-2-3", Job: "cadvisor",
 	}
 
-	ref1, err := h.GetOrCreateSeries(tgt, "cpu_seconds_total", "", "")
+	ref1, err := h.GetOrCreateSeries(tgt, "cpu_seconds_total")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
-	ref2, err := h.GetOrCreateSeries(tgt, "cpu_seconds_total", "", "")
+	ref2, err := h.GetOrCreateSeries(tgt, "cpu_seconds_total")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
@@ -288,7 +288,7 @@ func TestHeadDedupesTargetsAndSeries(t *testing.T) {
 	}
 
 	// A different metric on the SAME target must share the target but get a new series.
-	ref3, err := h.GetOrCreateSeries(tgt, "memory_bytes", "", "")
+	ref3, err := h.GetOrCreateSeries(tgt, "memory_bytes")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
@@ -304,11 +304,11 @@ func TestHeadDedupesTargetsAndSeries(t *testing.T) {
 
 	// A histogram bucket (different localLabel) is a distinct series from the same
 	// metric name with no local label.
-	ref4, err := h.GetOrCreateSeries(tgt, "request_duration_bucket", "le", "0.1")
+	ref4, err := h.GetOrCreateSeries(tgt, "request_duration_bucket", labels.Label{Name: "le", Value: "0.1"})
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
-	ref5, err := h.GetOrCreateSeries(tgt, "request_duration_bucket", "le", "0.5")
+	ref5, err := h.GetOrCreateSeries(tgt, "request_duration_bucket", labels.Label{Name: "le", Value: "0.5"})
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
@@ -320,7 +320,7 @@ func TestHeadDedupesTargetsAndSeries(t *testing.T) {
 	// otherwise-identical metric/local-label.
 	tgt2 := tgt
 	tgt2.Pod = "payments-api-def456"
-	ref6, err := h.GetOrCreateSeries(tgt2, "cpu_seconds_total", "", "")
+	ref6, err := h.GetOrCreateSeries(tgt2, "cpu_seconds_total")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
@@ -344,15 +344,15 @@ func TestHeadSeriesLabels(t *testing.T) {
 		Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j",
 	}
 
-	noLocalRef, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	noLocalRef, err := h.GetOrCreateSeries(tgt, "up")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
-	leRef, err := h.GetOrCreateSeries(tgt, "request_duration_bucket", "le", "0.1")
+	leRef, err := h.GetOrCreateSeries(tgt, "request_duration_bucket", labels.Label{Name: "le", Value: "0.1"})
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
-	quantileRef, err := h.GetOrCreateSeries(tgt, "request_duration", "quantile", "0.1")
+	quantileRef, err := h.GetOrCreateSeries(tgt, "request_duration", labels.Label{Name: "quantile", Value: "0.1"})
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
@@ -398,7 +398,7 @@ func TestHeadSeriesLabels(t *testing.T) {
 func TestHeadSeriesLabelsOmitsEmptyTargetLabels(t *testing.T) {
 	h := NewHead(2, 2, 2)
 
-	noTargetRef, err := h.GetOrCreateSeries(TargetLabels{}, "up", "", "")
+	noTargetRef, err := h.GetOrCreateSeries(TargetLabels{}, "up")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries (no target labels at all): %v", err)
 	}
@@ -413,7 +413,7 @@ func TestHeadSeriesLabelsOmitsEmptyTargetLabels(t *testing.T) {
 	}
 
 	partialTarget := TargetLabels{Cluster: "c", Job: "j"} // namespace/pod/container/node all absent
-	partialRef, err := h.GetOrCreateSeries(partialTarget, "down", "", "")
+	partialRef, err := h.GetOrCreateSeries(partialTarget, "down")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries (partial target labels): %v", err)
 	}
@@ -426,7 +426,7 @@ func TestHeadSeriesLabelsOmitsEmptyTargetLabels(t *testing.T) {
 func TestHeadAppendAndIterate(t *testing.T) {
 	h := NewHead(1, 1, 1)
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
-	ref, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	ref, err := h.GetOrCreateSeries(tgt, "up")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
@@ -456,7 +456,7 @@ func TestHeadTruncate(t *testing.T) {
 	h := NewHead(2, 2, 2)
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
 
-	gaugeRef, err := h.GetOrCreateSeries(tgt, "temperature", "", "")
+	gaugeRef, err := h.GetOrCreateSeries(tgt, "temperature")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries(gauge): %v", err)
 	}
@@ -469,7 +469,7 @@ func TestHeadTruncate(t *testing.T) {
 		}
 	}
 
-	histRef, err := h.GetOrCreateSeries(tgt, "request_latency", "", "")
+	histRef, err := h.GetOrCreateSeries(tgt, "request_latency")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries(hist): %v", err)
 	}
@@ -560,11 +560,11 @@ func TestHeadAtScale(t *testing.T) {
 			Job:       "cadvisor",
 		}
 		metric := fmt.Sprintf("container_metric_name_number_%03d_total", i%numMetrics)
-		var localName, local string
+		var extra []labels.Label
 		if i%20 < 6 { // roughly matches the histogram-bucket share used elsewhere
-			localName, local = "le", les[i%len(les)]
+			extra = []labels.Label{{Name: "le", Value: les[i%len(les)]}}
 		}
-		ref, err := h.GetOrCreateSeries(tgt, metric, localName, local)
+		ref, err := h.GetOrCreateSeries(tgt, metric, extra...)
 		if err != nil {
 			t.Fatalf("series %d: %v", i, err)
 		}

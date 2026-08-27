@@ -44,29 +44,40 @@ const maxSampleBits = 145
 // if something else later requests exactly that size class: no splitting, no merging
 // across classes. Full compaction (bench/05's approach) would do better; not built here.
 type SeriesStore struct {
-	// targetID is uint32, not uint16 like the other id fields: nameID/localRef come
-	// from bounded vocabularies (metric names, "le"-style local label values) that
+	// targetID is uint32, not uint16 like the other id fields: nameID/localLabels'
+	// name/val refs come from bounded vocabularies (metric names, "le"-style local
+	// label values) that
 	// don't grow with fleet churn, but every new pod/target IS a new targetID, and a
 	// live head accumulates those indefinitely over uptime - 65,536 target creations
 	// is a realistic thing to hit in a high-churn cluster within weeks, not a
 	// theoretical edge case. See CHECKLIST.md for the measured cost of this choice.
 	targetID []uint32
 	nameID   []uint16
-	// localName/localRef are the name and value symbol refs of a series' one
-	// supported non-target, non-__name__ label (see appender.go's
-	// ErrUnsupportedLabelShape). Both are needed to reconstruct a series' full label
-	// set on the read path - storing only the value (localRef alone, the original
-	// shape of this struct) was enough for write-side dedup but made it impossible to
-	// tell "le" from "quantile" from anything else when querying. Found and fixed
-	// while building the Querier, not before - this store had no read path to expose
-	// the gap until then.
-	localName []uint16
-	localRef  []uint16
-	// hasLocal records, independent of localName/localRef's values, whether a series
-	// actually has the extra label at all. 0 is a legitimate real id from liveInterner
-	// (whichever string happens to be interned first) - localName/localRef == 0 does
-	// NOT mean "absent," so absence needs its own explicit signal, not an inferred one.
-	hasLocal []bool
+	// localOff/localCount are a series' extra (non-target, non-__name__) labels:
+	// count entries starting at offset off in the shared localLabels array below -
+	// the same offset-into-a-flat-array technique symOffsets->symbols and
+	// targetID->targets already use, applied here too so a series can have any
+	// number of extra labels (0-255) instead of at most one. Both name and value
+	// symbol refs are needed per label to reconstruct a series' full label set on
+	// the read path - storing only the value was enough for write-side dedup but
+	// made it impossible to tell "le" from "quantile" from anything else when
+	// querying (found and fixed while building the Querier, before this store held
+	// more than one label per series).
+	//
+	// localCount is uint8 (255 extra labels is far beyond any real or tested
+	// workload) - callers must check len(extra) before calling Create, since a
+	// value > 255 would otherwise silently truncate exactly the way a narrower-
+	// than-needed bitOff field once did (see bitOff's own doc comment - the same
+	// bug class, guarded against deliberately here, not by luck).
+	//
+	// Replaced a fixed "at most one extra label" scheme (localName/localRef/
+	// hasLocal scalar fields) after bench/06_variable_labels measured this
+	// variable-length alternative as CHEAPER, not more expensive, on a real
+	// workload-shaped label-count distribution (see CHECKLIST.md) - not a
+	// theoretical improvement adopted on faith.
+	localOff    []uint32
+	localCount  []uint8
+	localLabels []localLabel // flat, shared across every series in this store
 	// bitOff is a series' current bit offset within its slot. uint32, not uint16 like
 	// nSamples: unlike sample COUNT (bounded by ErrTooManySamples below), bit count has
 	// no comparable natural ceiling - a highly compressible series (near-constant
@@ -109,14 +120,19 @@ type SeriesStore struct {
 	AllocBytesRequested    uint64
 }
 
+// localLabel is one extra (name, value) label as a pair of symbol refs -
+// SeriesStore.localLabels' element type.
+type localLabel struct {
+	name, val uint16
+}
+
 // NewSeriesStore returns an empty store with capacity preallocated for expectedSeries.
 func NewSeriesStore(expectedSeries int) *SeriesStore {
 	return &SeriesStore{
 		targetID:   make([]uint32, 0, expectedSeries),
 		nameID:     make([]uint16, 0, expectedSeries),
-		localName:  make([]uint16, 0, expectedSeries),
-		localRef:   make([]uint16, 0, expectedSeries),
-		hasLocal:   make([]bool, 0, expectedSeries),
+		localOff:   make([]uint32, 0, expectedSeries),
+		localCount: make([]uint8, 0, expectedSeries),
 		bitOff:     make([]uint32, 0, expectedSeries),
 		nSamples:   make([]uint16, 0, expectedSeries),
 		generation: make([]uint32, 0, expectedSeries),
@@ -164,16 +180,19 @@ func (s *SeriesStore) free(off, size uint32) {
 	s.freeList[size] = append(s.freeList[size], off)
 }
 
-// Create allocates a new series and returns its ref. hasLocal is false for a series
-// with no extra label - localName/localRef are meaningless (and typically both 0) in
-// that case, matching how appender.go treats an empty localLabel.
-func (s *SeriesStore) Create(targetID uint32, nameID, localName, localRef uint16, hasLocal bool) uint32 {
+// Create allocates a new series and returns its ref. extra is empty for a series
+// with no extra labels. The caller (Head.GetOrCreateSeries) must ensure
+// len(extra) <= math.MaxUint8 before calling - Create itself doesn't re-check, to
+// keep the hot path a single truncating conversion, matching every other narrow
+// field in this store (nSamples, slotCap's implicit bounds, etc.) that trusts its
+// caller's already-checked input rather than double-checking on every append.
+func (s *SeriesStore) Create(targetID uint32, nameID uint16, extra []localLabel) uint32 {
 	ref := uint32(len(s.targetID))
 	s.targetID = append(s.targetID, targetID)
 	s.nameID = append(s.nameID, nameID)
-	s.localName = append(s.localName, localName)
-	s.localRef = append(s.localRef, localRef)
-	s.hasLocal = append(s.hasLocal, hasLocal)
+	s.localOff = append(s.localOff, uint32(len(s.localLabels)))
+	s.localCount = append(s.localCount, uint8(len(extra)))
+	s.localLabels = append(s.localLabels, extra...)
 	s.bitOff = append(s.bitOff, 0)
 	s.nSamples = append(s.nSamples, 0)
 	s.generation = append(s.generation, 0)
@@ -191,13 +210,31 @@ func (s *SeriesStore) NumSeries() int {
 	return len(s.targetID)
 }
 
-// TargetID, NameID, LocalName, LocalRef, HasLocal expose a series' record fields for
-// the read path (reconstructing its full label set) - see Head.SeriesLabels.
-func (s *SeriesStore) TargetID(ref uint32) uint32  { return s.targetID[ref] }
-func (s *SeriesStore) NameID(ref uint32) uint16    { return s.nameID[ref] }
-func (s *SeriesStore) LocalName(ref uint32) uint16 { return s.localName[ref] }
-func (s *SeriesStore) LocalRef(ref uint32) uint16  { return s.localRef[ref] }
-func (s *SeriesStore) HasLocal(ref uint32) bool    { return s.hasLocal[ref] }
+// TargetID, NameID, LocalLabelCount, LocalLabelAt expose a series' record fields
+// for the read path (reconstructing its full label set) - see Head.SeriesLabels.
+func (s *SeriesStore) TargetID(ref uint32) uint32     { return s.targetID[ref] }
+func (s *SeriesStore) NameID(ref uint32) uint16       { return s.nameID[ref] }
+func (s *SeriesStore) LocalLabelCount(ref uint32) int { return int(s.localCount[ref]) }
+
+// LocalLabelAt returns ref's i'th extra label's (name, value) symbol refs -
+// i must be in [0, LocalLabelCount(ref)).
+func (s *SeriesStore) LocalLabelAt(ref uint32, i int) (name, val uint16) {
+	ll := s.localLabels[s.localOff[ref]+uint32(i)]
+	return ll.name, ll.val
+}
+
+// LocalLabels returns a copy of ref's extra labels - used where a caller needs the
+// whole set at once (rebuilding a seriesKey in Head.Truncate/durability.go's
+// LoadDurableHead) rather than iterating index-by-index like SeriesLabels/
+// SeriesLabelValue do on the more performance-sensitive per-query path.
+func (s *SeriesStore) LocalLabels(ref uint32) []localLabel {
+	n := s.localCount[ref]
+	if n == 0 {
+		return nil
+	}
+	off := s.localOff[ref]
+	return append([]localLabel(nil), s.localLabels[off:off+uint32(n)]...)
+}
 
 // NumSamples returns ref's current retained float sample count - Head.Truncate's way
 // of telling whether a series has any float data left after truncation, without

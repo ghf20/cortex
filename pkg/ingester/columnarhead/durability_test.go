@@ -1314,6 +1314,73 @@ func TestDurableHeadPersistsCustomBucketsHistogram(t *testing.T) {
 	}
 }
 
+// TestDurableHeadPersistsLocalLabels confirms a series' extra (non-target,
+// non-__name__) labels survive a real Flush+reload - the local_labels.bin file
+// this needed (durability.go's encodeLocalLabels/decodeLocalLabels), exercised
+// with MORE than one extra label specifically (the exact shape variable-length
+// local labels exist for, per CHECKLIST.md) - every other durability test in this
+// file happens to use series with 0 or 1 extra labels, so none of them would
+// catch a bug specific to the multi-label case (found while writing this test:
+// every existing test's Flush stats report LocalLabelBytes:0, confirmed by
+// grepping their own -v output - a real, otherwise-silent coverage gap in the
+// durability path this exact change touched).
+func TestDurableHeadPersistsLocalLabels(t *testing.T) {
+	dir := t.TempDir()
+	dh, err := CreateDurableHead(dir, 2, 1, 8)
+	if err != nil {
+		t.Fatalf("CreateDurableHead: %v", err)
+	}
+
+	l := labels.FromStrings(
+		labels.MetricName, "testhistogram_bucket",
+		"cluster", "c", "namespace", "n", "pod", "p", "container", "co", "node", "no", "job", "j",
+		"le", "0.1", "start", "positive",
+	)
+	app := dh.Appender(context.Background())
+	base := int64(1700000000000)
+	if _, err := app.Append(0, l, base, 5); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	stats, err := dh.Flush()
+	if err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if stats.LocalLabelBytes == 0 {
+		t.Fatal("Flush reported 0 local label bytes after appending a series with 2 extra labels")
+	}
+	if err := dh.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reloaded, err := LoadDurableHead(dir)
+	if err != nil {
+		t.Fatalf("LoadDurableHead: %v", err)
+	}
+	defer reloaded.Close()
+
+	refs, ok := reloaded.SeriesRefsForName("testhistogram_bucket")
+	if !ok || len(refs) != 1 {
+		t.Fatalf("series not found as expected: %v %v", refs, ok)
+	}
+	if got := reloaded.SeriesLabels(refs[0]); !labels.Equal(got, l) {
+		t.Fatalf("SeriesLabels after reload = %v, want %v", got, l)
+	}
+
+	// The dedup key must also survive the round-trip correctly - a second Append
+	// with the identical label set must resolve to the SAME series, not create a
+	// duplicate (would mean LoadDurableHead's seriesIndex reconstruction built a
+	// different key than GetOrCreateSeries does for identical input).
+	reloadedApp := reloaded.Appender(context.Background())
+	ref2, err := reloadedApp.Append(0, l, base+15000, 6)
+	if err != nil {
+		t.Fatalf("Append after reload: %v", err)
+	}
+	if toExternal := toExternalRef(refs[0]); ref2 != toExternal {
+		t.Fatalf("Append after reload with identical labels got ref %d, want %d (the existing series)", ref2, toExternal)
+	}
+}
+
 // TestDurableHeadPersistsGaugeHistogramCounterResetHint confirms
 // CounterResetHint == GaugeType survives a real Flush+reload - the 2-bit
 // per-sample field lives inside the arena bytes encodeHistogramStore already

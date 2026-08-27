@@ -2,6 +2,7 @@ package columnarhead
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/prometheus/common/model"
@@ -148,15 +149,25 @@ func TestAppenderWithLocalLabel(t *testing.T) {
 	}
 }
 
+// TestAppenderRejectsUnsupportedShape covers what's STILL unsupported after
+// variable-length local labels replaced the old "at most one extra label" cap
+// (see CHECKLIST.md) - missing __name__, and more than 255 extra labels
+// (SeriesStore.localCount's uint8 width). Two extra labels, rejected before this
+// change, is now covered by TestAppenderAcceptsMultipleExtraLabels instead - a
+// shape this test used to reject that now belongs in an "accepts" test, not
+// lingering here as a stale case.
 func TestAppenderRejectsUnsupportedShape(t *testing.T) {
 	h := NewHead(1, 1, 1)
 	app := h.Appender(context.Background())
 
+	tooMany := []labels.Label{{Name: labels.MetricName, Value: "m"}}
+	for i := 0; i < 256; i++ {
+		tooMany = append(tooMany, labels.Label{Name: fmt.Sprintf("extra%d", i), Value: "v"})
+	}
+
 	cases := map[string]labels.Labels{
-		"no __name__": labels.FromStrings("cluster", "c"),
-		"two extra labels beyond __name__": labels.FromStrings(
-			labels.MetricName, "m", "extra1", "a", "extra2", "b",
-		),
+		"no __name__":             labels.FromStrings("cluster", "c"),
+		"256 extra labels (>255)": labels.New(tooMany...),
 	}
 	for name, l := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -164,6 +175,31 @@ func TestAppenderRejectsUnsupportedShape(t *testing.T) {
 				t.Fatalf("Append(%v) = %v, want ErrUnsupportedLabelShape", l, err)
 			}
 		})
+	}
+}
+
+// TestAppenderAcceptsMultipleExtraLabels is the real-world shape variable-length
+// local labels exist for (CHECKLIST.md): more than one non-target extra label -
+// rejected outright before this change, ErrUnsupportedLabelShape regardless of
+// how few labels beyond one.
+func TestAppenderAcceptsMultipleExtraLabels(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	app := h.Appender(context.Background())
+
+	l := labels.FromStrings(
+		labels.MetricName, "testhistogram_bucket",
+		"le", "0.1", "start", "positive",
+	)
+	ref, err := app.Append(0, l, 1700000000000, 1)
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	internalRef, ok := toInternalRef(ref, h.NumSeries())
+	if !ok {
+		t.Fatalf("toInternalRef(%d) failed", ref)
+	}
+	if got := h.SeriesLabels(internalRef); !labels.Equal(got, l) {
+		t.Fatalf("SeriesLabels = %v, want %v", got, l)
 	}
 }
 

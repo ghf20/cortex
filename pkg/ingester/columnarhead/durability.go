@@ -26,10 +26,10 @@ import (
 // four core structures are ALREADY append-only in memory, with no in-place rewrite
 // of old bytes at all - liveInterner's blob/offset (Intern only ever appends),
 // TargetStore's refs (Create only ever appends), and SeriesStore's per-series
-// identity fields (targetID/nameID/localName/localRef/hasLocal, set once at Create,
-// never mutated again). Durability for those is close to free: flush the tail past
-// the last-known-durable length, fsync, done - no separate WAL record encoding
-// needed, the in-memory bytes ARE the durable bytes.
+// identity fields (targetID/nameID/localOff/localCount/localLabels, set once at
+// Create, never mutated again). Durability for those is close to free: flush the
+// tail past the last-known-durable length, fsync, done - no separate WAL record
+// encoding needed, the in-memory bytes ARE the durable bytes.
 //
 // The one genuine complication is SeriesStore's arena: growSlot moves a series to a
 // bigger region and FREES its old one for a *different* series' later alloc() to
@@ -70,8 +70,9 @@ const (
 	fileSymbolsBlob    = "symbols_blob.bin"
 	fileSymbolsOffsets = "symbols_offsets.bin"
 	fileTargets        = "targets.bin"
-	fileArena          = "arena.bin"       // per-shard: see shardFileName
-	fileSeriesMeta     = "series_meta.bin" // per-shard: see shardFileName
+	fileArena          = "arena.bin"        // per-shard: see shardFileName
+	fileSeriesMeta     = "series_meta.bin"  // per-shard: see shardFileName
+	fileLocalLabels    = "local_labels.bin" // per-shard: see shardFileName
 	fileMetadata       = "metadata.bin"
 	fileExemplars      = "exemplars.bin"
 	fileHistograms     = "histograms.bin" // per-shard: see shardFileName
@@ -89,28 +90,26 @@ func shardFileName(base string, shard int) string {
 }
 
 // seriesMetaRecordSize is one series' fixed-width persisted record: targetID(4) +
-// nameID(2) + localName(2) + localRef(2) + hasLocal(1) + bitOff(4) + nSamples(2) +
-// slotOff(4) + slotCap(4) + val.lastBits(8) + val.leading(1) + val.trailing(1) +
-// ts.lastTS(8) + ts.lastDelta(8). bitOff is 4 bytes, not 2, matching SeriesStore's own
-// uint32 field (see its doc comment - a uint16 here silently wrapped for a highly
-// compressible, long-lived series). Unlike the identity fields (targetID etc.), bitOff/
-// nSamples/slotOff/slotCap/val/ts mutate on every Append - persisted via a full
-// rewrite of this (small, O(shard's series count) not O(shard arena size)) table on
-// every Flush, rather than tracked incrementally like the arena; simpler, and cheap
-// at any realistic series count (500k series here is ~24 MB total across all shards
-// - see TestHeadAtScale for how fast a live head of that size already builds).
-const seriesMetaRecordSize = 4 + 2 + 2 + 2 + 1 + 4 + 2 + 4 + 4 + 8 + 1 + 1 + 8 + 8
+// nameID(2) + localOff(4) + localCount(1) + bitOff(4) + nSamples(2) + slotOff(4) +
+// slotCap(4) + val.lastBits(8) + val.leading(1) + val.trailing(1) + ts.lastTS(8) +
+// ts.lastDelta(8). localOff/localCount replace the old fixed scheme's localName(2)+
+// localRef(2)+hasLocal(1) at the same total width (5 bytes either way) - see
+// SeriesStore's own doc comment on why. bitOff is 4 bytes, not 2, matching
+// SeriesStore's own uint32 field (see its doc comment - a uint16 here silently
+// wrapped for a highly compressible, long-lived series). Unlike the identity fields
+// (targetID etc.), bitOff/nSamples/slotOff/slotCap/val/ts mutate on every Append -
+// persisted via a full rewrite of this (small, O(shard's series count) not O(shard
+// arena size)) table on every Flush, rather than tracked incrementally like the
+// arena; simpler, and cheap at any realistic series count (500k series here is ~24
+// MB total across all shards - see TestHeadAtScale for how fast a live head of that
+// size already builds).
+const seriesMetaRecordSize = 4 + 2 + 4 + 1 + 4 + 2 + 4 + 4 + 8 + 1 + 1 + 8 + 8
 
 func encodeSeriesMetaRecord(s *SeriesStore, ref uint32, buf []byte) {
 	binary.LittleEndian.PutUint32(buf[0:4], s.targetID[ref])
 	binary.LittleEndian.PutUint16(buf[4:6], s.nameID[ref])
-	binary.LittleEndian.PutUint16(buf[6:8], s.localName[ref])
-	binary.LittleEndian.PutUint16(buf[8:10], s.localRef[ref])
-	if s.hasLocal[ref] {
-		buf[10] = 1
-	} else {
-		buf[10] = 0
-	}
+	binary.LittleEndian.PutUint32(buf[6:10], s.localOff[ref])
+	buf[10] = s.localCount[ref]
 	binary.LittleEndian.PutUint32(buf[11:15], s.bitOff[ref])
 	binary.LittleEndian.PutUint16(buf[15:17], s.nSamples[ref])
 	binary.LittleEndian.PutUint32(buf[17:21], s.slotOff[ref])
@@ -122,12 +121,11 @@ func encodeSeriesMetaRecord(s *SeriesStore, ref uint32, buf []byte) {
 	binary.LittleEndian.PutUint64(buf[43:51], uint64(s.ts[ref].lastDelta))
 }
 
-func decodeSeriesMetaRecord(buf []byte) (targetID uint32, nameID, localName, localRef uint16, hasLocal bool, bitOff uint32, nSamples uint16, slotOff, slotCap uint32, val valueState, ts tsState) {
+func decodeSeriesMetaRecord(buf []byte) (targetID uint32, nameID uint16, localOff uint32, localCount uint8, bitOff uint32, nSamples uint16, slotOff, slotCap uint32, val valueState, ts tsState) {
 	targetID = binary.LittleEndian.Uint32(buf[0:4])
 	nameID = binary.LittleEndian.Uint16(buf[4:6])
-	localName = binary.LittleEndian.Uint16(buf[6:8])
-	localRef = binary.LittleEndian.Uint16(buf[8:10])
-	hasLocal = buf[10] != 0
+	localOff = binary.LittleEndian.Uint32(buf[6:10])
+	localCount = buf[10]
 	bitOff = binary.LittleEndian.Uint32(buf[11:15])
 	nSamples = binary.LittleEndian.Uint16(buf[15:17])
 	slotOff = binary.LittleEndian.Uint32(buf[17:21])
@@ -138,6 +136,39 @@ func decodeSeriesMetaRecord(buf []byte) (targetID uint32, nameID, localName, loc
 	ts.lastTS = int64(binary.LittleEndian.Uint64(buf[35:43]))
 	ts.lastDelta = int64(binary.LittleEndian.Uint64(buf[43:51]))
 	return
+}
+
+// encodeLocalLabels serializes a shard's whole localLabels flat array as a fixed-
+// width record per entry: name(2) + val(2). localOff/localCount (in
+// series_meta_*.bin) already record which range of this belongs to which series,
+// so this file itself has no per-series structure - just the flat array, matching
+// targets.bin's own encoding of TargetStore.refs. Grows monotonically (Create only
+// ever appends; nothing else in this store rewrites or shrinks it - see
+// SeriesStore's own doc comment), so a full rewrite on every Flush, same as
+// series_meta.bin, never needs a Truncate call the way histograms.bin/metadata.bin
+// do.
+func encodeLocalLabels(refs []localLabel) []byte {
+	buf := make([]byte, len(refs)*4)
+	for i, r := range refs {
+		binary.LittleEndian.PutUint16(buf[i*4:i*4+2], r.name)
+		binary.LittleEndian.PutUint16(buf[i*4+2:i*4+4], r.val)
+	}
+	return buf
+}
+
+// decodeLocalLabels is encodeLocalLabels' inverse.
+func decodeLocalLabels(buf []byte) ([]localLabel, error) {
+	if len(buf)%4 != 0 {
+		return nil, fmt.Errorf("columnarhead: local labels size %d not a multiple of record size 4", len(buf))
+	}
+	out := make([]localLabel, len(buf)/4)
+	for i := range out {
+		out[i] = localLabel{
+			name: binary.LittleEndian.Uint16(buf[i*4 : i*4+2]),
+			val:  binary.LittleEndian.Uint16(buf[i*4+2 : i*4+4]),
+		}
+	}
+	return out, nil
 }
 
 // encodeMetadataMap serializes m as a sequence of variable-length records (ref
@@ -740,7 +771,7 @@ func decodeHeadTimes(buf []byte) (minTime, maxTime int64, err error) {
 // state, since one shard's slotOff/generation numbering is meaningless in another
 // shard's arena - see seriesShard's doc comment in head.go).
 type durableShard struct {
-	arenaFile, metaFile, histogramsFile *os.File
+	arenaFile, metaFile, histogramsFile, localLabelsFile *os.File
 
 	// Per-series arena durability tracking within THIS shard - see DurableHead's
 	// pre-sharding doc comment (still accurate, just now per-shard instead of
@@ -799,7 +830,7 @@ func CreateDurableHeadWithShards(dir string, expectedSeries, expectedTargets, ex
 	}
 	expected := append([]string(nil), singularFiles...)
 	for i := 0; i < numShards; i++ {
-		expected = append(expected, shardFileName(fileArena, i), shardFileName(fileSeriesMeta, i), shardFileName(fileHistograms, i))
+		expected = append(expected, shardFileName(fileArena, i), shardFileName(fileSeriesMeta, i), shardFileName(fileHistograms, i), shardFileName(fileLocalLabels, i))
 	}
 	for _, name := range expected {
 		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
@@ -848,6 +879,9 @@ func CreateDurableHeadWithShards(dir string, expectedSeries, expectedTargets, ex
 			return nil, err
 		}
 		if ds.histogramsFile, err = os.OpenFile(filepath.Join(dir, shardFileName(fileHistograms, i)), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
+			return nil, err
+		}
+		if ds.localLabelsFile, err = os.OpenFile(filepath.Join(dir, shardFileName(fileLocalLabels, i)), os.O_RDWR|os.O_CREATE, 0o644); err != nil {
 			return nil, err
 		}
 		dh.shards[i] = ds
@@ -974,19 +1008,27 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 		if err != nil {
 			return nil, fmt.Errorf("columnarhead: decode %s: %w", shardFileName(fileHistograms, i), err)
 		}
+		localLabelsBytes, err := os.ReadFile(filepath.Join(dir, shardFileName(fileLocalLabels, i)))
+		if err != nil {
+			return nil, err
+		}
+		localLabels, err := decodeLocalLabels(localLabelsBytes)
+		if err != nil {
+			return nil, fmt.Errorf("columnarhead: decode %s: %w", shardFileName(fileLocalLabels, i), err)
+		}
 
 		localN := len(metaBytes) / seriesMetaRecordSize
 		ss := NewSeriesStore(localN)
 		ss.arena = arena
+		ss.localLabels = localLabels
 		var maxEnd uint32
 		for localRef := 0; localRef < localN; localRef++ {
 			rec := metaBytes[localRef*seriesMetaRecordSize : (localRef+1)*seriesMetaRecordSize]
-			targetID, nameID, localName, localRef2, hasLocal, bitOff, nSamples, slotOff, slotCap, val, tst := decodeSeriesMetaRecord(rec)
+			targetID, nameID, localOff, localCount, bitOff, nSamples, slotOff, slotCap, val, tst := decodeSeriesMetaRecord(rec)
 			ss.targetID = append(ss.targetID, targetID)
 			ss.nameID = append(ss.nameID, nameID)
-			ss.localName = append(ss.localName, localName)
-			ss.localRef = append(ss.localRef, localRef2)
-			ss.hasLocal = append(ss.hasLocal, hasLocal)
+			ss.localOff = append(ss.localOff, localOff)
+			ss.localCount = append(ss.localCount, localCount)
 			ss.bitOff = append(ss.bitOff, bitOff)
 			ss.nSamples = append(ss.nSamples, nSamples)
 			ss.generation = append(ss.generation, 0) // not persisted - see generation's doc comment; 0 is a safe baseline since flushedGeneration below starts at 0 too
@@ -1079,11 +1121,9 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 			continue
 		}
 		key := seriesKey{
-			targetID:  ss.TargetID(localIdx),
-			nameID:    ss.NameID(localIdx),
-			localName: ss.LocalName(localIdx),
-			localRef:  ss.LocalRef(localIdx),
-			hasLocal:  ss.HasLocal(localIdx),
+			targetID: ss.TargetID(localIdx),
+			nameID:   ss.NameID(localIdx),
+			localKey: newLocalKey(ss.LocalLabels(localIdx)),
 		}
 		h.seriesIndex[key] = ref
 		h.namePostings[key.nameID] = append(h.namePostings[key.nameID], ref)
@@ -1122,6 +1162,9 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 		if dhShards[i].histogramsFile, err = os.OpenFile(filepath.Join(dir, shardFileName(fileHistograms, i)), os.O_RDWR, 0o644); err != nil {
 			return nil, err
 		}
+		if dhShards[i].localLabelsFile, err = os.OpenFile(filepath.Join(dir, shardFileName(fileLocalLabels, i)), os.O_RDWR, 0o644); err != nil {
+			return nil, err
+		}
 	}
 	return dh, nil
 }
@@ -1133,6 +1176,7 @@ func LoadDurableHead(dir string) (*DurableHead, error) {
 type FlushStats struct {
 	NewBlobBytes, NewTargetBytes, NewArenaBytes int
 	SeriesMetaBytes                             int // always a full rewrite per shard - see seriesMetaRecordSize's doc comment
+	LocalLabelBytes                             int // always a full rewrite per shard - see encodeLocalLabels' doc comment
 	MetadataBytes                               int // always a full rewrite - see encodeMetadataMap's doc comment
 	ExemplarBytes                               int // always a full rewrite - see encodeExemplarStorage's doc comment
 	HistogramBytes                              int // always a full rewrite per shard - see encodeHistogramStore's doc comment
@@ -1239,6 +1283,17 @@ func (dh *DurableHead) Flush() (FlushStats, error) {
 		}
 		stats.SeriesMetaBytes += len(metaBuf)
 
+		// Full rewrite, same as series_meta_*.bin (and for the same reason: small,
+		// O(shard's total extra-label count), and grows monotonically - see
+		// encodeLocalLabels' own doc comment on why no Truncate call is needed here).
+		localLabelsBuf := encodeLocalLabels(ss.localLabels)
+		if len(localLabelsBuf) > 0 {
+			if _, err := ds.localLabelsFile.WriteAt(localLabelsBuf, 0); err != nil {
+				return stats, fmt.Errorf("write %s: %w", shardFileName(fileLocalLabels, i), err)
+			}
+		}
+		stats.LocalLabelBytes += len(localLabelsBuf)
+
 		// Full rewrite, same as metadata/exemplars - see encodeHistogramStore's
 		// doc comment for why (Truncate's delete-then-recreate means a ref's
 		// identity can change, not just its size, which a full rewrite handles
@@ -1293,7 +1348,7 @@ func (dh *DurableHead) Flush() (FlushStats, error) {
 
 	files := []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.metadataFile, dh.exemplarsFile, dh.headTimesFile}
 	for _, ds := range dh.shards {
-		files = append(files, ds.arenaFile, ds.metaFile, ds.histogramsFile)
+		files = append(files, ds.arenaFile, ds.metaFile, ds.histogramsFile, ds.localLabelsFile)
 	}
 	for _, f := range files {
 		if err := f.Sync(); err != nil {
@@ -1427,7 +1482,7 @@ func (dh *DurableHead) Close() error {
 	}
 	files := []*os.File{dh.blobFile, dh.offsetFile, dh.targetsFile, dh.metadataFile, dh.exemplarsFile, dh.headTimesFile}
 	for _, ds := range dh.shards {
-		files = append(files, ds.arenaFile, ds.metaFile, ds.histogramsFile)
+		files = append(files, ds.arenaFile, ds.metaFile, ds.histogramsFile, ds.localLabelsFile)
 	}
 	var err error
 	for _, f := range files {

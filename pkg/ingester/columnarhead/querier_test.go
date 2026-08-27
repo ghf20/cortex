@@ -26,9 +26,9 @@ func buildQueryHead(t *testing.T) *Head {
 		}
 		return ref
 	}
-	up1 := must(h.GetOrCreateSeries(tgtA, "up", "", ""))
-	up2 := must(h.GetOrCreateSeries(tgtB, "up", "", ""))
-	bucket := must(h.GetOrCreateSeries(tgtA, "request_duration_bucket", "le", "0.1"))
+	up1 := must(h.GetOrCreateSeries(tgtA, "up"))
+	up2 := must(h.GetOrCreateSeries(tgtB, "up"))
+	bucket := must(h.GetOrCreateSeries(tgtA, "request_duration_bucket", labels.Label{Name: "le", Value: "0.1"}))
 
 	if err := h.Append(up1, 1700000000000, 1); err != nil {
 		t.Fatalf("Append up1: %v", err)
@@ -81,7 +81,7 @@ func TestQuerierSelectSortSeries(t *testing.T) {
 	h := NewHead(4, 2, 8)
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
 	for _, name := range []string{"charlie", "bravo", "alpha"} {
-		if _, err := h.GetOrCreateSeries(tgt, name, "", ""); err != nil {
+		if _, err := h.GetOrCreateSeries(tgt, name); err != nil {
 			t.Fatalf("GetOrCreateSeries(%q): %v", name, err)
 		}
 	}

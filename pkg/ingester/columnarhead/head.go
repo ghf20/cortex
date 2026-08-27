@@ -175,15 +175,39 @@ type TargetLabels struct {
 	Cluster, Namespace, Pod, Container, Node, Job, Instance string
 }
 
+// seriesKey is the dedup/lookup key for GetOrCreateSeries/lookupSeries.
+// localKey is a canonical encoding of a series' extra labels (see newLocalKey) -
+// unlike the old fixed "at most one extra label" scheme's localName/localRef/
+// hasLocal scalar fields, a variable-length list of (name, val) symbol-ref pairs
+// isn't itself comparable/hashable as a Go map key, so it's collapsed into a single
+// string first. Empty string unambiguously means "no extra labels" - no separate
+// disambiguator field needed (unlike the old hasLocal, which existed only because
+// localName=localRef=0 was itself a valid real id pair, not a safe "absent"
+// sentinel).
 type seriesKey struct {
-	targetID  uint32
-	nameID    uint16
-	localName uint16
-	localRef  uint16
-	// hasLocal disambiguates "no local label" from "local label whose name and value
-	// both happen to intern to id 0" - both would otherwise present as
-	// localName=localRef=0 and collide in seriesIndex despite being different series.
-	hasLocal bool
+	targetID uint32
+	nameID   uint16
+	localKey string
+}
+
+// newLocalKey encodes refs (a series' extra labels' interned (name, val) symbol-ref
+// pairs) into a single string, suitable as part of a seriesKey map key. refs must
+// already be in canonical order - callers pass them in splitLabels' order, which is
+// l.Range's order, which is Prometheus's own guaranteed sorted-by-name order, so no
+// separate sort happens here. Two label sets with the same labels in any order
+// still produce identical output because of this - not because this function sorts.
+func newLocalKey(refs []localLabel) string {
+	if len(refs) == 0 {
+		return ""
+	}
+	buf := make([]byte, len(refs)*4)
+	for i, r := range refs {
+		buf[i*4] = byte(r.name >> 8)
+		buf[i*4+1] = byte(r.name)
+		buf[i*4+2] = byte(r.val >> 8)
+		buf[i*4+3] = byte(r.val)
+	}
+	return string(buf)
 }
 
 // NewHead returns an empty Head with capacity preallocated for the expected scale,
@@ -319,23 +343,19 @@ func (h *Head) updateMinMaxTime(ts int64) {
 	}
 }
 
-// GetOrCreateSeries resolves target+metricName+(localName,localLabel) to a series
-// ref, creating the target, symbols, and series record as needed - repeated calls
-// with identical arguments return the same ref rather than creating duplicates.
-// localName/localLabel are the name and value of the series-specific label besides
-// __name__ (e.g. "le" and "0.1" for a histogram bucket); pass "" for both if the
-// series has none - matches SeriesStore's existing single-extra-label model (bench/04's
-// original simplification, carried through unchanged here). Both must store the NAME,
-// not just the value: two series with the same value under different label names
-// (e.g. le="0.1" vs quantile="0.1") are different series, and the read path needs the
-// name to reconstruct a faithful label set (see Head.SeriesLabels) - a real gap found
-// and fixed while building the Querier, since nothing needed to reconstruct full
-// labels before then.
+// GetOrCreateSeries resolves target+metricName+extra to a series ref, creating the
+// target, symbols, and series record as needed - repeated calls with identical
+// arguments return the same ref rather than creating duplicates. extra is the
+// series' labels besides __name__ and the target block (e.g. {le: "0.1"} for a
+// histogram bucket) - any number, 0-255 (SeriesStore.localCount's width). Order
+// doesn't affect identity (newLocalKey's own doc comment), but every caller in this
+// package already passes extra in sorted order (splitLabels' contract), so this
+// never needs to sort it itself.
 //
 // Self-locking (see Head's doc comment): takes indexMu for the whole call (symbol/
 // target interning and series dedup all need it regardless), plus the target shard's
 // lock briefly, only when actually creating a new series.
-func (h *Head) GetOrCreateSeries(target TargetLabels, metricName, localName, localLabel string) (uint32, error) {
+func (h *Head) GetOrCreateSeries(target TargetLabels, metricName string, extra ...labels.Label) (uint32, error) {
 	h.indexMu.Lock()
 	defer h.indexMu.Unlock()
 
@@ -360,19 +380,26 @@ func (h *Head) GetOrCreateSeries(target TargetLabels, metricName, localName, loc
 	}
 	nameID := uint16(nameID32)
 
-	hasLocal := localLabel != ""
-	var localNameID, localRef uint16
-	if hasLocal {
-		localNameID32 := h.symbols.Intern(localName)
-		localRef32 := h.symbols.Intern(localLabel)
-		if localNameID32 > math.MaxUint16 || localRef32 > math.MaxUint16 {
+	// len(extra) > math.MaxUint8 is already rejected by splitLabels before this is
+	// ever called with caller-supplied labels, but GetOrCreateSeries is itself an
+	// exported API (also called directly by tests) - check again here rather than
+	// silently truncating into localCount's uint8, matching the discipline
+	// SeriesStore.Create's own doc comment describes trusting a checked caller,
+	// not skipping the check.
+	if len(extra) > math.MaxUint8 {
+		return 0, ErrUnsupportedLabelShape
+	}
+	localRefs := make([]localLabel, len(extra))
+	for i, lb := range extra {
+		n32 := h.symbols.Intern(lb.Name)
+		v32 := h.symbols.Intern(lb.Value)
+		if n32 > math.MaxUint16 || v32 > math.MaxUint16 {
 			return 0, ErrTooManySymbols
 		}
-		localNameID = uint16(localNameID32)
-		localRef = uint16(localRef32)
+		localRefs[i] = localLabel{name: uint16(n32), val: uint16(v32)}
 	}
 
-	key := seriesKey{targetID, nameID, localNameID, localRef, hasLocal}
+	key := seriesKey{targetID, nameID, newLocalKey(localRefs)}
 	if ref, ok := h.seriesIndex[key]; ok {
 		return ref, nil
 	}
@@ -382,7 +409,7 @@ func (h *Head) GetOrCreateSeries(target TargetLabels, metricName, localName, loc
 	// why this exists and what it deliberately doesn't cover.
 	var lbls labels.Labels
 	if h.lifecycleCallback != nil {
-		lbls = buildLabels(target, metricName, localName, localLabel)
+		lbls = buildLabels(target, metricName, extra...)
 		// PreCreation (e.g. userDB's) commonly calls back into NumSeries or
 		// PostingsForMatchers, both of which need indexMu themselves - held
 		// non-reentrantly, so it must be released across this call or every
@@ -403,7 +430,7 @@ func (h *Head) GetOrCreateSeries(target TargetLabels, metricName, localName, loc
 	ref := h.nextRef
 	shard, localIdx := h.shardFor(ref)
 	shard.mu.Lock()
-	got := shard.series.Create(targetID, nameID, localNameID, localRef, hasLocal)
+	got := shard.series.Create(targetID, nameID, localRefs)
 	shard.mu.Unlock()
 	if got != localIdx {
 		// Would mean the global ref counter and a shard's own local numbering
@@ -430,7 +457,7 @@ func (h *Head) GetOrCreateSeries(target TargetLabels, metricName, localName, loc
 // "empty-valued label == absent" fix (CHECKLIST.md's Phase 7 step 5 note) - kept
 // in sync deliberately, not by accident, since both reconstruct the identical
 // shape from the identical inputs.
-func buildLabels(target TargetLabels, metricName, localName, localLabel string) labels.Labels {
+func buildLabels(target TargetLabels, metricName string, extra ...labels.Label) labels.Labels {
 	b := labels.NewScratchBuilder(8)
 	b.Add(labels.MetricName, metricName)
 	addIfNotEmptyLabel(&b, labelCluster, target.Cluster)
@@ -440,8 +467,8 @@ func buildLabels(target TargetLabels, metricName, localName, localLabel string) 
 	addIfNotEmptyLabel(&b, labelNode, target.Node)
 	addIfNotEmptyLabel(&b, labelJob, target.Job)
 	addIfNotEmptyLabel(&b, labelInstance, target.Instance)
-	if localLabel != "" {
-		b.Add(localName, localLabel)
+	for _, lb := range extra {
+		b.Add(lb.Name, lb.Value)
 	}
 	b.Sort()
 	return b.Labels()
@@ -453,19 +480,19 @@ func addIfNotEmptyLabel(b *labels.ScratchBuilder, name, value string) {
 	}
 }
 
-// LookupSeriesRef returns the series ref for (target, metricName, localName,
-// localLabel) if it's already known, without creating anything - the self-locking
-// counterpart to lookupTarget+lookupSeries for callers (storage.GetRef,
-// AppendExemplar/UpdateMetadata's label-resolution fallback) that aren't already
-// holding indexMu themselves.
-func (h *Head) LookupSeriesRef(target TargetLabels, metricName, localName, localLabel string) (uint32, bool) {
+// LookupSeriesRef returns the series ref for (target, metricName, extra) if it's
+// already known, without creating anything - the self-locking counterpart to
+// lookupTarget+lookupSeries for callers (storage.GetRef, AppendExemplar/
+// UpdateMetadata's label-resolution fallback) that aren't already holding indexMu
+// themselves.
+func (h *Head) LookupSeriesRef(target TargetLabels, metricName string, extra ...labels.Label) (uint32, bool) {
 	h.indexMu.RLock()
 	defer h.indexMu.RUnlock()
 	tRefs, ok := h.lookupTarget(target)
 	if !ok {
 		return 0, false
 	}
-	return h.lookupSeries(tRefs, metricName, localName, localLabel)
+	return h.lookupSeries(tRefs, metricName, extra...)
 }
 
 // lookupTarget returns target's symbol-ref tuple and whether it's already known,
@@ -489,10 +516,10 @@ func (h *Head) lookupTarget(target TargetLabels) ([targetFields]uint32, bool) {
 	return tRefs, true
 }
 
-// lookupSeries returns the series ref for (tRefs, metricName, localName, localLabel)
-// and whether it's already known, without creating anything. Not self-locking - see
+// lookupSeries returns the series ref for (tRefs, metricName, extra) and whether
+// it's already known, without creating anything. Not self-locking - see
 // lookupTarget.
-func (h *Head) lookupSeries(tRefs [targetFields]uint32, metricName, localName, localLabel string) (uint32, bool) {
+func (h *Head) lookupSeries(tRefs [targetFields]uint32, metricName string, extra ...labels.Label) (uint32, bool) {
 	targetID, ok := h.targetIndex[tRefs]
 	if !ok {
 		return 0, false
@@ -501,18 +528,19 @@ func (h *Head) lookupSeries(tRefs [targetFields]uint32, metricName, localName, l
 	if !ok || nameID32 > math.MaxUint16 {
 		return 0, false
 	}
-	hasLocal := localLabel != ""
-	var localNameID, localRef uint16
-	if hasLocal {
-		localNameID32, nameOK := h.symbols.Lookup(localName)
-		localRef32, refOK := h.symbols.Lookup(localLabel)
-		if !nameOK || !refOK || localNameID32 > math.MaxUint16 || localRef32 > math.MaxUint16 {
+	if len(extra) > math.MaxUint8 {
+		return 0, false
+	}
+	localRefs := make([]localLabel, len(extra))
+	for i, lb := range extra {
+		n32, nameOK := h.symbols.Lookup(lb.Name)
+		v32, valOK := h.symbols.Lookup(lb.Value)
+		if !nameOK || !valOK || n32 > math.MaxUint16 || v32 > math.MaxUint16 {
 			return 0, false
 		}
-		localNameID = uint16(localNameID32)
-		localRef = uint16(localRef32)
+		localRefs[i] = localLabel{name: uint16(n32), val: uint16(v32)}
 	}
-	ref, ok := h.seriesIndex[seriesKey{targetID, uint16(nameID32), localNameID, localRef, hasLocal}]
+	ref, ok := h.seriesIndex[seriesKey{targetID, uint16(nameID32), newLocalKey(localRefs)}]
 	return ref, ok
 }
 
@@ -605,9 +633,9 @@ func (h *Head) appendable(shard *seriesShard, localIdx uint32, ts int64, v float
 	return appendReject, storage.ErrOutOfOrderSample
 }
 
-// SeriesLabels reconstructs ref's full label set: the six target labels, __name__,
-// and the one optional extra label, in the shape splitLabels originally accepted -
-// the read-side inverse of GetOrCreateSeries's write-side resolution.
+// SeriesLabels reconstructs ref's full label set: the seven target labels,
+// __name__, and every extra label - the read-side inverse of GetOrCreateSeries's
+// write-side resolution.
 //
 // Not self-locking - callers must already hold indexMu (for symbols/targets) and
 // ref's shard's lock (for series identity fields); Querier/ChunkQuerier hold both
@@ -642,8 +670,10 @@ func (h *Head) SeriesLabels(ref uint32) labels.Labels {
 	addIfNotEmpty(labelNode, tRefs[4])
 	addIfNotEmpty(labelJob, tRefs[5])
 	addIfNotEmpty(labelInstance, tRefs[6])
-	if shard.series.HasLocal(localIdx) {
-		b.Add(h.symbols.String(uint32(shard.series.LocalName(localIdx))), h.symbols.String(uint32(shard.series.LocalRef(localIdx))))
+	n := shard.series.LocalLabelCount(localIdx)
+	for i := 0; i < n; i++ {
+		nameRef, valRef := shard.series.LocalLabelAt(localIdx, i)
+		b.Add(h.symbols.String(uint32(nameRef)), h.symbols.String(uint32(valRef)))
 	}
 	b.Sort()
 	return b.Labels()
@@ -667,8 +697,12 @@ func (h *Head) SeriesLabelValue(ref uint32, name string) string {
 		tRefs := h.targets.Get(shard.series.TargetID(localIdx))
 		return h.symbols.String(tRefs[targetLabelIndex(name)])
 	default:
-		if shard.series.HasLocal(localIdx) && h.symbols.String(uint32(shard.series.LocalName(localIdx))) == name {
-			return h.symbols.String(uint32(shard.series.LocalRef(localIdx)))
+		n := shard.series.LocalLabelCount(localIdx)
+		for i := 0; i < n; i++ {
+			nameRef, valRef := shard.series.LocalLabelAt(localIdx, i)
+			if h.symbols.String(uint32(nameRef)) == name {
+				return h.symbols.String(uint32(valRef))
+			}
 		}
 		return ""
 	}
@@ -1003,11 +1037,9 @@ func (h *Head) Truncate(mint int64) {
 				continue
 			}
 			key := seriesKey{
-				targetID:  shard.series.TargetID(localIdx),
-				nameID:    shard.series.NameID(localIdx),
-				localName: shard.series.LocalName(localIdx),
-				localRef:  shard.series.LocalRef(localIdx),
-				hasLocal:  shard.series.HasLocal(localIdx),
+				targetID: shard.series.TargetID(localIdx),
+				nameID:   shard.series.NameID(localIdx),
+				localKey: newLocalKey(shard.series.LocalLabels(localIdx)),
 			}
 			if _, ok := h.seriesIndex[key]; !ok {
 				// Already removed by an earlier Truncate call, nothing appended

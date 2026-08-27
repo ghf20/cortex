@@ -16,7 +16,7 @@ func buildOOOHead(t *testing.T) (h *Head, ref uint32) {
 	t.Helper()
 	h = NewHead(1, 1, 1)
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
-	ref, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	ref, err := h.GetOrCreateSeries(tgt, "up")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestHeadMinMaxTime(t *testing.T) {
 	}
 
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
-	refA, err := h.GetOrCreateSeries(tgt, "up", "", "")
+	refA, err := h.GetOrCreateSeries(tgt, "up")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestHeadMinMaxTime(t *testing.T) {
 
 	// A histogram sample on a DIFFERENT series, later in time, must extend
 	// MaxTime too - not just the float path.
-	refB, err := h.GetOrCreateSeries(tgt, "request_latency", "", "")
+	refB, err := h.GetOrCreateSeries(tgt, "request_latency")
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries: %v", err)
 	}

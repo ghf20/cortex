@@ -33,7 +33,7 @@ func benchHeadAtScale(b *testing.B) *Head {
 			Job:       "cadvisor",
 		}
 		metric := fmt.Sprintf("container_metric_name_number_%03d_total", i%numMetrics)
-		if _, err := h.GetOrCreateSeries(tgt, metric, "", ""); err != nil {
+		if _, err := h.GetOrCreateSeries(tgt, metric); err != nil {
 			b.Fatalf("series %d: %v", i, err)
 		}
 	}

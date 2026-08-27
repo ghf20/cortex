@@ -24,11 +24,11 @@ import (
 func TestHeadShardWritesAreIndependent(t *testing.T) {
 	h := NewHeadWithShards(4, 1, 8, 2) // exactly 2 shards, so placement is deterministic
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
-	refA, err := h.GetOrCreateSeries(tgt, "series_a", "", "") // ref 0 -> shard 0
+	refA, err := h.GetOrCreateSeries(tgt, "series_a") // ref 0 -> shard 0
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries(A): %v", err)
 	}
-	refB, err := h.GetOrCreateSeries(tgt, "series_b", "", "") // ref 1 -> shard 1
+	refB, err := h.GetOrCreateSeries(tgt, "series_b") // ref 1 -> shard 1
 	if err != nil {
 		t.Fatalf("GetOrCreateSeries(B): %v", err)
 	}
@@ -94,7 +94,7 @@ func TestHeadConcurrentAppendQueryTruncateCompact(t *testing.T) {
 	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
 	refs := make([]uint32, numSeries)
 	for i := 0; i < numSeries; i++ {
-		ref, err := h.GetOrCreateSeries(tgt, fmt.Sprintf("series_%d", i), "", "")
+		ref, err := h.GetOrCreateSeries(tgt, fmt.Sprintf("series_%d", i))
 		if err != nil {
 			t.Fatalf("GetOrCreateSeries: %v", err)
 		}
