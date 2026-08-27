@@ -162,13 +162,14 @@ func (s *histoSeries) lastSegment() *histoSegment {
 	return s.segments[len(s.segments)-1]
 }
 
-// HistogramStore holds histogram-typed series, keyed by the same series refs Head's
-// SeriesStore assigns for float series - a given series is either float-typed (in
-// SeriesStore) or histogram-typed (here), matching real Prometheus semantics that a
-// series' sample type doesn't change mid-stream. A plain Go map, not a columnar slab:
-// per-series state here (spans, scratch bucket slices) doesn't fit a fixed-width
-// record the way float series do, and histogram series are the minority case this
-// prototype is scoped for.
+// HistogramStore holds a series' histogram-typed samples, keyed by the same series
+// refs Head's SeriesStore assigns for float samples - a series with samples of both
+// kinds has an entry in BOTH stores (see querier.go's mixedTypeIterator; the two
+// stores being separate is a storage-layer split, not a "one series, one type"
+// constraint the way an earlier version of this comment claimed). A plain Go map,
+// not a columnar slab: per-series state here (spans, scratch bucket slices) doesn't
+// fit a fixed-width record the way float series do, and histogram series are the
+// minority case this prototype is scoped for.
 type HistogramStore struct {
 	series map[uint32]*histoSeries
 }
@@ -189,6 +190,21 @@ func (hst *HistogramStore) NumSeries() int {
 func (hst *HistogramStore) Has(ref uint32) bool {
 	_, ok := hst.series[ref]
 	return ok
+}
+
+// LastTimestamp returns ref's most recently appended histogram sample's
+// timestamp, and whether ref has any histogram samples at all - the
+// append-ordering/cross-type-collision checks in Head.appendable/
+// appendableHistogram need exactly this, without reaching past HistogramStore's
+// field boundary into histoSegment's own shape.
+func (hst *HistogramStore) LastTimestamp(ref uint32) (int64, bool) {
+	s, ok := hst.series[ref]
+	if !ok {
+		return 0, false
+	}
+	// lastSegment's own doc comment: a stored *histoSeries never has zero
+	// segments, so this is never nil here.
+	return s.lastSegment().ts.lastTS, true
 }
 
 // IsFloat reports whether ref's histogram samples are FloatHistogram-typed (true) or

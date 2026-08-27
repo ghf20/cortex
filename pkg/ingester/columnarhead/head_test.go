@@ -8,6 +8,7 @@ import (
 
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunks"
 )
 
@@ -445,6 +446,87 @@ func TestHeadAppendAndIterate(t *testing.T) {
 		got = append(got, sample{ts, v})
 	}
 	assertSamplesEqual(t, got, want)
+}
+
+// TestHeadRejectsHistogramBackwardsTimestamp is CHECKLIST.md's port of real
+// Prometheus's TestHeadAppender_AppendFloatWithSameTimestampAsPreviousHistogram
+// (tsdb/head_test.go), extended: found while porting that HistogramStore.Append
+// had NO ordering check at all, not just the specific cross-type gap that test
+// covers - confirmed via a direct repro (not assumed) that a backward timestamp
+// was silently accepted, corrupting the stored, supposedly-monotonic delta-of-
+// delta-encoded sequence.
+func TestHeadRejectsHistogramBackwardsTimestamp(t *testing.T) {
+	h := NewHead(1, 1, 1)
+	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
+	ref, err := h.GetOrCreateSeries(tgt, "request_latency")
+	if err != nil {
+		t.Fatalf("GetOrCreateSeries: %v", err)
+	}
+
+	hg1 := &histogram.Histogram{Schema: 0, Sum: 1, Count: 1}
+	if err := h.AppendHistogram(ref, 2000, hg1); err != nil {
+		t.Fatalf("AppendHistogram @2000: %v", err)
+	}
+	hg2 := &histogram.Histogram{Schema: 0, Sum: 2, Count: 2}
+	if err := h.AppendHistogram(ref, 1000, hg2); err != storage.ErrOutOfOrderSample {
+		t.Fatalf("AppendHistogram @1000 (backwards) = %v, want ErrOutOfOrderSample", err)
+	}
+	if err := h.AppendHistogram(ref, 2000, hg2); err != storage.ErrDuplicateSampleForTimestamp {
+		t.Fatalf("AppendHistogram @2000 (duplicate ts) = %v, want ErrDuplicateSampleForTimestamp", err)
+	}
+
+	it := h.HistogramIterator(ref)
+	n := 0
+	for it.Next() {
+		ts, hg := it.At()
+		if ts != 2000 || hg.Sum != 1 || hg.Count != 1 {
+			t.Fatalf("sample %d: ts=%d sum=%v count=%v, want the ORIGINAL @2000 sample unchanged - a rejected append must not corrupt what's already stored", n, ts, hg.Sum, hg.Count)
+		}
+		n++
+	}
+	if n != 1 {
+		t.Fatalf("HistogramIterator returned %d samples, want exactly 1 (the rejected appends above must not have landed)", n)
+	}
+}
+
+// TestHeadRejectsCrossTypeSameTimestamp is CHECKLIST.md's port of real
+// Prometheus's TestHeadAppender_AppendFloatWithSameTimestampAsPreviousHistogram
+// (tsdb/head_test.go): a single (series, timestamp) slot is exactly one type -
+// found missing here entirely (a float landing at the same ts as an existing
+// histogram sample, and vice versa, were both silently accepted before this,
+// landing an ambiguous sample mixed_iterator.go's own tie-break comment assumed
+// could never happen).
+func TestHeadRejectsCrossTypeSameTimestamp(t *testing.T) {
+	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
+	t.Run("float after histogram", func(t *testing.T) {
+		h := NewHead(1, 1, 1)
+		ref, err := h.GetOrCreateSeries(tgt, "request_latency")
+		if err != nil {
+			t.Fatalf("GetOrCreateSeries: %v", err)
+		}
+		hg := &histogram.Histogram{Schema: 0, Sum: 1, Count: 1}
+		if err := h.AppendHistogram(ref, 2000, hg); err != nil {
+			t.Fatalf("AppendHistogram @2000: %v", err)
+		}
+		wantErr := storage.NewDuplicateHistogramToFloatErr(2000, 10.0)
+		if err := h.Append(ref, 2000, 10.0); err == nil || err.Error() != wantErr.Error() {
+			t.Fatalf("Append(float @2000, same ts as histogram) = %v, want %v", err, wantErr)
+		}
+	})
+	t.Run("histogram after float", func(t *testing.T) {
+		h := NewHead(1, 1, 1)
+		ref, err := h.GetOrCreateSeries(tgt, "request_latency")
+		if err != nil {
+			t.Fatalf("GetOrCreateSeries: %v", err)
+		}
+		if err := h.Append(ref, 2000, 10.0); err != nil {
+			t.Fatalf("Append @2000: %v", err)
+		}
+		hg := &histogram.Histogram{Schema: 0, Sum: 1, Count: 1}
+		if err := h.AppendHistogram(ref, 2000, hg); err != storage.ErrDuplicateSampleForTimestamp {
+			t.Fatalf("AppendHistogram(@2000, same ts as float) = %v, want ErrDuplicateSampleForTimestamp", err)
+		}
+	})
 }
 
 // TestHeadTruncate covers Head.Truncate's role as orchestrator across both stores:

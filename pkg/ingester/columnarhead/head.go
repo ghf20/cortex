@@ -608,7 +608,23 @@ const (
 // here, mirroring that real Prometheus doesn't detect it either.
 //
 // Not self-locking - the caller (Append) already holds shard's lock.
+//
+// A single (series, timestamp) slot is exactly one type - real tsdb.Head refuses a
+// float sample at the same timestamp as an existing histogram sample
+// (storage.NewDuplicateHistogramToFloatErr, vendor/.../tsdb/head_append.go). This
+// package splits float and histogram storage into separate stores (SeriesStore/
+// HistogramStore) that don't share a single "last sample" pointer the way real
+// tsdb.Head's memSeries does, so the check below is explicit: does ts collide with
+// the histogram side's own most recent timestamp - the histogram-side analogue of
+// this function's own "only the latest sample is checked, not full history" scope
+// note below. Found missing entirely while porting
+// TestHeadAppender_AppendFloatWithSameTimestampAsPreviousHistogram (CHECKLIST.md) -
+// previously silently accepted, landing an ambiguous sample mixedTypeIterator's own
+// tie-break comment assumed could never happen.
 func (h *Head) appendable(shard *seriesShard, localIdx uint32, ts int64, v float64) (appendAction, error) {
+	if histTS, histOK := shard.histograms.LastTimestamp(localIdx); histOK && ts == histTS {
+		return appendReject, storage.NewDuplicateHistogramToFloatErr(ts, v)
+	}
 	lastTS, lastBits, ok := shard.series.LastSample(localIdx)
 	if !ok {
 		return appendInOrder, nil
@@ -839,6 +855,49 @@ func (h *Head) SetExemplarCapacity(n int) {
 	h.exemplars.resize(n)
 }
 
+// appendableHistogram decides whether ts is acceptable for a new histogram sample
+// on (shard, localIdx) - mirroring appendable's real-Prometheus-derived semantics,
+// adapted to the histogram path: forward-only (histogram OOO is a stated, deferred
+// scope - see ooo.go's own "floats only first" doc comment, so a backward
+// timestamp is rejected rather than accepted into an OOO buffer), and a
+// same-timestamp append is rejected too. Real Prometheus allows an EXACT-value
+// duplicate at the same timestamp as a silent no-op there
+// (memSeries.appendableHistogram, vendor/.../tsdb/head_append.go); this doesn't
+// attempt that leniency - comparing two full histograms for equality needs
+// decoding the just-written segment state back out, real but not-yet-built
+// complexity (CHECKLIST.md) - so ANY same-timestamp histogram append is rejected,
+// a real, narrower-than-upstream-but-safe scope limit, not a bug: it can reject a
+// legitimate retry/federation duplicate that real Prometheus would silently
+// accept, but never corrupts stored data, which silently accepting an unchecked
+// timestamp would.
+//
+// Also checks the float side for appendable's own cross-type collision, in the
+// other direction: a histogram sample can't share a timestamp with an existing
+// float sample either.
+//
+// Found this whole function's absence - not just the cross-type gap - while
+// porting TestHeadAppender_AppendFloatWithSameTimestampAsPreviousHistogram
+// (CHECKLIST.md): HistogramStore.Append had NO ordering check at all before this,
+// confirmed via a direct repro (not assumed) to silently accept a backward
+// timestamp and corrupt the stored, supposedly-monotonic sequence.
+//
+// Not self-locking - callers (AppendHistogram/AppendFloatHistogram) already hold
+// shard's lock.
+func (h *Head) appendableHistogram(shard *seriesShard, localIdx uint32, ts int64) error {
+	if lastTS, ok := shard.histograms.LastTimestamp(localIdx); ok {
+		switch {
+		case ts < lastTS:
+			return storage.ErrOutOfOrderSample
+		case ts == lastTS:
+			return storage.ErrDuplicateSampleForTimestamp
+		}
+	}
+	if floatTS, _, ok := shard.series.LastSample(localIdx); ok && ts == floatTS {
+		return storage.ErrDuplicateSampleForTimestamp
+	}
+	return nil
+}
+
 // AppendHistogram encodes one integer-count histogram sample for the series at ref.
 // See HistogramStore/histoSegment's doc comments for what this does and does not
 // support (a schema/zero-threshold/span change, or a custom-bucket-boundary
@@ -847,9 +906,11 @@ func (h *Head) SetExemplarCapacity(n int) {
 func (h *Head) AppendHistogram(ref uint32, ts int64, hg *histogram.Histogram) error {
 	shard, localIdx := h.shardFor(ref)
 	shard.mu.Lock()
-	err := shard.histograms.Append(localIdx, ts, hg)
-	shard.mu.Unlock()
-	if err != nil {
+	defer shard.mu.Unlock()
+	if err := h.appendableHistogram(shard, localIdx, ts); err != nil {
+		return err
+	}
+	if err := shard.histograms.Append(localIdx, ts, hg); err != nil {
 		return err
 	}
 	h.updateMinMaxTime(ts)
@@ -862,9 +923,11 @@ func (h *Head) AppendHistogram(ref uint32, ts int64, hg *histogram.Histogram) er
 func (h *Head) AppendFloatHistogram(ref uint32, ts int64, hg *histogram.FloatHistogram) error {
 	shard, localIdx := h.shardFor(ref)
 	shard.mu.Lock()
-	err := shard.histograms.AppendFloat(localIdx, ts, hg)
-	shard.mu.Unlock()
-	if err != nil {
+	defer shard.mu.Unlock()
+	if err := h.appendableHistogram(shard, localIdx, ts); err != nil {
+		return err
+	}
+	if err := shard.histograms.AppendFloat(localIdx, ts, hg); err != nil {
 		return err
 	}
 	h.updateMinMaxTime(ts)
