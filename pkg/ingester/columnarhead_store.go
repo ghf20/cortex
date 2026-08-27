@@ -118,6 +118,16 @@ func newColumnarheadTSDBStore(
 		rngs = []int64{minBlockDuration}
 	}
 
+	// Head.SetChunkRange - the same value CompactHeadRange writes head blocks
+	// at (this function's own chunkRange field below) - gives a brand-new
+	// series' first sample a real admission cushion (Head.appendableNewSeries)
+	// instead of unconditionally treating it as in-order regardless of how far
+	// behind the head's current data it is. Without this call the cushion
+	// defaults to disabled (Head.chunkRange's own doc comment) - every real
+	// production tenant needs it, so it's wired here at construction, not left
+	// for a caller to remember.
+	head.SetChunkRange(rngs[0])
+
 	compactor, err := tsdb.NewLeveledCompactorWithOptions(context.Background(), reg, logger, rngs, chunkenc.NewPool(), tsdb.LeveledCompactorOptions{
 		// Same deliberate choice real Cortex's own *tsdb.DB construction makes
 		// (ingester.go's tsdb.Open call) - let compactors handle overlaps

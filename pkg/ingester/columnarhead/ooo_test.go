@@ -169,6 +169,116 @@ func TestHeadRejectsOOOSampleOlderThanWindow(t *testing.T) {
 	}
 }
 
+// TestHeadNewSeriesFirstSampleRespectsChunkRangeCushion ports real Prometheus's
+// TestOOOAppendWithNoSeries (tsdb/head_test.go): a brand-new series' first
+// sample - no prior history at all - still needs SOME admission bound, or an
+// arbitrarily old first sample would silently land as if it were the most
+// recent thing ever seen. Real Prometheus gates this on
+// minValidTime = headMaxt - chunkRange/2 before falling through to the same
+// too-old/OOO logic an existing series' backward timestamp hits - mirrored here
+// via Head.chunkRange/SetChunkRange/appendableNewSeries.
+//
+// Found while investigating this gap: a first fix attempt comparing directly
+// against h.maxTime.Load() with NO cushion regressed ~10 other tests (loading
+// independent new series with ordinary small differences in their first
+// timestamps is common and legitimate) - see CHECKLIST.md and
+// appendableNewSeries' own doc comment for the full story. chunkRange defaults
+// to 0 (no cushion, old behavior) unless SetChunkRange is called, which is why
+// this test calls it explicitly while the rest of the suite is unaffected.
+func TestHeadNewSeriesFirstSampleRespectsChunkRangeCushion(t *testing.T) {
+	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
+	h := NewHead(6, 1, 1)
+	h.SetOOOTimeWindow(120 * 60 * 1000) // 120 minutes, matching the real test
+	h.SetChunkRange(120 * 60 * 1000)    // 2h, matching real DefaultBlockDuration -> cushion = 60m
+
+	minute := int64(60 * 1000)
+	newSeries := func(name string) uint32 {
+		ref, err := h.GetOrCreateSeries(tgt, name)
+		if err != nil {
+			t.Fatalf("GetOrCreateSeries(%s): %v", name, err)
+		}
+		return ref
+	}
+
+	s1 := newSeries("s1")
+	if err := h.Append(s1, 300*minute, 1); err != nil {
+		t.Fatalf("s1@300m (first-ever head sample, always in-order): %v", err)
+	}
+
+	// 61m behind the new maxTime (300m), outside the 60m cushion but within the
+	// 120m OOO window - must land OOO, not in-order and not rejected.
+	s2 := newSeries("s2")
+	if err := h.Append(s2, 239*minute, 2); err != nil {
+		t.Fatalf("s2@239m (should be OOO): %v", err)
+	}
+	if len(h.OOOSamples(s2)) != 1 {
+		t.Fatalf("s2@239m: OOOSamples = %d, want 1", len(h.OOOSamples(s2)))
+	}
+
+	// Exactly at the OOO window boundary (120m behind maxTime) - still OOO.
+	s3 := newSeries("s3")
+	if err := h.Append(s3, 180*minute, 3); err != nil {
+		t.Fatalf("s3@180m (window boundary, should be OOO): %v", err)
+	}
+	if len(h.OOOSamples(s3)) != 1 {
+		t.Fatalf("s3@180m: OOOSamples = %d, want 1", len(h.OOOSamples(s3)))
+	}
+
+	// 1 minute past the OOO window - rejected outright.
+	s4 := newSeries("s4")
+	if err := h.Append(s4, 179*minute, 4); !errors.Is(err, storage.ErrTooOldSample) {
+		t.Fatalf("s4@179m (outside window) = %v, want storage.ErrTooOldSample", err)
+	}
+
+	// 60m behind maxTime - within the chunkRange/2 cushion, so still in-order,
+	// NOT OOO. This is the case a cushion-free maxTime comparison gets wrong.
+	s5 := newSeries("s5")
+	if err := h.Append(s5, 240*minute, 5); err != nil {
+		t.Fatalf("s5@240m (within cushion, should be in-order): %v", err)
+	}
+	if len(h.OOOSamples(s5)) != 0 {
+		t.Fatalf("s5@240m: OOOSamples = %d, want 0 (should be in-order)", len(h.OOOSamples(s5)))
+	}
+}
+
+// TestHeadNewHistogramSeriesFirstSampleRespectsChunkRangeCushion is
+// TestHeadNewSeriesFirstSampleRespectsChunkRangeCushion's histogram
+// counterpart. Histogram OOO isn't built here (ooo.go's own "floats only
+// first" scope), so there's no OOO landing spot for an accepted-but-behind
+// sample - a new histogram series' first sample outside the cushion is
+// rejected outright instead.
+func TestHeadNewHistogramSeriesFirstSampleRespectsChunkRangeCushion(t *testing.T) {
+	tgt := TargetLabels{Cluster: "c", Namespace: "n", Pod: "p", Container: "co", Node: "no", Job: "j"}
+	h := NewHead(2, 1, 1)
+	h.SetChunkRange(120 * 60 * 1000) // 2h -> cushion = 60m
+
+	minute := int64(60 * 1000)
+	newSeries := func(name string) uint32 {
+		ref, err := h.GetOrCreateSeries(tgt, name)
+		if err != nil {
+			t.Fatalf("GetOrCreateSeries(%s): %v", name, err)
+		}
+		return ref
+	}
+
+	s1 := newSeries("s1")
+	if err := h.AppendHistogram(s1, 300*minute, &histogram.Histogram{Schema: 0, Sum: 1, Count: 1}); err != nil {
+		t.Fatalf("s1@300m (first-ever head sample): %v", err)
+	}
+
+	// 61m behind maxTime, outside the 60m cushion, no OOO to fall back to.
+	s2 := newSeries("s2")
+	if err := h.AppendHistogram(s2, 239*minute, &histogram.Histogram{Schema: 0, Sum: 2, Count: 1}); !errors.Is(err, storage.ErrOutOfOrderSample) {
+		t.Fatalf("s2@239m (outside cushion) = %v, want storage.ErrOutOfOrderSample", err)
+	}
+
+	// 60m behind maxTime, within the cushion - in-order.
+	s3 := newSeries("s3")
+	if err := h.AppendHistogram(s3, 240*minute, &histogram.Histogram{Schema: 0, Sum: 3, Count: 1}); err != nil {
+		t.Fatalf("s3@240m (within cushion): %v", err)
+	}
+}
+
 // TestOOOSeriesBufferRejectsDuplicateWithinBuffer is a focused unit check on
 // oooSeriesBuffer.insert directly, mirroring real Prometheus's own OOOChunk.Insert
 // behavior: an exact-timestamp duplicate within the OOO buffer itself (not just

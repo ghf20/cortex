@@ -161,6 +161,21 @@ type Head struct {
 	// append regardless of shard, so a mutex here would be a new bottleneck.
 	oooTimeWindow atomic.Int64
 
+	// chunkRange is the cushion a brand-new series' first sample gets before
+	// Head.appendable/appendableHistogram/appendableFloatHistogram treat it as
+	// "too old" rather than unconditionally in-order - see appendableNewSeries'
+	// doc comment for the full reasoning. 0 (NewHead's default) means NO
+	// cushion is enforced: a brand-new series' first sample is always in-order
+	// regardless of how far behind the head's current maxTime it is, matching
+	// this package's ORIGINAL behavior before this field existed. Set via
+	// SetChunkRange - real callers (columnarheadTSDBStore) always set this to
+	// their configured minimum block duration, mirroring where real
+	// tsdb.Options.MinBlockDuration ends up (h.chunkRange there too). Tests
+	// that construct a bare Head and never call SetChunkRange keep the old,
+	// no-cushion behavior unchanged - this field is opt-in, not a silent
+	// behavior change for every existing caller.
+	chunkRange atomic.Int64
+
 	// minTime, maxTime track the earliest and latest timestamp ever accepted
 	// (in-order or OOO) across the whole head - maintained incrementally in
 	// Append/AppendHistogram/SetSTZeroSample via lock-free CAS, not computed by a
@@ -269,6 +284,16 @@ func (h *Head) shardFor(ref uint32) (*seriesShard, uint32) {
 // without that wiring.
 func (h *Head) SetOOOTimeWindow(w int64) {
 	h.oooTimeWindow.Store(w)
+}
+
+// SetChunkRange configures the cushion (r/2) a brand-new series' first sample gets
+// before being treated as "too old" instead of unconditionally in-order - see
+// chunkRange's own doc comment and appendableNewSeries. 0 (NewHead's default)
+// means no cushion. Real callers pass their configured minimum block duration
+// (columnarheadTSDBStore's own chunkRange field), matching where real
+// tsdb.Options.MinBlockDuration ends up (real Head.chunkRange).
+func (h *Head) SetChunkRange(r int64) {
+	h.chunkRange.Store(r)
 }
 
 // SeriesLifecycleCallback mirrors real tsdb.SeriesLifecycleCallback's exact 3-method
@@ -588,7 +613,7 @@ const (
 // appendable decides how (ts, v) relates to (shard, localIdx)'s existing in-order
 // float stream, matching real Prometheus's own memSeries.appendable semantics
 // (vendor/.../tsdb/head_append.go) rather than inventing new ones:
-//   - no samples yet: always in-order.
+//   - no samples yet: see appendableNewSeries.
 //   - ts strictly after the last in-order timestamp: in-order.
 //   - ts equal to the last in-order timestamp: identical value is a silent
 //     no-op (allowed - federation and retries produce exact duplicates in
@@ -627,7 +652,7 @@ func (h *Head) appendable(shard *seriesShard, localIdx uint32, ts int64, v float
 	}
 	lastTS, lastBits, ok := shard.series.LastSample(localIdx)
 	if !ok {
-		return appendInOrder, nil
+		return h.appendableNewSeries(ts)
 	}
 	if ts > lastTS {
 		return appendInOrder, nil
@@ -638,6 +663,17 @@ func (h *Head) appendable(shard *seriesShard, localIdx uint32, ts int64, v float
 		}
 		return appendReject, storage.NewDuplicateFloatErr(ts, math.Float64frombits(lastBits), v)
 	}
+	return h.tooOldOrOOO(ts)
+}
+
+// tooOldOrOOO decides whether ts, already known to be behind the in-order
+// boundary, lands in the OOO buffer or is rejected outright: accepted if within
+// oooTimeWindow of the head's current max timestamp, otherwise
+// storage.ErrOutOfOrderSample (oooTimeWindow == 0, real Prometheus's own
+// default) or storage.ErrTooOldSample (outside the window but OOO is enabled) -
+// matching appendable's own doc comment. Shared by appendable's own
+// backward-timestamp case and appendableNewSeries' too-old-for-the-cushion case.
+func (h *Head) tooOldOrOOO(ts int64) (appendAction, error) {
 	maxTime := h.maxTime.Load()
 	window := h.oooTimeWindow.Load()
 	if window > 0 && ts >= maxTime-window {
@@ -647,6 +683,58 @@ func (h *Head) appendable(shard *seriesShard, localIdx uint32, ts int64, v float
 		return appendReject, storage.ErrTooOldSample
 	}
 	return appendReject, storage.ErrOutOfOrderSample
+}
+
+// appendableNewSeries decides whether ts is acceptable as a brand-new series'
+// first EVER sample (no prior in-order sample in SeriesStore for this ref) -
+// the case appendable's own doc comment used to describe as unconditionally
+// "always in-order," found too permissive while porting real Prometheus's
+// TestOOOAppendWithNoSeries (tsdb/head_test.go): a series with zero history
+// still needs SOME bound, or an arbitrarily old first sample (hours, days, or
+// more behind the head's current data) silently lands as if it were the most
+// recent thing ever seen.
+//
+// Real Prometheus solves this with a cushion before a new series' sample is
+// treated as in-order: minValidTime = headMaxt - chunkRange/2 ("avoid
+// overlapping timeframes from one block to the next" - head_append.go's
+// appendableMinValidTime), falling through to the SAME too-old/OOO logic an
+// EXISTING series' backward timestamp hits once ts is behind that cushion.
+// Mirrored here via chunkRange (this Head's own field, not reusing
+// oooTimeWindow - they're conceptually different: one is about admission
+// cushioning for compaction-window overlap, the other is about how far back an
+// already-known series may receive a genuinely out-of-order sample).
+//
+// chunkRange == 0 (NewHead's default, unless SetChunkRange is called) means NO
+// cushion is enforced: ts >= h.maxTime.Load() is the only check, i.e. this
+// function is equivalent to the unconditional "always in-order" appendable used
+// to do. This is deliberate, not a compromise: a first, naive fix comparing
+// directly against h.maxTime.Load() with NO cushion at all was tried and
+// reverted (CHECKLIST.md) - it rejected the extremely common case of loading
+// several independent new series whose first samples differ by ordinary
+// seconds-to-minutes amounts (promqltest's own load blocks, this package's own
+// test helpers) as "out of order," even at the default oooTimeWindow=0,
+// breaking ~10 previously-passing tests including the full promqltest
+// acceptance suite. Every existing test/caller that never calls SetChunkRange
+// keeps that original behavior completely unchanged; the real gap is closed
+// only for callers that actually configure a chunk range - which every real
+// production caller (columnarheadTSDBStore, from its own already-configured
+// minimum block duration) already does.
+//
+// h.maxTime.Load() == math.MinInt64 (a genuinely empty head, NewHead's Reset
+// default) is special-cased to skip the cushion check entirely, not just
+// happen to satisfy it: MinInt64 - cr/2 would wrap around to a huge positive
+// number (Go's defined int64 overflow behavior), which would incorrectly
+// reject the very first sample ever appended to the head.
+func (h *Head) appendableNewSeries(ts int64) (appendAction, error) {
+	cr := h.chunkRange.Load()
+	maxTime := h.maxTime.Load()
+	if cr <= 0 || maxTime == math.MinInt64 {
+		return appendInOrder, nil
+	}
+	if ts >= maxTime-cr/2 {
+		return appendInOrder, nil
+	}
+	return h.tooOldOrOOO(ts)
 }
 
 // SeriesLabels reconstructs ref's full label set: the seven target labels,
@@ -887,7 +975,8 @@ func (h *Head) SetExemplarCapacity(n int) {
 // Not self-locking - callers (AppendHistogram/AppendFloatHistogram) already hold
 // shard's lock.
 func (h *Head) appendableHistogram(shard *seriesShard, localIdx uint32, ts int64, hg *histogram.Histogram) (appendAction, error) {
-	if lastTS, ok := shard.histograms.LastTimestamp(localIdx); ok {
+	lastTS, ok := shard.histograms.LastTimestamp(localIdx)
+	if ok {
 		switch {
 		case ts < lastTS:
 			return appendReject, storage.ErrOutOfOrderSample
@@ -898,8 +987,11 @@ func (h *Head) appendableHistogram(shard *seriesShard, localIdx uint32, ts int64
 			return appendReject, storage.ErrDuplicateSampleForTimestamp
 		}
 	}
-	if floatTS, _, ok := shard.series.LastSample(localIdx); ok && ts == floatTS {
+	if floatTS, _, floatOK := shard.series.LastSample(localIdx); floatOK && ts == floatTS {
 		return appendReject, storage.ErrDuplicateSampleForTimestamp
+	}
+	if !ok {
+		return h.appendableNewHistogramSeries(ts)
 	}
 	return appendInOrder, nil
 }
@@ -907,7 +999,8 @@ func (h *Head) appendableHistogram(shard *seriesShard, localIdx uint32, ts int64
 // appendableFloatHistogram is appendableHistogram's FloatHistogram counterpart -
 // see its doc comment. Equality is HistogramStore.LastEqualsFloat.
 func (h *Head) appendableFloatHistogram(shard *seriesShard, localIdx uint32, ts int64, hg *histogram.FloatHistogram) (appendAction, error) {
-	if lastTS, ok := shard.histograms.LastTimestamp(localIdx); ok {
+	lastTS, ok := shard.histograms.LastTimestamp(localIdx)
+	if ok {
 		switch {
 		case ts < lastTS:
 			return appendReject, storage.ErrOutOfOrderSample
@@ -918,10 +1011,34 @@ func (h *Head) appendableFloatHistogram(shard *seriesShard, localIdx uint32, ts 
 			return appendReject, storage.ErrDuplicateSampleForTimestamp
 		}
 	}
-	if floatTS, _, ok := shard.series.LastSample(localIdx); ok && ts == floatTS {
+	if floatTS, _, floatOK := shard.series.LastSample(localIdx); floatOK && ts == floatTS {
 		return appendReject, storage.ErrDuplicateSampleForTimestamp
 	}
+	if !ok {
+		return h.appendableNewHistogramSeries(ts)
+	}
 	return appendInOrder, nil
+}
+
+// appendableNewHistogramSeries is appendableNewSeries' histogram counterpart -
+// see its doc comment for the shared reasoning (chunkRange cushion, opt-in via
+// SetChunkRange, why a naive maxTime-only comparison regressed elsewhere).
+// Histogram OOO isn't built here (ooo.go's own "floats only first" scope) -
+// unlike the float path, there's no OOO buffer to route an accepted-but-behind
+// sample into, so a new histogram series' first sample outside the cushion is
+// rejected outright (storage.ErrOutOfOrderSample, matching this function's own
+// callers' EXISTING-series backward-timestamp case) rather than calling
+// tooOldOrOOO.
+func (h *Head) appendableNewHistogramSeries(ts int64) (appendAction, error) {
+	cr := h.chunkRange.Load()
+	maxTime := h.maxTime.Load()
+	if cr <= 0 || maxTime == math.MinInt64 {
+		return appendInOrder, nil
+	}
+	if ts >= maxTime-cr/2 {
+		return appendInOrder, nil
+	}
+	return appendReject, storage.ErrOutOfOrderSample
 }
 
 // AppendHistogram encodes one integer-count histogram sample for the series at ref.
