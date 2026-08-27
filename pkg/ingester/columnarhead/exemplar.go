@@ -90,6 +90,39 @@ func (es *exemplarStorage) all() []exemplarEntry {
 	return out
 }
 
+// resize changes the ring's capacity, preserving as many of the most recent
+// entries as fit in the new size - the columnar-head counterpart to real
+// tsdb.exemplar.CircularExemplarStorage.Resize (called from the same place:
+// ingester.go's periodic per-tenant limits refresh, updateUserTSDBConfigs), not
+// a byte-for-byte port of its algorithm. A shrink keeps the newest entries
+// (the ring's own eviction order already discards the oldest first); a grow
+// keeps everything and gains headroom. A no-op if newCapacity already matches
+// the current size - the common case, since this runs on every limits refresh
+// tick even when nothing changed.
+func (es *exemplarStorage) resize(newCapacity int) {
+	if newCapacity == len(es.entries) {
+		return
+	}
+	if newCapacity < 0 {
+		newCapacity = 0
+	}
+	current := es.all() // oldest first
+	if len(current) > newCapacity {
+		current = current[len(current)-newCapacity:]
+	}
+	es.entries = make([]exemplarEntry, newCapacity)
+	es.next = 0
+	es.filled = false
+	for _, e := range current {
+		es.entries[es.next] = e
+		es.next++
+		if es.next >= len(es.entries) {
+			es.next = 0
+			es.filled = true
+		}
+	}
+}
+
 // Len returns the number of exemplars currently retained (across all series).
 func (es *exemplarStorage) Len() int {
 	if es.filled {

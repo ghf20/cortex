@@ -779,6 +779,22 @@ func (h *Head) Exemplars(ref uint32) []exemplarEntry {
 	return h.exemplars.forSeries(ref)
 }
 
+// SetExemplarCapacity resizes h's exemplar ring to hold at most n exemplars
+// total - the columnar-head counterpart to real tsdb.Head's per-tenant
+// MaxExemplars, wired from ingester.go's periodic per-tenant limits refresh
+// (updateUserTSDBConfigs) the same way SetOOOTimeWindow is. A previously-real
+// gap (external review, "exemplar ring ignores per-tenant max_exemplars"):
+// exemplarStorage was created once at construction with a fixed
+// defaultExemplarCapacity and never resized, so a tenant configured with a
+// smaller or larger max_exemplars got the placeholder default regardless.
+// Self-locking (indexMu - exemplars aren't sharded, see Head's doc comment on
+// why).
+func (h *Head) SetExemplarCapacity(n int) {
+	h.indexMu.Lock()
+	defer h.indexMu.Unlock()
+	h.exemplars.resize(n)
+}
+
 // AppendHistogram encodes one integer-count histogram sample for the series at ref.
 // See HistogramStore/histoSegment's doc comments for what this does and does not
 // support (a schema/zero-threshold/span change mid-series starts a new segment;

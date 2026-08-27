@@ -17,6 +17,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/promslog"
+	"github.com/prometheus/prometheus/config"
+	"github.com/prometheus/prometheus/model/exemplar"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
@@ -453,6 +455,49 @@ func TestColumnarheadTSDBStorePostingsForMatchers(t *testing.T) {
 	require.NoError(t, p.Err())
 	if count != 1 {
 		t.Fatalf("got %d postings, want 1", count)
+	}
+}
+
+// TestColumnarheadTSDBStoreApplyConfigResizesExemplarCapacity confirms
+// ApplyConfig's MaxExemplars field actually reaches the underlying exemplar
+// ring (Head.SetExemplarCapacity) - a real, previously-missing wiring an
+// external review found: the columnar backend created a fixed
+// defaultExemplarCapacity ring at construction and never resized it, even
+// though ingester.go's updateUserTSDBConfigs already calls ApplyConfig with a
+// real per-tenant MaxExemplars on every periodic limits-refresh tick, for
+// both backends.
+func TestColumnarheadTSDBStoreApplyConfigResizesExemplarCapacity(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestColumnarheadStore(t, dir, 2*60*60*1000)
+	defer s.Close()
+
+	l := seriesLabels("up", "p")
+	app := s.Appender(context.Background())
+	ref, err := app.Append(0, l, 1700000000000, 1)
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	base := int64(1700000000000)
+	for i := 0; i < 5; i++ {
+		e := exemplar.Exemplar{Ts: base + int64(i), Value: float64(i), Labels: labels.FromStrings("trace_id", fmt.Sprintf("t%d", i))}
+		if _, err := app.AppendExemplar(ref, l, e); err != nil {
+			t.Fatalf("AppendExemplar %d: %v", i, err)
+		}
+	}
+	internalRef := uint32(ref) - 1
+	if got := s.head.Exemplars(internalRef); len(got) != 5 {
+		t.Fatalf("Exemplars before resize = %d, want 5", len(got))
+	}
+
+	if err := s.ApplyConfig(&config.Config{StorageConfig: config.StorageConfig{
+		ExemplarsConfig: &config.ExemplarsConfig{MaxExemplars: 2},
+	}}); err != nil {
+		t.Fatalf("ApplyConfig: %v", err)
+	}
+
+	got := s.head.Exemplars(internalRef)
+	if len(got) != 2 {
+		t.Fatalf("Exemplars after ApplyConfig(MaxExemplars: 2) = %d, want 2", len(got))
 	}
 }
 

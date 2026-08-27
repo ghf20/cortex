@@ -3276,7 +3276,16 @@ func (i *Ingester) createTSDB(userID string) (*userTSDB, error) {
 		// never goes through GetOrCreateSeries, so there's no "don't limit during
 		// reload" ordering hazard to avoid here.
 		store.head.SetSeriesLifecycleCallback(userDB)
-		if err := store.ApplyConfig(&config.Config{StorageConfig: config.StorageConfig{TSDBConfig: &config.TSDBConfig{OutOfOrderTimeWindow: time.Duration(oooTimeWindow).Milliseconds()}}}); err != nil {
+		// ExemplarsConfig.MaxExemplars is set here too, not left to the first
+		// updateUserTSDBConfigs tick: without it, a real, previously-latent gap
+		// (external review) - the exemplar ring would resize to capacity 0
+		// immediately after construction (ApplyConfig's own zero-value default
+		// for a nil ExemplarsConfig) and silently drop every exemplar pushed
+		// before that first tick fires, even with exemplars enabled.
+		if err := store.ApplyConfig(&config.Config{StorageConfig: config.StorageConfig{
+			TSDBConfig:      &config.TSDBConfig{OutOfOrderTimeWindow: time.Duration(oooTimeWindow).Milliseconds()},
+			ExemplarsConfig: &config.ExemplarsConfig{MaxExemplars: maxExemplarsForUser},
+		}}); err != nil {
 			if closeErr := store.Close(); closeErr != nil {
 				level.Warn(userLogger).Log("msg", "failed to close columnar head TSDB after ApplyConfig failure", "err", closeErr)
 			}

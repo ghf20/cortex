@@ -35,9 +35,9 @@ import (
 // of reinventing it" precedent CompactHead itself already established for
 // head->block compaction (see CHECKLIST.md's Phase 5a).
 //
-// Not yet wired into the ingester's real construction path (see CHECKLIST.md's
-// Phase 7 recommended build order, step 5) - this type is complete and
-// independently tested, but nothing in ingester.go constructs one yet.
+// Wired into the ingester's real construction path (ingester.go's createTSDB,
+// gated by the -blocks-storage.tsdb.use-columnar-head flag - see CHECKLIST.md's
+// Phase 7 step 5).
 type columnarheadTSDBStore struct {
 	head   *columnarhead.DurableHead
 	dir    string
@@ -347,10 +347,17 @@ func (s *columnarheadTSDBStore) PostingsForMatchers(ctx context.Context, ms ...*
 	return s.head.PostingsForMatchers(ctx, ms...)
 }
 
-// ApplyConfig wires the one live-reconfigurable knob that has a real
-// columnarhead equivalent so far - OutOfOrderTimeWindow (Head.SetOOOTimeWindow,
-// built in Phase 4) - matching real *tsdb.DB.ApplyConfig's own field path
-// (vendor/.../tsdb/db.go). Retention/MaxBytes reconfiguration, real *tsdb.DB's
+// ApplyConfig wires the live-reconfigurable knobs that have a real columnarhead
+// equivalent so far - OutOfOrderTimeWindow (Head.SetOOOTimeWindow, built in
+// Phase 4) and MaxExemplars (Head.SetExemplarCapacity) - matching real
+// *tsdb.DB.ApplyConfig's own field paths (vendor/.../tsdb/db.go: OOO window and
+// ce.Resize(cfg.StorageConfig.ExemplarsConfig.MaxExemplars)). ingester.go's
+// updateUserTSDBConfigs calls this on every tenant on a periodic ticker
+// regardless of backend, so both fields must be handled here even though this
+// method is also called once at construction with only the OOO window set (see
+// createTSDB) - MaxExemplars defaulting to 0 on that first call is fine, since
+// the very next updateUserTSDBConfigs tick corrects it, same as it already does
+// for the native backend. Retention/MaxBytes reconfiguration, real *tsdb.DB's
 // other ApplyConfig responsibility, has no columnarhead equivalent yet (no
 // size-based retention has been built for this backend at all) - a stated gap,
 // not a silent one.
@@ -363,6 +370,12 @@ func (s *columnarheadTSDBStore) ApplyConfig(conf *config.Config) error {
 		oooTimeWindow = 0
 	}
 	s.head.SetOOOTimeWindow(oooTimeWindow)
+
+	maxExemplars := int64(0)
+	if conf.StorageConfig.ExemplarsConfig != nil {
+		maxExemplars = conf.StorageConfig.ExemplarsConfig.MaxExemplars
+	}
+	s.head.SetExemplarCapacity(int(maxExemplars))
 	return nil
 }
 
